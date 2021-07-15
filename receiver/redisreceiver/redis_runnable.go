@@ -20,7 +20,7 @@ import (
 
 	"go.opentelemetry.io/collector/config"
 	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/model/pdata"
 	"go.opentelemetry.io/collector/obsreport"
 	"go.uber.org/zap"
 
@@ -41,7 +41,6 @@ type redisRunnable struct {
 	redisMetrics    []*redisMetric
 	logger          *zap.Logger
 	timeBundle      *timeBundle
-	serviceName     string
 	obsrecv         *obsreport.Receiver
 }
 
@@ -49,14 +48,12 @@ func newRedisRunnable(
 	ctx context.Context,
 	id config.ComponentID,
 	client client,
-	serviceName string,
 	metricsConsumer consumer.Metrics,
 	logger *zap.Logger,
 ) *redisRunnable {
 	return &redisRunnable{
 		id:              id,
 		ctx:             ctx,
-		serviceName:     serviceName,
 		redisSvc:        newRedisSvc(client),
 		metricsConsumer: metricsConsumer,
 		logger:          logger,
@@ -100,10 +97,8 @@ func (r *redisRunnable) Run() error {
 
 	pdm := pdata.NewMetrics()
 	rm := pdm.ResourceMetrics().AppendEmpty()
-	resource := rm.Resource()
-	rattrs := resource.Attributes()
-	rattrs.InsertString("service.name", r.serviceName)
 	ilm := rm.InstrumentationLibraryMetrics().AppendEmpty()
+	ilm.InstrumentationLibrary().SetName("otelcol/" + typeStr)
 	fixedMS, warnings := inf.buildFixedMetrics(r.redisMetrics, r.timeBundle)
 	fixedMS.MoveAndAppendTo(ilm.Metrics())
 	if warnings != nil {
@@ -122,8 +117,8 @@ func (r *redisRunnable) Run() error {
 	}
 	keyspaceMS.MoveAndAppendTo(ilm.Metrics())
 
+	numPoints := pdm.DataPointCount()
 	err = r.metricsConsumer.ConsumeMetrics(r.ctx, pdm)
-	_, numPoints := pdm.MetricAndDataPointCount()
 	r.obsrecv.EndMetricsOp(ctx, dataFormat, numPoints, err)
 
 	return nil

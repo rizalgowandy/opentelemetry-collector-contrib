@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/montanaflynn/stats"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/model/pdata"
 )
 
 func buildCounterMetric(parsedMetric statsDMetric, timeNow time.Time) pdata.InstrumentationLibraryMetrics {
@@ -49,8 +49,8 @@ func buildGaugeMetric(parsedMetric statsDMetric, timeNow time.Time) pdata.Instru
 	if parsedMetric.unit != "" {
 		nm.SetUnit(parsedMetric.unit)
 	}
-	nm.SetDataType(pdata.MetricDataTypeDoubleGauge)
-	dp := nm.DoubleGauge().DataPoints().AppendEmpty()
+	nm.SetDataType(pdata.MetricDataTypeGauge)
+	dp := nm.Gauge().DataPoints().AppendEmpty()
 	dp.SetValue(parsedMetric.floatvalue)
 	dp.SetTimestamp(pdata.TimestampFromTime(timeNow))
 	for i, key := range parsedMetric.labelKeys {

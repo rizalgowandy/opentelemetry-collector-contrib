@@ -23,17 +23,18 @@ import (
 	"time"
 
 	"github.com/DataDog/datadog-agent/pkg/trace/exportable/pb"
+	"github.com/DataDog/datadog-agent/pkg/trace/exportable/traceutil"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/model/pdata"
 	"go.opentelemetry.io/collector/translator/conventions"
 	tracetranslator "go.opentelemetry.io/collector/translator/trace"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/zorkian/go-datadog-api.v2"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/config"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/metadata"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/metrics"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/utils"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/metrics"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/utils"
 )
 
 const (
@@ -61,6 +62,7 @@ const (
 	// tagContainersTags specifies the name of the tag which holds key/value
 	// pairs representing information about the container (Docker, EC2, etc).
 	tagContainersTags = "_dd.tags.container"
+	tagDatadogEnv     = "env"
 )
 
 // converts Traces into an array of datadog trace payloads grouped by env
@@ -208,6 +210,9 @@ func resourceSpansToDatadogSpans(rs pdata.ResourceSpans, hostname string, cfg *c
 		// TODO: allow users to configure specific spans to be marked as an analyzed spans for app analytics
 		top := getAnalyzedSpans(apiTrace.Spans)
 
+		// https://github.com/DataDog/datadog-agent/blob/443930a00bced1ea87d0067fc2f1fc3f98a48ba1/pkg/trace/agent/agent.go#L241-L243
+		traceutil.ComputeTopLevel(apiTrace.Spans)
+
 		payload.Transactions = append(payload.Transactions, top...)
 		payload.Traces = append(payload.Traces, apiTrace)
 	}
@@ -226,7 +231,7 @@ func spanToDatadogSpan(s pdata.Span,
 	tags := aggregateSpanTags(s, datadogTags)
 
 	// otel specification resource service.name takes precedence
-	// and configuration DD_ENV as fallback if it exists
+	// and configuration DD_SERVICE as fallback if it exists
 	if cfg.Service != "" {
 		// prefer the collector level service name over an empty string or otel default
 		if serviceName == "" || serviceName == tracetranslator.ResourceNoServiceName {
@@ -309,8 +314,8 @@ func resourceToDatadogServiceNameAndAttributeMap(
 	resource pdata.Resource,
 ) (serviceName string, datadogTags map[string]string) {
 	attrs := resource.Attributes()
-	// predefine capacity where possible with extra for _dd.tags.container payload
-	datadogTags = make(map[string]string, attrs.Len()+1)
+	// predefine capacity where possible with extra for _dd.tags.container payload and duplicate env tag
+	datadogTags = make(map[string]string, attrs.Len()+2)
 
 	if attrs.Len() == 0 {
 		return tracetranslator.ResourceNoServiceName, datadogTags
@@ -320,6 +325,17 @@ func resourceToDatadogServiceNameAndAttributeMap(
 		datadogTags[k] = tracetranslator.AttributeValueToString(v)
 		return true
 	})
+
+	// specification states that the resource level deployment.environment should be used for passing env,
+	// and also a number of Datadog UI components are hardcoded to point to /  look for / search with `env`.
+	// So we ensure that anytime deployment.environment is set, `env` is the same value.
+	// In the future, we can probably just set `env` using the deployment.environment value, but drop the duplicate
+	// deployment.environment tag afterward. Without knowing whether this would break existing user setups, its better
+	// to simply set both tags.
+	// https://github.com/open-telemetry/opentelemetry-specification/blob/v1.4.0/specification/resource/semantic_conventions/deployment_environment.md#deployment
+	if resourceEnv, ok := datadogTags[conventions.AttributeDeploymentEnvironment]; ok {
+		datadogTags[tagDatadogEnv] = utils.NormalizeTag(resourceEnv)
+	}
 
 	serviceName = extractDatadogServiceName(datadogTags)
 	return serviceName, datadogTags
@@ -549,17 +565,27 @@ func getSpanErrorAndSetTags(s pdata.Span, tags map[string]string) int32 {
 
 	if isError == errorCode {
 		extractErrorTagsFromEvents(s, tags)
-		// If we weren't able to pull an error type or message, go ahead and set
-		// these to the old defaults
-		if _, ok := tags[ext.ErrorType]; !ok {
-			tags[ext.ErrorType] = "ERR_CODE_" + strconv.FormatInt(int64(status.Code()), 10)
-		}
 
+		// if the error message doesnt exist, try to infer useful error information from
+		// the status message, and http status code / http status text.
+		// if we find useful error.message info, also set a fallback error.type
+		// otherwise leave these tags unset and allow the UI to handle defaults
 		if _, ok := tags[ext.ErrorMsg]; !ok {
 			if status.Message() != "" {
 				tags[ext.ErrorMsg] = status.Message()
-			} else {
-				tags[ext.ErrorMsg] = "ERR_CODE_" + strconv.FormatInt(int64(status.Code()), 10)
+				// look for useful http metadata if it exists and add that as a fallback for the error message
+			} else if statusCode, ok := tags[conventions.AttributeHTTPStatusCode]; ok {
+				if statusText, ok := tags[conventions.AttributeHTTPStatusText]; ok {
+					tags[ext.ErrorMsg] = fmt.Sprintf("%s %s", statusCode, statusText)
+				} else {
+					tags[ext.ErrorMsg] = statusCode
+				}
+			}
+
+			// If we weren't able to pull an error type, but we do have an error message
+			// set to a reasonable default
+			if (tags[ext.ErrorType] == "") && (tags[ext.ErrorMsg] != "") {
+				tags[ext.ErrorType] = "error"
 			}
 		}
 	}

@@ -20,16 +20,17 @@ import (
 	"strings"
 	"time"
 
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/model/pdata"
 	"go.opentelemetry.io/collector/translator/conventions"
 	"go.uber.org/zap"
 )
 
 var patternKeyToAttributeMap = map[string]string{
-	"ClusterName":         "aws.ecs.cluster.name",
-	"TaskId":              "aws.ecs.task.id",
-	"NodeName":            "k8s.node.name",
-	"ContainerInstanceId": "aws.ecs.container.instance.id",
+	"ClusterName":          "aws.ecs.cluster.name",
+	"TaskId":               "aws.ecs.task.id",
+	"NodeName":             "k8s.node.name",
+	"ContainerInstanceId":  "aws.ecs.container.instance.id",
+	"TaskDefinitionFamily": "aws.ecs.task.family",
 }
 
 func replacePatterns(s string, attrMap pdata.AttributeMap, logger *zap.Logger) string {

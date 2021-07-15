@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/model/pdata"
 )
 
 func TestBuildCounterMetric(t *testing.T) {
@@ -66,8 +66,8 @@ func TestBuildGaugeMetric(t *testing.T) {
 	expectedMetric := expectedMetrics.Metrics().AppendEmpty()
 	expectedMetric.SetName("testGauge")
 	expectedMetric.SetUnit("meter")
-	expectedMetric.SetDataType(pdata.MetricDataTypeDoubleGauge)
-	dp := expectedMetric.DoubleGauge().DataPoints().AppendEmpty()
+	expectedMetric.SetDataType(pdata.MetricDataTypeGauge)
+	dp := expectedMetric.Gauge().DataPoints().AppendEmpty()
 	dp.SetValue(32.3)
 	dp.SetTimestamp(pdata.TimestampFromTime(timeNow))
 	dp.LabelsMap().Insert("mykey", "myvalue")

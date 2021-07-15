@@ -26,7 +26,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/model/pdata"
 	"go.opentelemetry.io/collector/translator/internaldata"
 	"go.uber.org/zap"
 )
@@ -499,7 +499,8 @@ func TestTransformSpan(t *testing.T) {
 				event.SetName("this is the event name")
 				event.SetTimestamp(pdata.TimestampFromTime(now))
 				event.SetDroppedAttributesCount(1)
-				s.Events().Append(event)
+				tgt := s.Events().AppendEmpty()
+				event.CopyTo(tgt)
 				return s
 			},
 			want: telemetry.Span{
@@ -592,8 +593,8 @@ func TestTransformGauge(t *testing.T) {
 		m.SetName("gauge")
 		m.SetDescription("description")
 		m.SetUnit("1")
-		m.SetDataType(pdata.MetricDataTypeDoubleGauge)
-		gd := m.DoubleGauge()
+		m.SetDataType(pdata.MetricDataTypeGauge)
+		gd := m.Gauge()
 		dp := gd.DataPoints().AppendEmpty()
 		dp.SetTimestamp(ts)
 		dp.SetValue(42.0)
@@ -646,28 +647,28 @@ func TestTransformSum(t *testing.T) {
 		m.SetName("sum")
 		m.SetDescription("description")
 		m.SetUnit("1")
-		m.SetDataType(pdata.MetricDataTypeDoubleSum)
-		d := m.DoubleSum()
+		m.SetDataType(pdata.MetricDataTypeSum)
+		d := m.Sum()
 		d.SetAggregationTemporality(pdata.AggregationTemporalityDelta)
 		dp := d.DataPoints().AppendEmpty()
 		dp.SetStartTimestamp(start)
 		dp.SetTimestamp(end)
 		dp.SetValue(42.0)
-		t.Run("DoubleSum-Delta", func(t *testing.T) { testTransformMetric(t, m, expected) })
+		t.Run("Sum-Delta", func(t *testing.T) { testTransformMetric(t, m, expected) })
 	}
 	{
 		m := pdata.NewMetric()
 		m.SetName("sum")
 		m.SetDescription("description")
 		m.SetUnit("1")
-		m.SetDataType(pdata.MetricDataTypeDoubleSum)
-		d := m.DoubleSum()
+		m.SetDataType(pdata.MetricDataTypeSum)
+		d := m.Sum()
 		d.SetAggregationTemporality(pdata.AggregationTemporalityCumulative)
 		dp := d.DataPoints().AppendEmpty()
 		dp.SetStartTimestamp(start)
 		dp.SetTimestamp(end)
 		dp.SetValue(42.0)
-		t.Run("DoubleSum-Cumulative", func(t *testing.T) { testTransformMetric(t, m, expectedGauge) })
+		t.Run("Sum-Cumulative", func(t *testing.T) { testTransformMetric(t, m, expectedGauge) })
 	}
 	{
 		m := pdata.NewMetric()

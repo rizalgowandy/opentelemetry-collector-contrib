@@ -22,11 +22,6 @@ import (
 	"go.opentelemetry.io/collector/config"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/receiver/receiverhelper"
-	"go.uber.org/zap"
-
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awscontainerinsightreceiver/internal/cadvisor"
-	hostInfo "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awscontainerinsightreceiver/internal/host"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awscontainerinsightreceiver/internal/k8sapiserver"
 )
 
 // Factory for awscontainerinsightreceiver
@@ -39,6 +34,12 @@ const (
 
 	// Default container orchestrator service is aws eks
 	defaultContainerOrchestrator = "eks"
+
+	// Metrics is tagged with service name by default
+	defaultTagService = true
+
+	// Don't use pod full name by default (as the full names contain suffix with random characters)
+	defaultPrefFullPodName = false
 )
 
 // NewFactory creates a factory for AWS container insight receiver
@@ -55,6 +56,8 @@ func createDefaultConfig() config.Receiver {
 		ReceiverSettings:      config.NewReceiverSettings(config.NewID(typeStr)),
 		CollectionInterval:    defaultCollectionInterval,
 		ContainerOrchestrator: defaultContainerOrchestrator,
+		TagService:            defaultTagService,
+		PrefFullPodName:       defaultPrefFullPodName,
 	}
 }
 
@@ -68,12 +71,5 @@ func createMetricsReceiver(
 
 	rCfg := baseCfg.(*Config)
 	logger := params.Logger
-	hostInfo, err := hostInfo.NewInfo(rCfg.CollectionInterval, logger)
-	// TODO: I will need to change the code here to let cadvisor and k8sapiserver return err as well
-	if err != nil {
-		logger.Warn("failed to initialize hostInfo", zap.Error(err))
-	}
-	cadvisor := cadvisor.New(rCfg.ContainerOrchestrator, hostInfo, logger)
-	k8sapiserver := k8sapiserver.New(hostInfo, logger)
-	return New(logger, rCfg, consumer, cadvisor, k8sapiserver)
+	return newAWSContainerInsightReceiver(logger, rCfg, consumer)
 }

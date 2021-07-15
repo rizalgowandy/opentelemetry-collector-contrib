@@ -17,11 +17,19 @@ package splunkhecexporter
 import (
 	"time"
 
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/model/pdata"
 	"go.opentelemetry.io/collector/translator/conventions"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/splunk"
+)
+
+const (
+	// Keys are taken from https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/logs/overview.md#trace-context-in-legacy-formats.
+	// spanIDFieldKey is the key used in log event for the span id (if any).
+	spanIDFieldKey = "span_id"
+	// traceIDFieldKey is the key used in the log event for the trace id (if any).
+	traceIDFieldKey = "trace_id"
 )
 
 // Composite index of a log record in pdata.Logs.
@@ -46,6 +54,12 @@ func mapLogRecordToSplunkEvent(res pdata.Resource, lr pdata.LogRecord, config *C
 	fields := map[string]interface{}{}
 	if lr.Name() != "" {
 		fields[splunk.NameLabel] = lr.Name()
+	}
+	if spanID := lr.SpanID().HexString(); spanID != "" {
+		fields[spanIDFieldKey] = spanID
+	}
+	if traceID := lr.TraceID().HexString(); traceID != "" {
+		fields[traceIDFieldKey] = traceID
 	}
 	res.Attributes().Range(func(k string, v pdata.AttributeValue) bool {
 		switch k {

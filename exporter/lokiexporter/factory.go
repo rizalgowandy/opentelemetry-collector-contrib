@@ -49,23 +49,24 @@ func createDefaultConfig() config.Exporter {
 		QueueSettings: exporterhelper.DefaultQueueSettings(),
 		TenantID:      "",
 		Labels: LabelsConfig{
-			Attributes: map[string]string{},
+			Attributes:         map[string]string{},
+			ResourceAttributes: map[string]string{},
 		},
 	}
 }
 
-func createLogsExporter(_ context.Context, params component.ExporterCreateSettings, config config.Exporter) (component.LogsExporter, error) {
+func createLogsExporter(_ context.Context, set component.ExporterCreateSettings, config config.Exporter) (component.LogsExporter, error) {
 	expCfg := config.(*Config)
 
 	if err := expCfg.validate(); err != nil {
 		return nil, err
 	}
 
-	exp := newExporter(expCfg, params.Logger)
+	exp := newExporter(expCfg, set.Logger)
 
 	return exporterhelper.NewLogsExporter(
 		expCfg,
-		params.Logger,
+		set,
 		exp.pushLogData,
 		// explicitly disable since we rely on http.Client timeout logic.
 		exporterhelper.WithTimeout(exporterhelper.TimeoutSettings{Timeout: 0}),

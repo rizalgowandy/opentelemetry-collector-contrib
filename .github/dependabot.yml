@@ -62,6 +62,10 @@ updates:
     schedule:
       interval: "weekly"
   - package-ecosystem: "gomod"
+    directory: "/exporter/googlecloudpubsubexporter"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
     directory: "/exporter/honeycombexporter"
     schedule:
       interval: "weekly"
@@ -71,10 +75,6 @@ updates:
       interval: "weekly"
   - package-ecosystem: "gomod"
     directory: "/exporter/influxdbexporter"
-    schedule:
-      interval: "weekly"
-  - package-ecosystem: "gomod"
-    directory: "/exporter/jaegerthrifthttpexporter"
     schedule:
       interval: "weekly"
   - package-ecosystem: "gomod"
@@ -286,6 +286,10 @@ updates:
     schedule:
       interval: "weekly"
   - package-ecosystem: "gomod"
+    directory: "/receiver/googlecloudpubsubreceiver"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
     directory: "/receiver/influxdbreceiver"
     schedule:
       interval: "weekly"
@@ -355,6 +359,10 @@ updates:
       interval: "weekly"
   - package-ecosystem: "gomod"
     directory: "/receiver/tcplogreceiver"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/receiver/udplogreceiver"
     schedule:
       interval: "weekly"
   - package-ecosystem: "gomod"

@@ -23,7 +23,7 @@ import (
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer/consumererror"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/model/pdata"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/windowsperfcountersreceiver/internal/pdh"
@@ -129,9 +129,9 @@ func (s *scraper) scrape(context.Context) (pdata.MetricSlice, error) {
 
 func initializeDoubleGaugeMetric(metric pdata.Metric, now pdata.Timestamp, name string, counterValues []win_perf_counters.CounterValue) {
 	metric.SetName(name)
-	metric.SetDataType(pdata.MetricDataTypeDoubleGauge)
+	metric.SetDataType(pdata.MetricDataTypeGauge)
 
-	dg := metric.DoubleGauge()
+	dg := metric.Gauge()
 	ddps := dg.DataPoints()
 	ddps.Resize(len(counterValues))
 	for i, counterValue := range counterValues {
