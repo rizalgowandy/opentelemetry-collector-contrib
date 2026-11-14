@@ -1,0 +1,10 @@
+type: cassandra
+display_name: Cassandra Exporter
+
+status:
+  class: exporter
+  stability:
+    alpha: [traces, logs]
+  distributions: [contrib]
+  codeowners:
+    active: [atoulme, emreyalvac]

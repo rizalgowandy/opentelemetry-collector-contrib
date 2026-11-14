@@ -1,0 +1,99 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package fileexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/fileexporter"
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pprofile"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.uber.org/zap"
+)
+
+// fileExporter is the implementation of file exporter that writes telemetry data to a file
+type fileExporter struct {
+	conf       *Config
+	logger     *zap.Logger
+	marshaller *marshaller
+	writer     *fileWriter
+}
+
+func (e *fileExporter) consumeTraces(_ context.Context, td ptrace.Traces) error {
+	buf, err := e.marshaller.marshalTraces(td)
+	if err != nil {
+		return err
+	}
+	return e.writer.export(buf)
+}
+
+func (e *fileExporter) consumeMetrics(_ context.Context, md pmetric.Metrics) error {
+	buf, err := e.marshaller.marshalMetrics(md)
+	if err != nil {
+		return err
+	}
+	return e.writer.export(buf)
+}
+
+func (e *fileExporter) consumeLogs(_ context.Context, ld plog.Logs) error {
+	buf, err := e.marshaller.marshalLogs(ld)
+	if err != nil {
+		return err
+	}
+	return e.writer.export(buf)
+}
+
+func (e *fileExporter) consumeProfiles(_ context.Context, pd pprofile.Profiles) error {
+	buf, err := e.marshaller.marshalProfiles(pd)
+	if err != nil {
+		return err
+	}
+	return e.writer.export(buf)
+}
+
+// Start starts the flush timer if set.
+func (e *fileExporter) Start(_ context.Context, host component.Host) error {
+	marshaller, err := newMarshaller(e.conf, host)
+	if err != nil {
+		return err
+	}
+	e.marshaller = marshaller
+	export := buildExportFunc(e.conf)
+
+	// Optionally ensure the output directory exists.
+	if e.conf.CreateDirectory {
+		perm, permErr := e.conf.dirPermissions()
+		if permErr != nil {
+			return permErr
+		}
+		if mkdirErr := os.MkdirAll(filepath.Dir(e.conf.Path), perm); mkdirErr != nil {
+			return mkdirErr
+		}
+	}
+
+	if migrateErr := migrateLegacyBackups(e.conf.Path, e.conf.Rotation, e.logger); migrateErr != nil {
+		return migrateErr
+	}
+
+	writer, err := newFileWriter(e.conf.Path, e.conf.Append, e.conf.Rotation, e.conf.FlushInterval, export, e.conf.Compression, int(e.conf.CompressionParams.Level), e.logger)
+	if err != nil {
+		return err
+	}
+	e.writer = writer
+	e.writer.start()
+	return nil
+}
+
+// Shutdown stops the exporter and is invoked during shutdown.
+// It stops the flush ticker if set.
+func (e *fileExporter) Shutdown(context.Context) error {
+	if e.writer == nil {
+		return nil
+	}
+	return e.writer.shutdown()
+}

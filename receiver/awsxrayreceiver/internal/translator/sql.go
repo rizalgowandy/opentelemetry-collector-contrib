@@ -1,30 +1,21 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package translator
+package translator // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awsxrayreceiver/internal/translator"
 
 import (
 	"fmt"
 	"regexp"
+	"strings"
 
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/conventions"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	conventionsv125 "go.opentelemetry.io/otel/semconv/v1.25.0"
+	conventionsv128 "go.opentelemetry.io/otel/semconv/v1.28.0"
 
 	awsxray "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/xray"
 )
 
-func addSQLToSpan(sql *awsxray.SQLData, attrs *pdata.AttributeMap) error {
+func addSQLToSpan(sql *awsxray.SQLData, attrs pcommon.Map) error {
 	if sql == nil {
 		return nil
 	}
@@ -35,19 +26,19 @@ func addSQLToSpan(sql *awsxray.SQLData, attrs *pdata.AttributeMap) error {
 		if err != nil {
 			return err
 		}
-		attrs.UpsertString(conventions.AttributeDBConnectionString, dbURL)
-		attrs.UpsertString(conventions.AttributeDBName, dbName)
+		attrs.PutStr(string(conventionsv125.DBConnectionStringKey), dbURL)
+		attrs.PutStr(string(conventionsv125.DBNameKey), dbName)
 	}
 	// not handling sql.ConnectionString for now because the X-Ray exporter
 	// does not support it
-	addString(sql.DatabaseType, conventions.AttributeDBSystem, attrs)
-	addString(sql.SanitizedQuery, conventions.AttributeDBStatement, attrs)
-	addString(sql.User, conventions.AttributeDBUser, attrs)
+	addString(sql.DatabaseType, string(conventionsv128.DBSystemKey), attrs)
+	addString(sql.SanitizedQuery, string(conventionsv125.DBStatementKey), attrs)
+	addString(sql.User, string(conventionsv125.DBUserKey), attrs)
 	return nil
 }
 
-// SQL URL is of the format: protocol+transport://host:port/dbName?queryParam
-var re = regexp.MustCompile(`^(.+\/\/.+)\/([^\?]+)\??.*$`)
+// SQL URL is of the format: protocol+transport://host:port/dbName?queryParam or protocol+transport:dbName?queryParam
+var re = regexp.MustCompile(`^([^/]+:(?://[^/]+/)?)([^\?]+)\??.*$`)
 
 const (
 	dbURLI  = 1
@@ -62,5 +53,5 @@ func splitSQLURL(rawURL string) (string, string, error) {
 			rawURL,
 		)
 	}
-	return m[dbURLI], m[dbNameI], nil
+	return strings.TrimRight(m[dbURLI], "/"), m[dbNameI], nil
 }

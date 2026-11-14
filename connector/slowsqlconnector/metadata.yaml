@@ -1,0 +1,14 @@
+type: slow_sql
+deprecated_type: slowsql
+display_name: Slow SQL Connector
+
+status:
+  class: connector
+  stability:
+    development: [traces_to_logs]
+  codeowners:
+    active: [JaredTan95, Frapschen]
+    emeritus: [atoulme]
+
+tests:
+  config:

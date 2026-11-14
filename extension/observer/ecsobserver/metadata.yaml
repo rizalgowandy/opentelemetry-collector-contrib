@@ -1,0 +1,11 @@
+display_name: Amazon Elastic Container Service Observer
+type: ecs_observer
+
+status:
+  class: extension
+  stability:
+    beta: [extension]
+  distributions: [contrib]
+  codeowners:
+    active: [pjanotti]
+    emeritus: [rmfitzpatrick, dmitryax]

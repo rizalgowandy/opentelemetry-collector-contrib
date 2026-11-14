@@ -1,49 +1,101 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package windowsperfcountersreceiver
+package windowsperfcountersreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/windowsperfcountersreceiver"
 
 import (
+	"errors"
 	"fmt"
+	"slices"
 
-	"go.opentelemetry.io/collector/consumer/consumererror"
-	"go.opentelemetry.io/collector/receiver/scraperhelper"
+	"go.opentelemetry.io/collector/scraper/scraperhelper"
+	"go.uber.org/multierr"
 )
+
+const defaultAggregationName = "_Total"
 
 // Config defines configuration for WindowsPerfCounters receiver.
 type Config struct {
-	scraperhelper.ScraperControllerSettings `mapstructure:",squash"`
+	ControllerConfig scraperhelper.ControllerConfig `mapstructure:",squash"`
 
-	PerfCounters []PerfCounterConfig `mapstructure:"perfcounters"`
+	MetricMetaData map[string]MetricConfig `mapstructure:"metrics"`
+	PerfCounters   []ObjectConfig          `mapstructure:"perfcounters"`
 }
 
-// PerfCounterConfig defines configuration for a perf counter object.
-type PerfCounterConfig struct {
+// MetricsConfig defines the configuration for a metric to be created.
+type MetricConfig struct {
+	Unit        string      `mapstructure:"unit"`
+	Description string      `mapstructure:"description"`
+	Gauge       GaugeMetric `mapstructure:"gauge"`
+	Sum         SumMetric   `mapstructure:"sum"`
+}
+
+type GaugeMetric struct{}
+
+type SumMetric struct {
+	Aggregation string `mapstructure:"aggregation"`
+	Monotonic   bool   `mapstructure:"monotonic"`
+}
+
+// ObjectConfig defines configuration for a perf counter object.
+type ObjectConfig struct {
 	Object    string   `mapstructure:"object"`
 	Instances []string `mapstructure:"instances"`
-	Counters  []string `mapstructure:"counters"`
+	// AggregationName identifies the instance that aggregates the values of all
+	// other instances. It defaults to "_Total".
+	AggregationName string          `mapstructure:"aggregation_name"`
+	Counters        []CounterConfig `mapstructure:"counters"`
+}
+
+func (oc ObjectConfig) aggregationSettings() (string, bool) {
+	aggregationName := oc.AggregationName
+	if aggregationName == "" {
+		aggregationName = defaultAggregationName
+	}
+
+	// Naming the aggregation instance alongside the wildcard is the opt-in to
+	// retain it without creating a second query.
+	includeAggregationInstance := slices.Contains(oc.Instances, "*") && slices.Contains(oc.Instances, aggregationName)
+	return aggregationName, includeAggregationInstance
+}
+
+// CounterConfig defines the individual counter in an object.
+type CounterConfig struct {
+	Name          string    `mapstructure:"name"`
+	MetricRep     MetricRep `mapstructure:",squash"`
+	RecreateQuery bool      `mapstructure:"recreate_query"`
+}
+
+type MetricRep struct {
+	Name       string            `mapstructure:"metric"`
+	Attributes map[string]string `mapstructure:"attributes"`
 }
 
 func (c *Config) Validate() error {
-	var errors []error
+	var errs error
 
-	if c.CollectionInterval <= 0 {
-		errors = append(errors, fmt.Errorf("collection_interval must be a positive duration"))
+	if c.ControllerConfig.CollectionInterval <= 0 {
+		errs = multierr.Append(errs, errors.New("collection_interval must be a positive duration"))
 	}
 
 	if len(c.PerfCounters) == 0 {
-		errors = append(errors, fmt.Errorf("must specify at least one perf counter"))
+		errs = multierr.Append(errs, errors.New("must specify at least one perf counter"))
+	}
+
+	for name, metric := range c.MetricMetaData {
+		if metric.Unit == "" {
+			metric.Unit = "1"
+		}
+
+		if (metric.Sum != SumMetric{}) {
+			if (metric.Gauge != GaugeMetric{}) {
+				errs = multierr.Append(errs, fmt.Errorf("metric %q provides both a sum config and a gauge config", name))
+			}
+
+			if metric.Sum.Aggregation != "cumulative" && metric.Sum.Aggregation != "delta" {
+				errs = multierr.Append(errs, fmt.Errorf("sum metric %q includes an invalid aggregation", name))
+			}
+		}
 	}
 
 	var perfCounterMissingObjectName bool
@@ -53,21 +105,34 @@ func (c *Config) Validate() error {
 			continue
 		}
 
-		for _, instance := range pc.Instances {
-			if instance == "" {
-				errors = append(errors, fmt.Errorf("perf counter for object %q includes an empty instance", pc.Object))
-				break
+		if len(pc.Counters) == 0 {
+			errs = multierr.Append(errs, fmt.Errorf("perf counter for object %q does not specify any counters", pc.Object))
+		}
+
+		for _, counter := range pc.Counters {
+			if counter.MetricRep.Name == "" {
+				continue
+			}
+
+			foundMatchingMetric := false
+			for name := range c.MetricMetaData {
+				if counter.MetricRep.Name == name {
+					foundMatchingMetric = true
+				}
+			}
+			if !foundMatchingMetric {
+				errs = multierr.Append(errs, fmt.Errorf("perf counter for object %q includes an undefined metric", pc.Object))
 			}
 		}
 
-		if len(pc.Counters) == 0 {
-			errors = append(errors, fmt.Errorf("perf counter for object %q does not specify any counters", pc.Object))
+		if slices.Contains(pc.Instances, "") {
+			errs = multierr.Append(errs, fmt.Errorf("perf counter for object %q includes an empty instance", pc.Object))
 		}
 	}
 
 	if perfCounterMissingObjectName {
-		errors = append(errors, fmt.Errorf("must specify object name for all perf counters"))
+		errs = multierr.Append(errs, errors.New("must specify object name for all perf counters"))
 	}
 
-	return consumererror.Combine(errors)
+	return errs
 }

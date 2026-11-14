@@ -1,0 +1,35 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package windowsservicereceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/windowsservicereceiver"
+
+import (
+	"time"
+
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/receiver/xreceiver"
+	"go.opentelemetry.io/collector/scraper/scraperhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/windowsservicereceiver/internal/metadata"
+)
+
+func NewFactory() receiver.Factory {
+	return xreceiver.NewFactory(
+		metadata.Type,
+		createDefaultConfig,
+		xreceiver.WithMetrics(createMetricsReceiver, metadata.MetricsStability),
+		xreceiver.WithDeprecatedTypeAlias(metadata.DeprecatedType),
+	)
+}
+
+func createDefaultConfig() component.Config {
+	return &Config{
+		ControllerConfig: scraperhelper.ControllerConfig{
+			CollectionInterval: 1 * time.Minute,
+		},
+		MetricsBuilderConfig: metadata.NewDefaultMetricsBuilderConfig(),
+		IncludeServices:      nil,
+		ExcludeServices:      nil,
+	}
+}

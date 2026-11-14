@@ -1,0 +1,419 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package ottlfuncs
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottllog"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/internal/slicegetter"
+)
+
+func Test_keepKeys(t *testing.T) {
+	input := pcommon.NewMap()
+	input.PutStr("test", "hello world")
+	input.PutInt("test2", 3)
+	input.PutBool("test3", true)
+
+	tests := []struct {
+		name string
+		keys []string
+		want func(pcommon.Map)
+	}{
+		{
+			name: "keep one",
+			keys: []string{"test"},
+			want: func(expectedMap pcommon.Map) {
+				expectedMap.PutStr("test", "hello world")
+			},
+		},
+		{
+			name: "keep two",
+			keys: []string{"test", "test2"},
+			want: func(expectedMap pcommon.Map) {
+				expectedMap.PutStr("test", "hello world")
+				expectedMap.PutInt("test2", 3)
+			},
+		},
+		{
+			name: "keep none",
+			keys: []string{},
+			want: func(_ pcommon.Map) {},
+		},
+		{
+			name: "no match",
+			keys: []string{"no match"},
+			want: func(_ pcommon.Map) {},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scenarioMap := pcommon.NewMap()
+			input.CopyTo(scenarioMap)
+
+			setterWasCalled := false
+			target := &ottl.StandardPMapGetSetter[pcommon.Map]{
+				Getter: func(_ context.Context, tCtx pcommon.Map) (pcommon.Map, error) {
+					return tCtx, nil
+				},
+				Setter: func(_ context.Context, tCtx pcommon.Map, m any) error {
+					setterWasCalled = true
+					if v, ok := m.(pcommon.Map); ok {
+						v.CopyTo(tCtx)
+						return nil
+					}
+					return errors.New("expected pcommon.Map")
+				},
+			}
+
+			keys := make([]ottl.StringGetter[pcommon.Map], len(tt.keys))
+			for i, key := range tt.keys {
+				k := key
+				keys[i] = ottl.StandardStringGetter[pcommon.Map]{
+					Getter: func(_ context.Context, _ pcommon.Map) (any, error) {
+						return k, nil
+					},
+				}
+			}
+
+			sliceKeys := slicegetter.NewTestingSliceGetter[pcommon.Map, ottl.StringGetter[pcommon.Map]](true, keys)
+			exprFunc, err := keepKeys(target, sliceKeys)
+			require.NoError(t, err)
+
+			_, err = exprFunc(nil, scenarioMap)
+			require.NoError(t, err)
+			assert.True(t, setterWasCalled)
+
+			expected := pcommon.NewMap()
+			tt.want(expected)
+
+			assert.Equal(t, expected, scenarioMap)
+		})
+	}
+}
+
+func Test_keepKeys_parser_slice_arguments(t *testing.T) {
+	tests := []struct {
+		name        string
+		statement   string
+		setupCache  func(pcommon.Map)
+		wantKeys    []string
+		wantErrPart string
+	}{
+		{
+			name:      "populated cache slice",
+			statement: `keep_keys(attributes, cache["x"])`,
+			setupCache: func(cache pcommon.Map) {
+				cache.PutEmptySlice("x").AppendEmpty().SetStr("a")
+			},
+			wantKeys: []string{"a"},
+		},
+		{
+			name:        "unset cache entry",
+			statement:   `keep_keys(attributes, cache["x"])`,
+			wantErrPart: "keys cannot be nil",
+		},
+		{
+			name:      "scalar cache value",
+			statement: `keep_keys(attributes, cache["x"])`,
+			setupCache: func(cache pcommon.Map) {
+				cache.PutStr("x", "not a slice")
+			},
+			wantErrPart: "expected a slice",
+		},
+		{
+			name:      "cache slice with non-string element",
+			statement: `keep_keys(attributes, cache["x"])`,
+			setupCache: func(cache pcommon.Map) {
+				slice := cache.PutEmptySlice("x")
+				slice.AppendEmpty().SetStr("a")
+				slice.AppendEmpty().SetInt(1)
+			},
+			wantErrPart: "expected string",
+		},
+		{
+			name:      "empty cache slice",
+			statement: `keep_keys(attributes, cache["x"])`,
+			setupCache: func(cache pcommon.Map) {
+				cache.PutEmptySlice("x")
+			},
+			wantKeys: []string{},
+		},
+		{
+			name:      "literal slice",
+			statement: `keep_keys(attributes, ["a", "b"])`,
+			wantKeys:  []string{"a", "b"},
+		},
+		{
+			name:      "empty literal slice",
+			statement: `keep_keys(attributes, [])`,
+			wantKeys:  []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser, err := ottllog.NewParser(
+				map[string]ottl.Factory[*ottllog.TransformContext]{
+					"keep_keys": NewKeepKeysFactory[*ottllog.TransformContext](),
+				},
+				componenttest.NewNopTelemetrySettings(),
+			)
+			require.NoError(t, err)
+			statement, err := parser.ParseStatement(tt.statement)
+			require.NoError(t, err)
+
+			cache := pcommon.NewMap()
+			if tt.setupCache != nil {
+				tt.setupCache(cache)
+			}
+
+			resourceLogs := plog.NewResourceLogs()
+			scopeLogs := resourceLogs.ScopeLogs().AppendEmpty()
+			logRecord := scopeLogs.LogRecords().AppendEmpty()
+			attributes := logRecord.Attributes()
+			attributes.PutStr("a", "value-a")
+			attributes.PutStr("b", "value-b")
+			attributes.PutStr("c", "value-c")
+			originalAttributes := attributes.AsRaw()
+
+			tCtx := ottllog.NewTransformContext(resourceLogs, scopeLogs, logRecord, ottllog.WithCache(&cache))
+			t.Cleanup(tCtx.Close)
+			_, _, err = statement.Execute(t.Context(), tCtx)
+
+			if tt.wantErrPart != "" {
+				require.ErrorContains(t, err, tt.wantErrPart)
+				assert.Equal(t, originalAttributes, attributes.AsRaw())
+				return
+			}
+			require.NoError(t, err)
+
+			expected := make(map[string]any, len(tt.wantKeys))
+			for _, key := range tt.wantKeys {
+				expected[key] = "value-" + key
+			}
+			assert.Equal(t, expected, attributes.AsRaw())
+		})
+	}
+}
+
+func Test_keepKeys_literal_nil_fails_during_parsing(t *testing.T) {
+	parser, err := ottllog.NewParser(
+		map[string]ottl.Factory[*ottllog.TransformContext]{
+			"keep_keys": NewKeepKeysFactory[*ottllog.TransformContext](),
+		},
+		componenttest.NewNopTelemetrySettings(),
+	)
+	require.NoError(t, err)
+
+	_, err = parser.ParseStatement(`keep_keys(attributes, nil)`)
+	require.ErrorContains(t, err, "keys cannot be nil")
+}
+
+func Test_keepKeys_dynamic_key_error(t *testing.T) {
+	input := pcommon.NewMap()
+	input.PutStr("a", "value")
+	target := &ottl.StandardPMapGetSetter[pcommon.Map]{
+		Getter: func(_ context.Context, tCtx pcommon.Map) (pcommon.Map, error) {
+			return tCtx, nil
+		},
+	}
+
+	getErr := errors.New("get dynamic key")
+	keys := slicegetter.NewTestingSliceGetter[pcommon.Map, ottl.StringGetter[pcommon.Map]](false, []ottl.StringGetter[pcommon.Map]{
+		ottl.StandardStringGetter[pcommon.Map]{
+			Getter: func(context.Context, pcommon.Map) (any, error) {
+				return nil, getErr
+			},
+		},
+	})
+
+	exprFunc, err := keepKeys(target, keys)
+	require.NoError(t, err)
+	_, err = exprFunc(t.Context(), input)
+	require.ErrorIs(t, err, getErr)
+	assert.Equal(t, 1, input.Len())
+}
+
+func Test_keepKeys_empty_dynamic_slice(t *testing.T) {
+	input := pcommon.NewMap()
+	input.PutStr("a", "value")
+	target := &ottl.StandardPMapGetSetter[pcommon.Map]{
+		Getter: func(_ context.Context, tCtx pcommon.Map) (pcommon.Map, error) {
+			return tCtx, nil
+		},
+		Setter: func(_ context.Context, tCtx pcommon.Map, value any) error {
+			value.(pcommon.Map).CopyTo(tCtx)
+			return nil
+		},
+	}
+	keys := slicegetter.NewTestingSliceGetter[pcommon.Map, ottl.StringGetter[pcommon.Map]](false, []ottl.StringGetter[pcommon.Map]{})
+
+	exprFunc, err := keepKeys(target, keys)
+	require.NoError(t, err)
+	_, err = exprFunc(t.Context(), input)
+	require.NoError(t, err)
+	assert.Equal(t, 0, input.Len())
+}
+
+func Test_keepKeys_bad_input(t *testing.T) {
+	input := pcommon.NewValueStr("not a map")
+	target := &ottl.StandardPMapGetSetter[any]{
+		Getter: func(_ context.Context, tCtx any) (pcommon.Map, error) {
+			if v, ok := tCtx.(pcommon.Map); ok {
+				return v, nil
+			}
+			return pcommon.Map{}, errors.New("expected pcommon.Map")
+		},
+	}
+
+	keys := slicegetter.NewTestingSliceGetter[any, ottl.StringGetter[any]](true, []ottl.StringGetter[any]{
+		ottl.StandardStringGetter[any]{
+			Getter: func(_ context.Context, _ any) (any, error) {
+				return "anything", nil
+			},
+		},
+	})
+
+	exprFunc, err := keepKeys[any](target, keys)
+	require.NoError(t, err)
+
+	_, err = exprFunc(nil, input)
+	assert.Error(t, err)
+}
+
+func Test_keepKeys_get_nil(t *testing.T) {
+	target := &ottl.StandardPMapGetSetter[any]{
+		Getter: func(_ context.Context, tCtx any) (pcommon.Map, error) {
+			if v, ok := tCtx.(pcommon.Map); ok {
+				return v, nil
+			}
+			return pcommon.Map{}, errors.New("expected pcommon.Map")
+		},
+	}
+
+	keys := slicegetter.NewTestingSliceGetter[any, ottl.StringGetter[any]](true, []ottl.StringGetter[any]{
+		ottl.StandardStringGetter[any]{
+			Getter: func(_ context.Context, _ any) (any, error) {
+				return "anything", nil
+			},
+		},
+	})
+
+	exprFunc, err := keepKeys[any](target, keys)
+	require.NoError(t, err)
+	_, err = exprFunc(nil, nil)
+	assert.Error(t, err)
+}
+
+func Test_KeepKeysFactory(t *testing.T) {
+	t.Run("factory creation", func(t *testing.T) {
+		factory := NewKeepKeysFactory[any]()
+		assert.Equal(t, "keep_keys", factory.Name())
+	})
+
+	t.Run("default arguments", func(t *testing.T) {
+		factory := NewKeepKeysFactory[any]()
+		args := factory.CreateDefaultArguments()
+
+		assert.IsType(t, &keepKeysArguments[any]{}, args)
+		assertArgumentFieldNames(t, args, []string{"Target", "Keys"})
+	})
+
+	t.Run("function creation", func(t *testing.T) {
+		factory := NewKeepKeysFactory[any]()
+		args := factory.CreateDefaultArguments()
+		keepKeysArgs, ok := args.(*keepKeysArguments[any])
+		require.True(t, ok)
+		keepKeysArgs.Target = &ottl.StandardPMapGetSetter[any]{
+			Getter: func(context.Context, any) (pcommon.Map, error) {
+				return pcommon.NewMap(), nil
+			},
+		}
+		keepKeysArgs.Keys = *slicegetter.NewTestingSliceGetter[any, ottl.StringGetter[any]](true, []ottl.StringGetter[any]{
+			ottl.StandardStringGetter[any]{
+				Getter: func(context.Context, any) (any, error) {
+					return "key", nil
+				},
+			},
+		})
+
+		fn, err := factory.CreateFunction(ottl.FunctionContext{}, args)
+		require.NoError(t, err)
+		assert.NotNil(t, fn)
+	})
+
+	t.Run("invalid arguments type", func(t *testing.T) {
+		_, err := createKeepKeysFunction[any](ottl.FunctionContext{}, "invalid args")
+		assert.ErrorContains(t, err, "KeepKeysFactory args must be of type *keepKeysArguments[K]")
+	})
+}
+
+func BenchmarkKeepKeys(b *testing.B) {
+	input := pcommon.NewMap()
+	input.PutStr("test", "hello world")
+	input.PutInt("test2", 3)
+	input.PutBool("test3", true)
+
+	target := &ottl.StandardPMapGetSetter[pcommon.Map]{
+		Getter: func(_ context.Context, tCtx pcommon.Map) (pcommon.Map, error) {
+			return tCtx, nil
+		},
+		Setter: func(_ context.Context, tCtx pcommon.Map, m any) error {
+			v, ok := m.(pcommon.Map)
+			if !ok {
+				return errors.New("expected pcommon.Map")
+			}
+			v.CopyTo(tCtx)
+			return nil
+		},
+	}
+	for _, tt := range []struct {
+		name      string
+		isLiteral bool
+	}{
+		{name: "literal", isLiteral: true},
+		{name: "dynamic", isLiteral: false},
+	} {
+		b.Run(tt.name, func(b *testing.B) {
+			keyGetter := ottl.StringGetter[pcommon.Map](ottl.StandardStringGetter[pcommon.Map]{
+				Getter: func(_ context.Context, _ pcommon.Map) (any, error) {
+					return "test", nil
+				},
+			})
+			if tt.isLiteral {
+				literalKeyGetter, err := ottl.NewTestingLiteralGetter[pcommon.Map, string](true, keyGetter)
+				if err != nil {
+					b.Fatal(err)
+				}
+				keyGetter = literalKeyGetter
+			}
+
+			keys := slicegetter.NewTestingSliceGetter[pcommon.Map](tt.isLiteral, []ottl.StringGetter[pcommon.Map]{keyGetter})
+			exprFunc, err := keepKeys(target, keys)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			ctx := b.Context()
+			b.ReportAllocs()
+			for b.Loop() {
+				scenarioMap := pcommon.NewMap()
+				input.CopyTo(scenarioMap)
+				if _, err := exprFunc(ctx, scenarioMap); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

@@ -1,40 +1,59 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-// +build !linux
+//go:build !linux
 
-package cadvisor
+package cadvisor // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awscontainerinsightreceiver/internal/cadvisor"
 
 import (
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awscontainerinsightreceiver/internal/host"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awscontainerinsightreceiver/internal/cadvisor/extractors"
 )
 
 // cadvisor doesn't support windows, define the dummy functions
 
+type HostInfo interface {
+	GetNumCores() int64
+	GetMemoryCapacity() int64
+	GetClusterName() string
+}
+
 // Cadvisor is a dummy struct for windows
-type Cadvisor struct {
+type Cadvisor struct{}
+
+type Decorator interface {
+	Decorate(*extractors.CAdvisorMetric) *extractors.CAdvisorMetric
+	Shutdown() error
+}
+
+// Option is a function that can be used to configure Cadvisor struct
+type Option func(*Cadvisor)
+
+// WithDecorator constructs an option for configuring the metric decorator
+func WithDecorator(_ any) Option {
+	return func(*Cadvisor) {
+		// do nothing
+	}
+}
+
+func WithECSInfoCreator(_ any) Option {
+	return func(*Cadvisor) {
+		// do nothing
+	}
 }
 
 // New is a dummy function to construct a dummy Cadvisor struct for windows
-func New(containerOrchestrator string, machineInfo *host.Info, logger *zap.Logger) *Cadvisor {
-	return &Cadvisor{}
+func New(_ string, _ HostInfo, _ *zap.Logger, _ ...Option) (*Cadvisor, error) {
+	return &Cadvisor{}, nil
 }
 
 // GetMetrics is a dummy function that always returns empty metrics for windows
-func (c *Cadvisor) GetMetrics() []pdata.Metrics {
-	return []pdata.Metrics{}
+func (*Cadvisor) GetMetrics() []pmetric.Metrics {
+	return []pmetric.Metrics{}
+}
+
+func (*Cadvisor) Shutdown() error {
+	return nil
 }

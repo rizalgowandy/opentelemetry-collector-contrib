@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package fluentforwardreceiver
 
@@ -29,7 +18,7 @@ func TestDetermineNextEventMode(t *testing.T) {
 	cases := []struct {
 		name          string
 		event         func() []byte
-		expectedMode  EventMode
+		expectedMode  eventMode
 		expectedError error
 	}{
 		{
@@ -42,7 +31,7 @@ func TestDetermineNextEventMode(t *testing.T) {
 				b = msgp.AppendInt(b, 5000)
 				return b
 			},
-			MessageMode,
+			messageMode,
 			nil,
 		},
 		{
@@ -55,7 +44,7 @@ func TestDetermineNextEventMode(t *testing.T) {
 				b = msgp.AppendInt(b, 5000)
 				return b
 			},
-			MessageMode,
+			messageMode,
 			nil,
 		},
 		{
@@ -68,7 +57,7 @@ func TestDetermineNextEventMode(t *testing.T) {
 				b = msgp.AppendInt(b, 5000)
 				return b
 			},
-			MessageMode,
+			messageMode,
 			nil,
 		},
 		{
@@ -81,7 +70,7 @@ func TestDetermineNextEventMode(t *testing.T) {
 				b = msgp.AppendInt(b, 5000)
 				return b
 			},
-			MessageMode,
+			messageMode,
 			nil,
 		},
 		{
@@ -94,7 +83,7 @@ func TestDetermineNextEventMode(t *testing.T) {
 				b = msgp.AppendInt(b, 5000)
 				return b
 			},
-			UnknownMode,
+			unknownMode,
 			errors.New("malformed tag field"),
 		},
 		{
@@ -107,7 +96,7 @@ func TestDetermineNextEventMode(t *testing.T) {
 				b = msgp.AppendFloat64(b, 5000.0)
 				return b
 			},
-			UnknownMode,
+			unknownMode,
 			errors.New("unable to determine next event mode for type float64"),
 		},
 	}
@@ -116,7 +105,7 @@ func TestDetermineNextEventMode(t *testing.T) {
 		c := cases[i]
 		t.Run(c.name, func(t *testing.T) {
 			peeker := bufio.NewReaderSize(bytes.NewReader(c.event()), 1024*100)
-			mode, err := DetermineNextEventMode(peeker)
+			mode, err := determineNextEventMode(peeker)
 			if c.expectedError != nil {
 				require.Equal(t, c.expectedError, err)
 			} else {

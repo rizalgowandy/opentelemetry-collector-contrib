@@ -1,35 +1,29 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package awscloudwatchlogsexporter
 
 import (
-	"reflect"
 	"testing"
 
-	"go.opentelemetry.io/collector/config/configmodels"
+	"github.com/stretchr/testify/assert"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/config/configretry"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/awsutil"
 )
 
 func TestDefaultConfig_exporterSettings(t *testing.T) {
-	config := createDefaultConfig().(*Config)
 	want := &Config{
-		ExporterSettings: configmodels.ExporterSettings{
-			TypeVal: configmodels.Type("awscloudwatchlogs"),
-			NameVal: "awscloudwatchlogs",
-		},
+		BackOffConfig:      configretry.NewDefaultBackOffConfig(),
+		AWSSessionSettings: awsutil.CreateDefaultSessionConfig(),
+		QueueSettings: configoptional.Some(func() exporterhelper.QueueBatchConfig {
+			queue := exporterhelper.NewDefaultQueueConfig()
+			queue.NumConsumers = 1
+			queue.Batch = configoptional.Some(*queue.Batch.GetOrInsertDefault())
+			return queue
+		}()),
 	}
-	if got := config; !reflect.DeepEqual(got.ExporterSettings, want.ExporterSettings) {
-		t.Errorf("createDefaultConfig().ExporterSettings = %v, want %v", got, want)
-	}
+	assert.Equal(t, want, createDefaultConfig())
 }

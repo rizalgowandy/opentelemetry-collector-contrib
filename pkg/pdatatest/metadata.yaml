@@ -1,0 +1,6 @@
+status:
+  disable_codecov_badge: true
+  class: pkg
+  codeowners:
+    active: [singhvibhanshu, jinja2, crobert-1]
+    emeritus: [djaglowski, fatsheep9146, dmitryax]

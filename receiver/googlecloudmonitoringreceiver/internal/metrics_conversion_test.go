@@ -1,0 +1,995 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package internal
+
+import (
+	"fmt"
+	"path/filepath"
+	"testing"
+
+	"cloud.google.com/go/monitoring/apiv3/v2/monitoringpb"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.uber.org/zap"
+	"google.golang.org/genproto/googleapis/api/distribution"
+	"google.golang.org/genproto/googleapis/api/metric"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/golden"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatatest/pmetrictest"
+)
+
+func TestConvertGaugeToMetrics(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		ts               *monitoringpb.TimeSeries
+		fileNameExpected string
+	}{
+		{
+			name: "valid gauge points",
+			ts: &monitoringpb.TimeSeries{
+				Points: []*monitoringpb.Point{
+					{
+						Interval: &monitoringpb.TimeInterval{
+							StartTime: &timestamppb.Timestamp{Seconds: 10},
+							EndTime:   &timestamppb.Timestamp{Seconds: 20},
+						},
+						Value: &monitoringpb.TypedValue{
+							Value: &monitoringpb.TypedValue_DoubleValue{DoubleValue: 42.0},
+						},
+					},
+				},
+				Metric: &metric.Metric{
+					Labels: map[string]string{"labelKey": "labelValue"},
+				},
+			},
+			fileNameExpected: "TestConvertGaugeToMetrics_ValidGaugePoints.yaml",
+		},
+		{
+			name: "invalid end time",
+			ts: &monitoringpb.TimeSeries{
+				Points: []*monitoringpb.Point{
+					{
+						Interval: &monitoringpb.TimeInterval{
+							StartTime: &timestamppb.Timestamp{Seconds: 10},
+							EndTime:   nil,
+						},
+						Value: &monitoringpb.TypedValue{
+							Value: &monitoringpb.TypedValue_Int64Value{Int64Value: 100},
+						},
+					},
+				},
+			},
+			fileNameExpected: "TestConvertGaugeToMetrics_InvalidEndTime.yaml",
+		},
+		{
+			name: "valid boolean true",
+			ts: &monitoringpb.TimeSeries{
+				Points: []*monitoringpb.Point{
+					{
+						Interval: &monitoringpb.TimeInterval{
+							StartTime: &timestamppb.Timestamp{Seconds: 10},
+							EndTime:   &timestamppb.Timestamp{Seconds: 20},
+						},
+						Value: &monitoringpb.TypedValue{
+							Value: &monitoringpb.TypedValue_BoolValue{BoolValue: true},
+						},
+					},
+				},
+				Metric: &metric.Metric{
+					Labels: map[string]string{"boolKey": "trueValue"},
+				},
+			},
+			fileNameExpected: "TestConvertGaugeToMetrics_ValidBooleanTrue.yaml",
+		},
+		{
+			name: "valid boolean false",
+			ts: &monitoringpb.TimeSeries{
+				Points: []*monitoringpb.Point{
+					{
+						Interval: &monitoringpb.TimeInterval{
+							StartTime: &timestamppb.Timestamp{Seconds: 30},
+							EndTime:   &timestamppb.Timestamp{Seconds: 40},
+						},
+						Value: &monitoringpb.TypedValue{
+							Value: &monitoringpb.TypedValue_BoolValue{BoolValue: false},
+						},
+					},
+				},
+				Metric: &metric.Metric{
+					Labels: map[string]string{"boolKey": "falseValue"},
+				},
+			},
+			fileNameExpected: "TestConvertGaugeToMetrics_ValidBooleanFalse.yaml",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := zap.NewNop()
+			mb := NewMetricsBuilder(logger)
+
+			m := pmetric.NewMetric()
+			mb.ConvertGaugeToMetrics(tt.ts, m)
+
+			expectedFile := filepath.Join("testdata", tt.fileNameExpected)
+			// Uncomment to regenerate the yaml file with the expected metrics:
+			// require.NoError(t, golden.WriteMetrics(t, expectedFile, wrapMetric(m)))
+			expectedMetrics, err := golden.ReadMetrics(expectedFile)
+			require.NoError(t, err)
+			assert.NoError(t, pmetrictest.CompareMetrics(expectedMetrics, wrapMetric(m)))
+		})
+	}
+}
+
+func TestConvertSumToMetrics(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	ts := &monitoringpb.TimeSeries{
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 10},
+					EndTime:   &timestamppb.Timestamp{Seconds: 20},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_Int64Value{Int64Value: 100},
+				},
+			},
+		},
+		Metric: &metric.Metric{
+			Labels: map[string]string{"labelKey": "labelValue"},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertSumToMetrics(ts, m)
+
+	require.Equal(t, pmetric.MetricTypeSum, m.Type())
+	sum := m.Sum()
+	assert.Equal(t, pmetric.AggregationTemporalityCumulative, sum.AggregationTemporality())
+	assert.True(t, sum.IsMonotonic(), "cumulative sums must be marked monotonic")
+	require.Equal(t, 1, sum.DataPoints().Len())
+	assert.Equal(t, int64(100), sum.DataPoints().At(0).IntValue())
+}
+
+func TestConvertDeltaToMetrics(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	ts := &monitoringpb.TimeSeries{
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 10},
+					EndTime:   &timestamppb.Timestamp{Seconds: 20},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_Int64Value{Int64Value: 42},
+				},
+			},
+		},
+		Metric: &metric.Metric{
+			Type:   "custom.metric",
+			Labels: map[string]string{"key": "val"},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDeltaToMetrics(ts, m)
+
+	require.Equal(t, pmetric.MetricTypeSum, m.Type())
+	sum := m.Sum()
+	assert.Equal(t, pmetric.AggregationTemporalityDelta, sum.AggregationTemporality())
+	require.Equal(t, 1, sum.DataPoints().Len())
+	dp := sum.DataPoints().At(0)
+	assert.Equal(t, int64(42), dp.IntValue())
+	assert.Equal(t, "val", dp.Attributes().AsRaw()["key"])
+}
+
+func TestSortPointsChronologically(t *testing.T) {
+	t.Run("empty and single element", func(t *testing.T) {
+		SortPointsChronologically(nil)
+		single := []*monitoringpb.Point{{}}
+		SortPointsChronologically(single)
+		assert.Len(t, single, 1)
+	})
+
+	t.Run("reverse order by EndTime", func(t *testing.T) {
+		p1 := &monitoringpb.Point{
+			Interval: &monitoringpb.TimeInterval{
+				StartTime: &timestamppb.Timestamp{Seconds: 0},
+				EndTime:   &timestamppb.Timestamp{Seconds: 100},
+			},
+		}
+		p2 := &monitoringpb.Point{
+			Interval: &monitoringpb.TimeInterval{
+				StartTime: &timestamppb.Timestamp{Seconds: 100},
+				EndTime:   &timestamppb.Timestamp{Seconds: 200},
+			},
+		}
+		points := []*monitoringpb.Point{p2, p1}
+		SortPointsChronologically(points)
+		assert.Same(t, p1, points[0])
+		assert.Same(t, p2, points[1])
+	})
+
+	t.Run("equal EndTime ordered by StartTime", func(t *testing.T) {
+		p1 := &monitoringpb.Point{
+			Interval: &monitoringpb.TimeInterval{
+				StartTime: &timestamppb.Timestamp{Seconds: 50},
+				EndTime:   &timestamppb.Timestamp{Seconds: 200},
+			},
+		}
+		p2 := &monitoringpb.Point{
+			Interval: &monitoringpb.TimeInterval{
+				StartTime: &timestamppb.Timestamp{Seconds: 100},
+				EndTime:   &timestamppb.Timestamp{Seconds: 200},
+			},
+		}
+		points := []*monitoringpb.Point{p2, p1}
+		SortPointsChronologically(points)
+		assert.Same(t, p1, points[0])
+		assert.Same(t, p2, points[1])
+	})
+
+	t.Run("nanosecond precision comparison", func(t *testing.T) {
+		p1 := &monitoringpb.Point{
+			Interval: &monitoringpb.TimeInterval{
+				EndTime: &timestamppb.Timestamp{Seconds: 10, Nanos: 100},
+			},
+		}
+		p2 := &monitoringpb.Point{
+			Interval: &monitoringpb.TimeInterval{
+				EndTime: &timestamppb.Timestamp{Seconds: 10, Nanos: 500},
+			},
+		}
+		points := []*monitoringpb.Point{p2, p1}
+		SortPointsChronologically(points)
+		assert.Same(t, p1, points[0])
+		assert.Same(t, p2, points[1])
+	})
+
+	t.Run("nil intervals and nil points handled safely", func(t *testing.T) {
+		pValid := &monitoringpb.Point{
+			Interval: &monitoringpb.TimeInterval{
+				EndTime: &timestamppb.Timestamp{Seconds: 10},
+			},
+		}
+		pNilInterval := &monitoringpb.Point{}
+		var pNilPoint *monitoringpb.Point
+
+		points := []*monitoringpb.Point{pNilPoint, pNilInterval, pValid}
+		SortPointsChronologically(points)
+		assert.Same(t, pValid, points[0])
+	})
+}
+
+func TestConvertDistributionToMetrics_NoDataPoints(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{},
+	}
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+	require.Equal(t, 0, m.Histogram().DataPoints().Len())
+}
+
+func TestConvertDistributionToMetrics_InvalidConversion_NoInterval(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{},
+		Points: []*monitoringpb.Point{
+			{
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_DistributionValue{
+						DistributionValue: &distribution.Distribution{
+							Count: 0,
+							BucketOptions: &distribution.Distribution_BucketOptions{
+								Options: &distribution.Distribution_BucketOptions_ExplicitBuckets{
+									ExplicitBuckets: &distribution.Distribution_BucketOptions_Explicit{
+										Bounds: []float64{},
+									},
+								},
+							},
+							BucketCounts: []int64{},
+						},
+					},
+				},
+			},
+		},
+	}
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+	require.Equal(t, 0, m.Histogram().DataPoints().Len())
+}
+
+func TestConvertDistributionToMetrics_ValidConversion_ExplicitBuckets_SingleDataPoint_WithExemplars(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	sourceProjectID := "test-project"
+	sourceTraceID := "1234567890abcdef1234567890abcdef"
+	sourceSpanID := "abcdef1234567890"
+	sourceSpanName := fmt.Sprintf("projects/%s/traces/%s/spans/%s", sourceProjectID, sourceTraceID, sourceSpanID)
+	sourceExemplarAttachmentTraceContext, err := anypb.New(&monitoringpb.SpanContext{
+		SpanName: sourceSpanName,
+	})
+	require.NoError(t, err)
+	sourceDroppedLabels := map[string]string{
+		"dropped_key_1": "dropped value 1",
+		"dropped_key_2": "dropped value 2",
+	}
+	sourceExemplarAttachmentDroppedLabels, err := anypb.New(&monitoringpb.DroppedLabels{
+		Label: sourceDroppedLabels,
+	})
+	require.NoError(t, err)
+	sourceArbitraryValue, err := structpb.NewValue(map[string]any{
+		"string": "value",
+		"number": 13,
+	})
+	require.NoError(t, err)
+	exemplarAttachmentArbitrary, err := anypb.New(sourceArbitraryValue)
+	require.NoError(t, err)
+
+	sourceBucketCounts := []int64{
+		5,  // [-inifinity, 11.1)
+		10, // [11.1, 22.2)
+		15, // [22.2, 33)
+		11, // [33.3, +infinity)
+	}
+	sourceCountTotal := int64(0)
+	for _, bucketCount := range sourceBucketCounts {
+		sourceCountTotal += bucketCount
+	}
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{
+			Labels: map[string]string{"key1": "value1", "key2": "value2"},
+		},
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 13},
+					EndTime:   &timestamppb.Timestamp{Seconds: 73},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_DistributionValue{
+						DistributionValue: &distribution.Distribution{
+							Count: sourceCountTotal,
+							Mean:  25.5,
+							BucketOptions: &distribution.Distribution_BucketOptions{
+								Options: &distribution.Distribution_BucketOptions_ExplicitBuckets{
+									ExplicitBuckets: &distribution.Distribution_BucketOptions_Explicit{
+										Bounds: []float64{11.1, 22.2, 33.3},
+									},
+								},
+							},
+							BucketCounts: sourceBucketCounts,
+
+							Exemplars: []*distribution.Distribution_Exemplar{
+								{
+									Timestamp:   &timestamppb.Timestamp{Seconds: 22},
+									Value:       15.5,
+									Attachments: []*anypb.Any{sourceExemplarAttachmentTraceContext, sourceExemplarAttachmentDroppedLabels},
+								},
+								{
+									Timestamp:   &timestamppb.Timestamp{Seconds: 33},
+									Value:       23.3,
+									Attachments: []*anypb.Any{exemplarAttachmentArbitrary},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+
+	expectedFile := filepath.Join("testdata", "TestConvertDistributionToMetrics_ValidConversion_ExplicitBuckets_SingleDataPoint_WithExemplars.yaml")
+	// Uncomment to regenerate the yaml file with the expected metrics:
+	// require.NoError(t, golden.WriteMetrics(t, expectedFile, wrapMetric(m)))
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
+	require.NoError(t, err)
+	assert.NoError(t, pmetrictest.CompareMetrics(expectedMetrics, wrapMetric(m)))
+}
+
+func TestConvertDistributionToMetrics_ValidConversion_ExplicitBuckets_SingleDataPoint_ZeroBoundsZeroCounts(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{},
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 13},
+					EndTime:   &timestamppb.Timestamp{Seconds: 73},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_DistributionValue{
+						DistributionValue: &distribution.Distribution{
+							Count: int64(1234), // counts are still reported for distributions without buckets
+							Mean:  12.5,
+							BucketOptions: &distribution.Distribution_BucketOptions{
+								Options: &distribution.Distribution_BucketOptions_ExplicitBuckets{
+									ExplicitBuckets: &distribution.Distribution_BucketOptions_Explicit{
+										Bounds: []float64{},
+									},
+								},
+							},
+							BucketCounts: []int64{},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+
+	expectedFile := filepath.Join("testdata", "TestConvertDistributionToMetrics_ValidConversion_ExplicitBuckets_SingleDataPoint_ZeroBoundsZeroCounts.yaml")
+	// Uncomment to regenerate the yaml file with the expected metrics:
+	// require.NoError(t, golden.WriteMetrics(t, expectedFile, wrapMetric(m)))
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
+	require.NoError(t, err)
+	assert.NoError(t, pmetrictest.CompareMetrics(expectedMetrics, wrapMetric(m)))
+}
+
+func TestConvertDistributionToMetrics_ValidConversion_ExplicitBuckets_SingleDataPoint_OnlyUnderAndOverflow(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	sourceBucketCounts := []int64{
+		5,  // [-inifinity, 22.2)
+		11, // [22.2, +infinity)
+	}
+	sourceCountTotal := int64(0)
+	for _, bucketCount := range sourceBucketCounts {
+		sourceCountTotal += bucketCount
+	}
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{},
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 13},
+					EndTime:   &timestamppb.Timestamp{Seconds: 73},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_DistributionValue{
+						DistributionValue: &distribution.Distribution{
+							Count: sourceCountTotal,
+							BucketOptions: &distribution.Distribution_BucketOptions{
+								Options: &distribution.Distribution_BucketOptions_ExplicitBuckets{
+									ExplicitBuckets: &distribution.Distribution_BucketOptions_Explicit{
+										Bounds: []float64{22.2},
+									},
+								},
+							},
+							BucketCounts: sourceBucketCounts,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+
+	expectedFile := filepath.Join("testdata", "TestConvertDistributionToMetrics_ValidConversion_ExplicitBuckets_SingleDataPoint_OnlyUnderAndOverflow.yaml")
+	// Uncomment to regenerate the yaml file with the expected metrics:
+	// require.NoError(t, golden.WriteMetrics(t, expectedFile, wrapMetric(m)))
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
+	require.NoError(t, err)
+	assert.NoError(t, pmetrictest.CompareMetrics(expectedMetrics, wrapMetric(m)))
+}
+
+func TestConvertDistributionToMetrics_ValidConversion_ExplicitBuckets_SingleDataPoint_ImplicitZeroCounts(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	sourceBucketCounts := []int64{
+		5,  // [-inifinity, 0)
+		11, // [0, 50)
+		20, // [50, 100)
+	}
+	sourceCountTotal := int64(0)
+	for _, bucketCount := range sourceBucketCounts {
+		sourceCountTotal += bucketCount
+	}
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{},
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 13},
+					EndTime:   &timestamppb.Timestamp{Seconds: 73},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_DistributionValue{
+						DistributionValue: &distribution.Distribution{
+							Count: sourceCountTotal,
+							BucketOptions: &distribution.Distribution_BucketOptions{
+								Options: &distribution.Distribution_BucketOptions_ExplicitBuckets{
+									ExplicitBuckets: &distribution.Distribution_BucketOptions_Explicit{
+										Bounds: []float64{0, 50, 100, 150, 200},
+									},
+								},
+							},
+							BucketCounts: sourceBucketCounts,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+
+	expectedFile := filepath.Join("testdata", "TestConvertDistributionToMetrics_ValidConversion_ExplicitBuckets_SingleDataPoint_ImplicitZeroCounts.yaml")
+	// Uncomment to regenerate the yaml file with the expected metrics:
+	// require.NoError(t, golden.WriteMetrics(t, expectedFile, wrapMetric(m)))
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
+	require.NoError(t, err)
+	assert.NoError(t, pmetrictest.CompareMetrics(expectedMetrics, wrapMetric(m)))
+}
+
+func TestConvertDistributionToMetrics_ValidConversion_ExplicitBuckets_MultipleDataPoint(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	sourceBucketCountsAllDataPoints := [][]int64{
+		{5, 0, 15, 11},
+		{6, -1, 16, 12},
+		{7, 0, 17, 13},
+	}
+	boundsAllDataPoints := [][]float64{
+		{11.1, 22.2, 33.3},
+		{111.1, 122.2, 133.3},
+		{211.1, 222.2, 233.3},
+	}
+	sourceCountTotalAllDataPoints := []int64{0, 0, 0}
+	for i, sourceBucketCountsForDataPoint := range sourceBucketCountsAllDataPoints {
+		for _, bucketCount := range sourceBucketCountsForDataPoint {
+			sourceCountTotalAllDataPoints[i] += bucketCount
+		}
+	}
+	dataPoints := make([]*monitoringpb.Point, 0, len(sourceBucketCountsAllDataPoints))
+	for i := range sourceBucketCountsAllDataPoints {
+		dataPoints = append(dataPoints, &monitoringpb.Point{
+			Interval: &monitoringpb.TimeInterval{
+				StartTime: &timestamppb.Timestamp{Seconds: 13 + int64(i)*60},
+				EndTime:   &timestamppb.Timestamp{Seconds: 13 + int64(i+1)*60},
+			},
+			Value: &monitoringpb.TypedValue{
+				Value: &monitoringpb.TypedValue_DistributionValue{
+					DistributionValue: &distribution.Distribution{
+						Count: sourceCountTotalAllDataPoints[i],
+						BucketOptions: &distribution.Distribution_BucketOptions{
+							Options: &distribution.Distribution_BucketOptions_ExplicitBuckets{
+								ExplicitBuckets: &distribution.Distribution_BucketOptions_Explicit{
+									Bounds: boundsAllDataPoints[i],
+								},
+							},
+						},
+						BucketCounts: sourceBucketCountsAllDataPoints[i],
+					},
+				},
+			},
+		})
+	}
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{
+			Labels: map[string]string{"key1": "value1", "key2": "value2"},
+		},
+		Points: dataPoints,
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+
+	expectedFile := filepath.Join("testdata", "TestConvertDistributionToMetrics_ValidConversion_ExplicitBuckets_MultipleDataPoint.yaml")
+	// Uncomment to regenerate the yaml file with the expected metrics:
+	// require.NoError(t, golden.WriteMetrics(t, expectedFile, wrapMetric(m)))
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
+	require.NoError(t, err)
+	assert.NoError(t, pmetrictest.CompareMetrics(expectedMetrics, wrapMetric(m)))
+}
+
+func TestConvertDistributionToMetrics_ValidConversion_LinearBuckets_SingleDataPoint(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	sourceBucketCounts := []int64{
+		5,  // [-infinity, 11.1)
+		10, // [11.1, 18.8)
+		15, // [18.8, 26.5)
+		11, // [26.5 +infinity)
+	}
+	sourceCountTotal := int64(0)
+	for _, bucketCount := range sourceBucketCounts {
+		sourceCountTotal += bucketCount
+	}
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{
+			Labels: map[string]string{"key1": "value1", "key2": "value2"},
+		},
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 13},
+					EndTime:   &timestamppb.Timestamp{Seconds: 73},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_DistributionValue{
+						DistributionValue: &distribution.Distribution{
+							Count: sourceCountTotal,
+							Mean:  20.5,
+							BucketOptions: &distribution.Distribution_BucketOptions{
+								Options: &distribution.Distribution_BucketOptions_LinearBuckets{
+									LinearBuckets: &distribution.Distribution_BucketOptions_Linear{
+										// [-infinity, 11.1), [11.1, 18.8), [18.8, 26.5), [26.5 +infinity)
+										NumFiniteBuckets: 2,
+										Offset:           11.1,
+										Width:            7.7,
+									},
+								},
+							},
+							BucketCounts: sourceBucketCounts,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+
+	expectedFile := filepath.Join("testdata", "TestConvertDistributionToMetrics_ValidConversion_LinearBuckets_SingleDataPoint.yaml")
+	// Uncomment to regenerate the yaml file with the expected metrics:
+	// require.NoError(t, golden.WriteMetrics(t, expectedFile, wrapMetric(m)))
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
+	require.NoError(t, err)
+	assert.NoError(t, pmetrictest.CompareMetrics(expectedMetrics, wrapMetric(m)))
+}
+
+func TestConvertDistributionToMetrics_ValidConversion_LinearBuckets_SingleDataPoint_OnlyUnderAndOverflow(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	sourceBucketCounts := []int64{
+		5,  // [-infinity, 11.1)
+		11, // [11.1 +infinity)
+	}
+	sourceCountTotal := int64(0)
+	for _, bucketCount := range sourceBucketCounts {
+		sourceCountTotal += bucketCount
+	}
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{},
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 13},
+					EndTime:   &timestamppb.Timestamp{Seconds: 73},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_DistributionValue{
+						DistributionValue: &distribution.Distribution{
+							Count: sourceCountTotal,
+							BucketOptions: &distribution.Distribution_BucketOptions{
+								Options: &distribution.Distribution_BucketOptions_LinearBuckets{
+									LinearBuckets: &distribution.Distribution_BucketOptions_Linear{
+										// [-infinity, 11.1), [11.1, +infinity)
+										NumFiniteBuckets: 0,
+										Offset:           11.1,
+										Width:            7.7,
+									},
+								},
+							},
+							BucketCounts: sourceBucketCounts,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+
+	expectedFile := filepath.Join("testdata", "TestConvertDistributionToMetrics_ValidConversion_LinearBuckets_SingleDataPoint_OnlyUnderAndOverflow.yaml")
+	// Uncomment to regenerate the yaml file with the expected metrics:
+	// require.NoError(t, golden.WriteMetrics(t, expectedFile, wrapMetric(m)))
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
+	require.NoError(t, err)
+	assert.NoError(t, pmetrictest.CompareMetrics(expectedMetrics, wrapMetric(m)))
+}
+
+func TestConvertDistributionToMetrics_ValidConversion_LinearBuckets_SingleDataPoint_ImplicitZeroCounts(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	sourceBucketCounts := []int64{
+		0,  // [-infinity, 11.1)
+		5,  // [11.1, 18.8)
+		11, // [18.8, 26.5)
+	}
+	sourceCountTotal := int64(0)
+	for _, bucketCount := range sourceBucketCounts {
+		sourceCountTotal += bucketCount
+	}
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{},
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 13},
+					EndTime:   &timestamppb.Timestamp{Seconds: 73},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_DistributionValue{
+						DistributionValue: &distribution.Distribution{
+							Count: sourceCountTotal,
+							BucketOptions: &distribution.Distribution_BucketOptions{
+								Options: &distribution.Distribution_BucketOptions_LinearBuckets{
+									LinearBuckets: &distribution.Distribution_BucketOptions_Linear{
+										// [-infinity, 11.1), [11.1, 18.8), [18.8, 26.5), [26.5,  34.2), [34.2, 41.9), [41.9, 49.6), [47.7, +infinity)
+										NumFiniteBuckets: 5,
+										Offset:           11.1,
+										Width:            7.7,
+									},
+								},
+							},
+							BucketCounts: sourceBucketCounts,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+
+	expectedFile := filepath.Join("testdata", "TestConvertDistributionToMetrics_ValidConversion_LinearBuckets_SingleDataPoint_ImplicitZeroCounts.yaml")
+	// Uncomment to regenerate the yaml file with the expected metrics:
+	// require.NoError(t, golden.WriteMetrics(t, expectedFile, wrapMetric(m)))
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
+	require.NoError(t, err)
+	assert.NoError(t, pmetrictest.CompareMetrics(expectedMetrics, wrapMetric(m)))
+}
+
+func TestConvertDistributionToMetrics_ValidConversion_ExponentialBuckets_SingleDataPoint(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	sourceBucketCounts := []int64{
+		5,  // [-infinity, 10)
+		10, // [10, 12)
+		15, // [12, 14.4)
+		11, // [14.4 +infinity)
+	}
+	sourceCountTotal := int64(0)
+	for _, bucketCount := range sourceBucketCounts {
+		sourceCountTotal += bucketCount
+	}
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{
+			Labels: map[string]string{"key1": "value1", "key2": "value2"},
+		},
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 13},
+					EndTime:   &timestamppb.Timestamp{Seconds: 73},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_DistributionValue{
+						DistributionValue: &distribution.Distribution{
+							Count: sourceCountTotal,
+							Mean:  12.5,
+							BucketOptions: &distribution.Distribution_BucketOptions{
+								Options: &distribution.Distribution_BucketOptions_ExponentialBuckets{
+									ExponentialBuckets: &distribution.Distribution_BucketOptions_Exponential{
+										// [-infinity, 10), [10, 12), [12, 14.4), [14.4 +infinity)
+										NumFiniteBuckets: 2,
+										GrowthFactor:     1.2,
+										Scale:            10,
+									},
+								},
+							},
+							BucketCounts: sourceBucketCounts,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+
+	expectedFile := filepath.Join("testdata", "TestConvertDistributionToMetrics_ValidConversion_ExponentialBuckets_SingleDataPoint.yaml")
+	// Uncomment to regenerate the yaml file with the expected metrics:
+	// require.NoError(t, golden.WriteMetrics(t, expectedFile, wrapMetric(m)))
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
+	require.NoError(t, err)
+	assert.NoError(t, pmetrictest.CompareMetrics(expectedMetrics, wrapMetric(m)))
+}
+
+func TestConvertDistributionToMetrics_ValidConversion_ExponentialBuckets_SingleDataPoint_OnlyUnderAndOverflow(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	sourceBucketCounts := []int64{
+		5,  // [-infinity, 10)
+		11, // [10 +infinity)
+	}
+	sourceCountTotal := int64(0)
+	for _, bucketCount := range sourceBucketCounts {
+		sourceCountTotal += bucketCount
+	}
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{},
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 13},
+					EndTime:   &timestamppb.Timestamp{Seconds: 73},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_DistributionValue{
+						DistributionValue: &distribution.Distribution{
+							Count: sourceCountTotal,
+							BucketOptions: &distribution.Distribution_BucketOptions{
+								Options: &distribution.Distribution_BucketOptions_ExponentialBuckets{
+									ExponentialBuckets: &distribution.Distribution_BucketOptions_Exponential{
+										// [-infinity, 10), [10 +infinity)
+										NumFiniteBuckets: 0,
+										GrowthFactor:     1.2,
+										Scale:            10,
+									},
+								},
+							},
+							BucketCounts: sourceBucketCounts,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+
+	expectedFile := filepath.Join("testdata", "TestConvertDistributionToMetrics_ValidConversion_ExponentialBuckets_SingleDataPoint_OnlyUnderAndOverflow.yaml")
+	// Uncomment to regenerate the yaml file with the expected metrics:
+	// require.NoError(t, golden.WriteMetrics(t, expectedFile, wrapMetric(m)))
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
+	require.NoError(t, err)
+	assert.NoError(t, pmetrictest.CompareMetrics(expectedMetrics, wrapMetric(m)))
+}
+
+func TestConvertDistributionToMetrics_ValidConversion_ExponentialBuckets_SingleDataPoint_ImplicitZeroCounts(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	sourceBucketCounts := []int64{
+		0,  // [-infinity, 10)
+		5,  // [10, 20)
+		11, // [20, 40)
+	}
+	sourceCountTotal := int64(0)
+	for _, bucketCount := range sourceBucketCounts {
+		sourceCountTotal += bucketCount
+	}
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{},
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 13},
+					EndTime:   &timestamppb.Timestamp{Seconds: 73},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_DistributionValue{
+						DistributionValue: &distribution.Distribution{
+							Count: sourceCountTotal,
+							BucketOptions: &distribution.Distribution_BucketOptions{
+								Options: &distribution.Distribution_BucketOptions_ExponentialBuckets{
+									ExponentialBuckets: &distribution.Distribution_BucketOptions_Exponential{
+										// [-infinity, 10), [10, 20), [20, 40), [40, 80), [80, 160), [160, 320), [320, +infinity)
+										NumFiniteBuckets: 5,
+										GrowthFactor:     2,
+										Scale:            10,
+									},
+								},
+							},
+							BucketCounts: sourceBucketCounts,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityDelta)
+
+	expectedFile := filepath.Join("testdata", "TestConvertDistributionToMetrics_ValidConversion_ExponentialBuckets_SingleDataPoint_ImplicitZeroCounts.yaml")
+	// Uncomment to regenerate the yaml file with the expected metrics:
+	// require.NoError(t, golden.WriteMetrics(t, expectedFile, wrapMetric(m)))
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
+	require.NoError(t, err)
+	assert.NoError(t, pmetrictest.CompareMetrics(expectedMetrics, wrapMetric(m)))
+}
+
+func TestConvertDistributionToMetrics_CumulativeTemporality(t *testing.T) {
+	logger := zap.NewNop()
+	mb := NewMetricsBuilder(logger)
+
+	ts := &monitoringpb.TimeSeries{
+		Metric: &metric.Metric{
+			Type:   "custom.googleapis.com/latency",
+			Labels: map[string]string{"key": "val"},
+		},
+		Points: []*monitoringpb.Point{
+			{
+				Interval: &monitoringpb.TimeInterval{
+					StartTime: &timestamppb.Timestamp{Seconds: 10},
+					EndTime:   &timestamppb.Timestamp{Seconds: 70},
+				},
+				Value: &monitoringpb.TypedValue{
+					Value: &monitoringpb.TypedValue_DistributionValue{
+						DistributionValue: &distribution.Distribution{
+							Count: 10,
+							Mean:  15.5,
+							BucketOptions: &distribution.Distribution_BucketOptions{
+								Options: &distribution.Distribution_BucketOptions_ExplicitBuckets{
+									ExplicitBuckets: &distribution.Distribution_BucketOptions_Explicit{
+										Bounds: []float64{10, 20},
+									},
+								},
+							},
+							BucketCounts: []int64{2, 5, 3},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	m := pmetric.NewMetric()
+	mb.ConvertDistributionToMetrics(ts, m, pmetric.AggregationTemporalityCumulative)
+
+	require.Equal(t, pmetric.MetricTypeHistogram, m.Type())
+	histogram := m.Histogram()
+	assert.Equal(t, pmetric.AggregationTemporalityCumulative, histogram.AggregationTemporality())
+	require.Equal(t, 1, histogram.DataPoints().Len())
+	dp := histogram.DataPoints().At(0)
+	assert.Equal(t, uint64(10), dp.Count())
+	assert.Equal(t, []uint64{2, 5, 3}, dp.BucketCounts().AsRaw())
+	assert.Equal(t, []float64{10, 20}, dp.ExplicitBounds().AsRaw())
+	assert.Equal(t, 155.0, dp.Sum())
+	assert.Equal(t, "val", dp.Attributes().AsRaw()["key"])
+}
+
+func wrapMetric(m pmetric.Metric) pmetric.Metrics {
+	metrics := pmetric.NewMetrics()
+	sm := metrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	m.CopyTo(sm.Metrics().AppendEmpty())
+	return metrics
+}

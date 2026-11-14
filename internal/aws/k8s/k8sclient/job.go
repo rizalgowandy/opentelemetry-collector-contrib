@@ -1,18 +1,7 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package k8sclient
+package k8sclient // import "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/k8s/k8sclient"
 
 import (
 	"context"
@@ -36,19 +25,15 @@ const (
 type JobClient interface {
 	// get the mapping between job and cronjob
 	JobToCronJob() map[string]string
-
-	// shutdown is only used internally by clientset to stop the JobClient
-	shutdown()
 }
 
-type noOpJobClient struct {
-}
+type noOpJobClient struct{}
 
-func (nc *noOpJobClient) JobToCronJob() map[string]string {
+func (*noOpJobClient) JobToCronJob() map[string]string {
 	return map[string]string{}
 }
 
-func (nc *noOpJobClient) shutdown() {
+func (*noOpJobClient) shutdown() {
 }
 
 type jobClientOption func(*jobClient)
@@ -129,7 +114,7 @@ func newJobClient(clientSet kubernetes.Interface, logger *zap.Logger, options ..
 
 	ctx := context.Background()
 	if _, err := clientSet.BatchV1().Jobs(metav1.NamespaceAll).List(ctx, metav1.ListOptions{}); err != nil {
-		return nil, fmt.Errorf("cannot list Job. err: %v", err)
+		return nil, fmt.Errorf("cannot list Job. err: %w", err)
 	}
 
 	c.store = NewObjStore(transformFuncJob, logger)
@@ -151,7 +136,7 @@ func (c *jobClient) shutdown() {
 	c.stopped = true
 }
 
-func transformFuncJob(obj interface{}) (interface{}, error) {
+func transformFuncJob(obj any) (any, error) {
 	job, ok := obj.(*batchv1.Job)
 	if !ok {
 		return nil, fmt.Errorf("input obj %v is not Job type", obj)
@@ -166,12 +151,11 @@ func transformFuncJob(obj interface{}) (interface{}, error) {
 }
 
 func createJobListWatch(client kubernetes.Interface, ns string) cache.ListerWatcher {
-	ctx := context.Background()
 	return &cache.ListWatch{
-		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
+		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 			return client.BatchV1().Jobs(ns).List(ctx, opts)
 		},
-		WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
 			return client.BatchV1().Jobs(ns).Watch(ctx, opts)
 		},
 	}

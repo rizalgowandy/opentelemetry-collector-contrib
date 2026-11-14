@@ -1,0 +1,453 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package honeycombmarkerexporter
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/honeycombmarkerexporter/internal/metadata"
+)
+
+func TestExportMarkers(t *testing.T) {
+	tests := []struct {
+		name              string
+		config            Config
+		attributeMap      map[string]string
+		expectedURL       string
+		timestamp         time.Time
+		observedTimestamp time.Time
+		expectedStartTime int64
+	}{
+		{
+			name: "all fields",
+			config: Config{
+				APIKey: "test-apikey",
+				Markers: []Marker{
+					{
+						Type:        "test-type",
+						MessageKey:  "message",
+						URLKey:      "url",
+						DatasetSlug: "test-dataset",
+						Rules: Rules{
+							LogConditions: []string{
+								`body == "test"`,
+							},
+						},
+					},
+				},
+			},
+			attributeMap: map[string]string{
+				"message": "this is a test message",
+				"url":     "https://api.testhost.io",
+				"type":    "test-type",
+			},
+			expectedURL:       "/1/markers/test-dataset",
+			timestamp:         time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC),
+			expectedStartTime: time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC).Unix(),
+		},
+		{
+			name: "no message key",
+			config: Config{
+				APIKey: "test-apikey",
+				Markers: []Marker{
+					{
+						Type:        "test-type",
+						URLKey:      "url",
+						DatasetSlug: "test-dataset",
+						Rules: Rules{
+							LogConditions: []string{
+								`body == "test"`,
+							},
+						},
+					},
+				},
+			},
+			attributeMap: map[string]string{
+				"url":  "https://api.testhost.io",
+				"type": "test-type",
+			},
+			expectedURL: "/1/markers/test-dataset",
+		},
+		{
+			name: "no url",
+			config: Config{
+				APIKey: "test-apikey",
+				Markers: []Marker{
+					{
+						Type:        "test-type",
+						MessageKey:  "message",
+						DatasetSlug: "test-dataset",
+						Rules: Rules{
+							LogConditions: []string{
+								`body == "test"`,
+							},
+						},
+					},
+				},
+			},
+			attributeMap: map[string]string{
+				"message": "this is a test message",
+				"type":    "test-type",
+			},
+			expectedURL: "/1/markers/test-dataset",
+		},
+		{
+			name: "no dataset_slug",
+			config: Config{
+				APIKey: "test-apikey",
+				Markers: []Marker{
+					{
+						Type: "test-type",
+						Rules: Rules{
+							LogConditions: []string{
+								`body == "test"`,
+							},
+						},
+					},
+				},
+			},
+			attributeMap: map[string]string{
+				"type": "test-type",
+			},
+			expectedURL: "/1/markers/__all__",
+		},
+		{
+			name: "path context syntax",
+			config: Config{
+				APIKey: "test-apikey",
+				Markers: []Marker{
+					{
+						Type:        "test-type",
+						MessageKey:  "message",
+						URLKey:      "url",
+						DatasetSlug: "test-dataset",
+						Rules: Rules{
+							LogConditions: []string{
+								`log.body == "test"`,
+							},
+						},
+					},
+				},
+			},
+			attributeMap: map[string]string{
+				"message": "this is a test message",
+				"url":     "https://api.testhost.io",
+				"type":    "test-type",
+			},
+			expectedURL: "/1/markers/test-dataset",
+		},
+		{
+			name: "uses log timestamp",
+			config: Config{
+				APIKey: "test-apikey",
+				Markers: []Marker{
+					{
+						Type:        "test-type",
+						MessageKey:  "message",
+						URLKey:      "url",
+						DatasetSlug: "test-dataset",
+						Rules: Rules{
+							LogConditions: []string{
+								`body == "test"`,
+							},
+						},
+					},
+				},
+			},
+			attributeMap: map[string]string{
+				"message": "this is a test message",
+				"url":     "https://api.testhost.io",
+				"type":    "test-type",
+			},
+			expectedURL:       "/1/markers/test-dataset",
+			timestamp:         time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC),
+			observedTimestamp: time.Date(2026, 8, 26, 10, 5, 0, 0, time.UTC),
+			expectedStartTime: time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC).Unix(),
+		},
+		{
+			name: "falls back to observed timestamp",
+			config: Config{
+				APIKey: "test-apikey",
+				Markers: []Marker{
+					{
+						Type:        "test-type",
+						MessageKey:  "message",
+						URLKey:      "url",
+						DatasetSlug: "test-dataset",
+						Rules: Rules{
+							LogConditions: []string{
+								`body == "test"`,
+							},
+						},
+					},
+				},
+			},
+			attributeMap: map[string]string{
+				"message": "this is a test message",
+				"url":     "https://api.testhost.io",
+				"type":    "test-type",
+			},
+			expectedURL:       "/1/markers/test-dataset",
+			timestamp:         time.Time{},
+			observedTimestamp: time.Date(2026, 8, 26, 10, 5, 0, 0, time.UTC),
+			expectedStartTime: time.Date(2026, 8, 26, 10, 5, 0, 0, time.UTC).Unix(),
+		},
+		{
+			name: "omits start time when timestamps are unset",
+			config: Config{
+				APIKey: "test-apikey",
+				Markers: []Marker{
+					{
+						Type:        "test-type",
+						MessageKey:  "message",
+						URLKey:      "url",
+						DatasetSlug: "test-dataset",
+						Rules: Rules{
+							LogConditions: []string{
+								`body == "test"`,
+							},
+						},
+					},
+				},
+			},
+			attributeMap: map[string]string{
+				"message": "this is a test message",
+				"url":     "https://api.testhost.io",
+				"type":    "test-type",
+			},
+			expectedURL: "/1/markers/test-dataset",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			markerServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				decodedBody := map[string]any{}
+				err := json.NewDecoder(req.Body).Decode(&decodedBody)
+
+				assert.NoError(t, err)
+
+				for attr := range tt.attributeMap {
+					assert.Equal(t, tt.attributeMap[attr], decodedBody[attr])
+				}
+
+				if tt.expectedStartTime != 0 {
+					assert.Equal(t, float64(tt.expectedStartTime), decodedBody["start_time"])
+				} else {
+					assert.NotContains(t, decodedBody, "start_time")
+				}
+
+				for attr := range tt.attributeMap {
+					assert.Equal(t, tt.attributeMap[attr], decodedBody[attr])
+				}
+				assert.Contains(t, req.URL.Path, tt.expectedURL)
+
+				apiKey := req.Header.Get(honeycombTeam)
+				assert.Equal(t, string(tt.config.APIKey), apiKey)
+
+				userAgent := req.Header.Get(userAgentHeaderKey)
+				assert.NotEmpty(t, userAgent)
+				assert.Contains(t, userAgent, "OpenTelemetry Collector")
+
+				rw.WriteHeader(http.StatusAccepted)
+			}))
+			defer markerServer.Close()
+
+			config := tt.config
+			config.APIURL = markerServer.URL
+
+			f := NewFactory()
+			exp, err := f.CreateLogs(t.Context(), exportertest.NewNopSettings(metadata.Type), &config)
+			require.NoError(t, err)
+
+			err = exp.Start(t.Context(), componenttest.NewNopHost())
+			assert.NoError(t, err)
+
+			logs := constructLogs(tt.attributeMap, tt.timestamp, tt.observedTimestamp)
+			err = exp.ConsumeLogs(t.Context(), logs)
+			assert.NoError(t, err)
+		})
+	}
+}
+
+func constructLogs(attributes map[string]string, timestamp, observedTimestamp time.Time) plog.Logs {
+	logs := plog.NewLogs()
+	rl := logs.ResourceLogs().AppendEmpty()
+	sl := rl.ScopeLogs().AppendEmpty()
+	l := sl.LogRecords().AppendEmpty()
+
+	l.Body().SetStr("test")
+	for attr, attrVal := range attributes {
+		l.Attributes().PutStr(attr, attrVal)
+	}
+
+	if !timestamp.IsZero() {
+		l.SetTimestamp(pcommon.NewTimestampFromTime(timestamp))
+	}
+
+	if !observedTimestamp.IsZero() {
+		l.SetObservedTimestamp(pcommon.NewTimestampFromTime(observedTimestamp))
+	}
+	return logs
+}
+
+func TestExportMarkers_Error(t *testing.T) {
+	tests := []struct {
+		name         string
+		config       Config
+		responseCode int
+		errorMessage string
+	}{
+		{
+			name: "unauthorized greater than 400",
+			config: Config{
+				APIKey: "test-apikey",
+				Markers: []Marker{
+					{
+						Type:        "test-type",
+						MessageKey:  "message",
+						URLKey:      "https://api.testhost.io",
+						DatasetSlug: "test-dataset",
+						Rules: Rules{
+							LogConditions: []string{
+								`body == "test"`,
+							},
+						},
+					},
+				},
+			},
+			responseCode: http.StatusUnauthorized,
+			errorMessage: "marker creation failed with 401",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			markerServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+				rw.WriteHeader(tt.responseCode)
+			}))
+			defer markerServer.Close()
+
+			config := tt.config
+			config.APIURL = markerServer.URL
+
+			f := NewFactory()
+			exp, err := f.CreateLogs(t.Context(), exportertest.NewNopSettings(metadata.Type), &config)
+			require.NoError(t, err)
+
+			err = exp.Start(t.Context(), componenttest.NewNopHost())
+			assert.NoError(t, err)
+
+			logs := constructLogs(map[string]string{}, time.Time{}, time.Time{})
+			err = exp.ConsumeLogs(t.Context(), logs)
+			assert.ErrorContains(t, err, tt.errorMessage)
+		})
+	}
+}
+
+func TestExportMarkers_SwitchingProtocols(t *testing.T) {
+	config := Config{
+		APIKey: "test-apikey",
+		APIURL: "http://example.com",
+		Markers: []Marker{
+			{
+				Type:        "test-type",
+				MessageKey:  "message",
+				URLKey:      "https://api.testhost.io",
+				DatasetSlug: "test-dataset",
+				Rules: Rules{
+					LogConditions: []string{
+						`body == "test"`,
+					},
+				},
+			},
+		},
+	}
+
+	exp, err := newHoneycombLogsExporter(exportertest.NewNopSettings(metadata.Type), &config)
+	require.NoError(t, err)
+
+	exp.client = &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			require.NoError(t, req.Body.Close())
+			return &http.Response{
+				StatusCode: http.StatusSwitchingProtocols,
+				Status:     "101 Switching Protocols",
+				Body:       http.NoBody,
+			}, nil
+		}),
+	}
+
+	logs := constructLogs(map[string]string{}, time.Time{}, time.Time{})
+	err = exp.exportMarkers(t.Context(), logs)
+	assert.ErrorContains(t, err, "marker creation failed with 101")
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestExportMarkers_NoAPICall(t *testing.T) {
+	tests := []struct {
+		name   string
+		config Config
+	}{
+		{
+			name: "all fields",
+			config: Config{
+				APIKey: "test-apikey",
+				Markers: []Marker{
+					{
+						Type:        "test-type",
+						MessageKey:  "message",
+						URLKey:      "url",
+						DatasetSlug: "test-dataset",
+						Rules: Rules{
+							LogConditions: []string{
+								`body == "foo"`,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			markerServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+				assert.Fail(t, "should not call the markers api")
+				rw.WriteHeader(http.StatusBadRequest) // 400
+			}))
+			defer markerServer.Close()
+
+			config := tt.config
+			config.APIURL = markerServer.URL
+
+			f := NewFactory()
+			exp, err := f.CreateLogs(t.Context(), exportertest.NewNopSettings(metadata.Type), &config)
+			require.NoError(t, err)
+
+			err = exp.Start(t.Context(), componenttest.NewNopHost())
+			assert.NoError(t, err)
+
+			logs := constructLogs(map[string]string{}, time.Time{}, time.Time{})
+			err = exp.ConsumeLogs(t.Context(), logs)
+			assert.NoError(t, err)
+		})
+	}
+}

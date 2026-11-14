@@ -1,59 +1,62 @@
-// Copyright 2021 OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package udplogreceiver
 
 import (
-	"context"
 	"fmt"
 	"net"
-	"path"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configtest"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
 	"go.opentelemetry.io/collector/consumer/consumertest"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zaptest"
+	"go.opentelemetry.io/collector/receiver/receivertest"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/stanza"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/adapter"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/operator"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/operator/input/udp"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/udplogreceiver/internal/metadata"
 )
 
 func TestUdp(t *testing.T) {
-	testUDP(t, testdataConfigYamlAsMap())
+	listenAddress := "127.0.0.1:29018"
+	testUDP(t, testdataConfigYaml(listenAddress), listenAddress)
 }
 
-func testUDP(t *testing.T, cfg *UDPLogConfig) {
+func TestUdpAsync(t *testing.T) {
+	listenAddress := "127.0.0.1:29019"
+	cfg := testdataConfigYaml(listenAddress)
+	cfg.InputConfig.AsyncConfig = &udp.AsyncConfig{
+		Readers:        2,
+		Processors:     2,
+		MaxQueueLength: 100,
+	}
+
+	cfg.InputConfig.AsyncConfig.Readers = 2
+	testUDP(t, testdataConfigYaml(listenAddress), listenAddress)
+}
+
+func testUDP(t *testing.T, cfg *UDPLogConfig, listenAddress string) {
 	numLogs := 5
 
 	f := NewFactory()
-	params := component.ReceiverCreateSettings{Logger: zaptest.NewLogger(t)}
 	sink := new(consumertest.LogsSink)
-	rcvr, err := f.CreateLogsReceiver(context.Background(), params, cfg, sink)
+	rcvr, err := f.CreateLogs(t.Context(), receivertest.NewNopSettings(metadata.Type), cfg, sink)
 	require.NoError(t, err)
-	require.NoError(t, rcvr.Start(context.Background(), componenttest.NewNopHost()))
+	require.NoError(t, rcvr.Start(t.Context(), componenttest.NewNopHost()))
 
 	var conn net.Conn
-	conn, err = net.Dial("udp", "0.0.0.0:29018")
+	conn, err = net.Dial("udp", listenAddress)
 	require.NoError(t, err)
 
-	for i := 0; i < numLogs; i++ {
+	for i := range numLogs {
 		msg := fmt.Sprintf("<86>1 2021-02-28T00:0%d:02.003Z test msg %d\n", i, i)
 		_, err = conn.Write([]byte(msg))
 		require.NoError(t, err)
@@ -61,72 +64,136 @@ func testUDP(t *testing.T, cfg *UDPLogConfig) {
 	require.NoError(t, conn.Close())
 
 	require.Eventually(t, expectNLogs(sink, numLogs), 2*time.Second, time.Millisecond)
-	require.NoError(t, rcvr.Shutdown(context.Background()))
+	require.NoError(t, rcvr.Shutdown(t.Context()))
 	require.Len(t, sink.AllLogs(), 1)
 
 	resourceLogs := sink.AllLogs()[0].ResourceLogs().At(0)
-	logs := resourceLogs.InstrumentationLibraryLogs().At(0).Logs()
+	logs := resourceLogs.ScopeLogs().At(0).LogRecords()
 	require.Equal(t, logs.Len(), numLogs)
 
 	expectedLogs := make([]string, numLogs)
 
-	for i := 0; i < numLogs; i++ {
+	for i := range numLogs {
 		expectedLogs[i] = fmt.Sprintf("<86>1 2021-02-28T00:0%d:02.003Z test msg %d", i, i)
 	}
 
-	for i := 0; i < numLogs; i++ {
-		assert.Contains(t, expectedLogs, logs.At(i).Body().StringVal())
+	for i := range numLogs {
+		assert.Contains(t, expectedLogs, logs.At(i).Body().Str())
 	}
 }
 
 func TestLoadConfig(t *testing.T) {
-	factories, err := componenttest.NopFactories()
-	assert.Nil(t, err)
-
-	factory := NewFactory()
-	factories.Receivers[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
 	require.NoError(t, err)
-	require.NotNil(t, cfg)
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig()
 
-	assert.Equal(t, len(cfg.Receivers), 1)
-	assert.Equal(t, testdataConfigYamlAsMap(), cfg.Receivers[config.NewID("udplog")])
+	sub, err := cm.Sub("udp_log")
+	require.NoError(t, err)
+	require.NoError(t, sub.Unmarshal(cfg))
+
+	assert.NoError(t, confmap.Validate(cfg))
+	assert.Equal(t, testdataConfigYaml("127.0.0.1:29018"), cfg)
+
+	// test resolve_names: false
+	cfgFalse := factory.CreateDefaultConfig()
+	subFalse, err := cm.Sub("udp_log/resolve_names_false")
+	require.NoError(t, err)
+	require.NoError(t, subFalse.Unmarshal(cfgFalse))
+	assert.NoError(t, confmap.Validate(cfgFalse))
+	expectedFalse := testdataConfigYaml("127.0.0.1:29018")
+	expectedFalse.InputConfig.AddAttributes = true
+	expectedFalse.InputConfig.ResolveNames = configoptional.Some(false)
+	assert.Equal(t, expectedFalse, cfgFalse)
+
+	// test resolve_names: true
+	cfgTrue := factory.CreateDefaultConfig()
+	subTrue, err := cm.Sub("udp_log/resolve_names_true")
+	require.NoError(t, err)
+	require.NoError(t, subTrue.Unmarshal(cfgTrue))
+	assert.NoError(t, confmap.Validate(cfgTrue))
+	expectedTrue := testdataConfigYaml("127.0.0.1:29018")
+	expectedTrue.InputConfig.AddAttributes = true
+	expectedTrue.InputConfig.ResolveNames = configoptional.Some(true)
+	assert.Equal(t, expectedTrue, cfgTrue)
 }
 
-func testdataConfigYamlAsMap() *UDPLogConfig {
+func TestUdpResolveNamesFalse(t *testing.T) {
+	listenAddress := "127.0.0.1:29020"
+	cfg := testdataConfigYaml(listenAddress)
+	cfg.InputConfig.AddAttributes = true
+	cfg.InputConfig.ResolveNames = configoptional.Some(false)
+
+	numLogs := 3
+	f := NewFactory()
+	sink := new(consumertest.LogsSink)
+	rcvr, err := f.CreateLogs(t.Context(), receivertest.NewNopSettings(metadata.Type), cfg, sink)
+	require.NoError(t, err)
+	require.NoError(t, rcvr.Start(t.Context(), componenttest.NewNopHost()))
+
+	conn, err := net.Dial("udp", listenAddress)
+	require.NoError(t, err)
+
+	for i := range numLogs {
+		msg := fmt.Sprintf("<86>1 2021-02-28T00:0%d:02.003Z test msg %d\n", i, i)
+		_, err = conn.Write([]byte(msg))
+		require.NoError(t, err)
+	}
+	require.NoError(t, conn.Close())
+
+	require.Eventually(t, expectNLogs(sink, numLogs), 2*time.Second, time.Millisecond)
+	require.NoError(t, rcvr.Shutdown(t.Context()))
+	require.Len(t, sink.AllLogs(), 1)
+
+	resourceLogs := sink.AllLogs()[0].ResourceLogs().At(0)
+	logs := resourceLogs.ScopeLogs().At(0).LogRecords()
+	require.Equal(t, logs.Len(), numLogs)
+
+	for i := range numLogs {
+		attrs := logs.At(i).Attributes().AsRaw()
+		assert.Equal(t, "IP.UDP", attrs["net.transport"])
+		assert.Equal(t, "127.0.0.1", attrs["net.host.ip"])
+		assert.NotEmpty(t, attrs["net.host.port"])
+		assert.Equal(t, "127.0.0.1", attrs["net.peer.ip"])
+		assert.NotEmpty(t, attrs["net.peer.port"])
+		assert.NotContains(t, attrs, "net.host.name", "net.host.name must not be present when resolve_names is false")
+		assert.NotContains(t, attrs, "net.peer.name", "net.peer.name must not be present when resolve_names is false")
+	}
+}
+
+func testdataConfigYaml(listenAddress string) *UDPLogConfig {
 	return &UDPLogConfig{
-		BaseConfig: stanza.BaseConfig{
-			ReceiverSettings: config.NewReceiverSettings(config.NewID("udplog")),
-			Operators:        stanza.OperatorConfigs{},
+		BaseConfig: adapter.BaseConfig{
+			Operators: []operator.Config{},
 		},
-		Input: stanza.InputConfig{
-			"listen_address": "0.0.0.0:29018",
-		},
+		InputConfig: func() udp.Config {
+			c := udp.NewConfig()
+			c.ListenAddress = listenAddress
+			return *c
+		}(),
 	}
 }
 
 func TestDecodeInputConfigFailure(t *testing.T) {
-	params := component.ReceiverCreateSettings{
-		Logger: zap.NewNop(),
-	}
 	sink := new(consumertest.LogsSink)
 	factory := NewFactory()
 	badCfg := &UDPLogConfig{
-		BaseConfig: stanza.BaseConfig{
-			ReceiverSettings: config.NewReceiverSettings(config.NewID("udplog")),
-			Operators:        stanza.OperatorConfigs{},
+		BaseConfig: adapter.BaseConfig{
+			Operators: []operator.Config{},
 		},
-		Input: stanza.InputConfig{
-			"max_buffer_size": "0.1.0.1-",
-		},
+		InputConfig: func() udp.Config {
+			c := udp.NewConfig()
+			c.Encoding = "fake"
+			return *c
+		}(),
 	}
-	receiver, err := factory.CreateLogsReceiver(context.Background(), params, badCfg, sink)
+	receiver, err := factory.CreateLogs(t.Context(), receivertest.NewNopSettings(metadata.Type), badCfg, sink)
 	require.Error(t, err, "receiver creation should fail if input config isn't valid")
 	require.Nil(t, receiver, "receiver creation should fail if input config isn't valid")
 }
 
 func expectNLogs(sink *consumertest.LogsSink, expected int) func() bool {
 	return func() bool {
-		return sink.LogRecordsCount() == expected
+		return sink.LogRecordCount() == expected
 	}
 }

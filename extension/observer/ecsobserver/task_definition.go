@@ -1,46 +1,36 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package ecsobserver
+package ecsobserver // import "github.com/open-telemetry/opentelemetry-collector-contrib/extension/observer/ecsobserver"
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ecs"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"go.uber.org/zap"
 )
 
 type TaskDefinitionConfig struct {
 	CommonExporterConfig `mapstructure:",squash" yaml:",inline"`
 
-	// ArnPattern is mandetory, empty string means arn based match is skipped.
+	// ArnPattern is mandatory, empty string means arn based match is skipped.
 	ArnPattern string `mapstructure:"arn_pattern" yaml:"arn_pattern"`
 	// ContainerNamePattern is optional, empty string means all containers in that task definition would be exported.
-	// Otherwise both service and container name petterns need to metch.
+	// Otherwise both service and container name patterns need to match.
 	ContainerNamePattern string `mapstructure:"container_name_pattern" yaml:"container_name_pattern"`
 }
 
 func (t *TaskDefinitionConfig) validate() error {
-	_, err := t.newMatcher(MatcherOptions{})
+	_, err := t.newMatcher(matcherOptions{})
 	return err
 }
 
-func (t *TaskDefinitionConfig) newMatcher(opts MatcherOptions) (Matcher, error) {
+func (t *TaskDefinitionConfig) newMatcher(opts matcherOptions) (targetMatcher, error) {
 	if t.ArnPattern == "" {
-		return nil, fmt.Errorf("arn_pattern is empty")
+		return nil, errors.New("arn_pattern is empty")
 	}
 
 	arnRegex, err := regexp.Compile(t.ArnPattern)
@@ -68,11 +58,11 @@ func (t *TaskDefinitionConfig) newMatcher(opts MatcherOptions) (Matcher, error) 
 }
 
 func taskDefinitionConfigsToMatchers(cfgs []TaskDefinitionConfig) []matcherConfig {
-	var matchers []matcherConfig
-	for _, cfg := range cfgs {
+	matchers := make([]matcherConfig, len(cfgs))
+	for i, cfg := range cfgs {
 		// NOTE: &cfg points to the temp var, whose value would end up be the last one in the slice.
 		copied := cfg
-		matchers = append(matchers, &copied)
+		matchers[i] = &copied
 	}
 	return matchers
 }
@@ -87,13 +77,13 @@ type taskDefinitionMatcher struct {
 	exportSetting      *commonExportSetting
 }
 
-func (m *taskDefinitionMatcher) Type() MatcherType {
-	return MatcherTypeTaskDefinition
+func (*taskDefinitionMatcher) matcherType() matcherType {
+	return matcherTypeTaskDefinition
 }
 
-func (m *taskDefinitionMatcher) MatchTargets(t *Task, c *ecs.ContainerDefinition) ([]MatchedTarget, error) {
+func (m *taskDefinitionMatcher) matchTargets(t *taskAnnotated, c ecstypes.ContainerDefinition) ([]matchedTarget, error) {
 	// Check arn
-	if !m.arnRegex.MatchString(aws.StringValue(t.Task.TaskDefinitionArn)) {
+	if !m.arnRegex.MatchString(aws.ToString(t.Task.TaskDefinitionArn)) {
 		return nil, errNotMatched
 	}
 	// The rest is same as ServiceMatcher

@@ -1,0 +1,24 @@
+display_name: AWS X-Ray Receiver
+type: awsxray
+
+status:
+  class: receiver
+  stability:
+    beta: [traces]
+  distributions: [contrib]
+  codeowners:
+    active: [wangzlei, srprash]
+
+feature_gates:
+  - id: receiver.awsxray.DontEmitV0HttpConventions
+    stage: beta
+    description: >-
+      When enabled, semconv legacy HTTP attributes are disabled.
+    from_version: v0.158.0
+    reference_url: https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/45085
+  - id: receiver.awsxray.EmitV1HttpConventions
+    stage: beta
+    description: >-
+      When enabled, semconv stable HTTP attributes are enabled.
+    from_version: v0.158.0
+    reference_url: https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/45085

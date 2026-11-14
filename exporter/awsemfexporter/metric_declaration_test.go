@@ -1,16 +1,5 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package awsemfexporter
 
@@ -18,7 +7,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -29,38 +19,38 @@ func TestLabelMatcherInit(t *testing.T) {
 		LabelNames: []string{"label1", "label2"},
 		Regex:      ".+",
 	}
-	err := lm.Init()
-	assert.Nil(t, err)
+	err := lm.init()
+	assert.NoError(t, err)
 	assert.Equal(t, ";", lm.Separator)
 	assert.Equal(t, ".+", lm.Regex)
 	assert.NotNil(t, lm.compiledRegex)
 
 	lm.Separator = ""
-	err = lm.Init()
-	assert.Nil(t, err)
+	err = lm.init()
+	assert.NoError(t, err)
 	assert.Equal(t, ";", lm.Separator)
 
 	lm.Separator = ","
-	err = lm.Init()
-	assert.Nil(t, err)
+	err = lm.init()
+	assert.NoError(t, err)
 	assert.Equal(t, ",", lm.Separator)
 
 	lm.Regex = "a*"
-	err = lm.Init()
-	assert.Nil(t, err)
+	err = lm.init()
+	assert.NoError(t, err)
 	assert.Equal(t, "a*", lm.Regex)
 	assert.NotNil(t, lm.compiledRegex)
 
 	// Test error
 	lm.Regex = ""
-	err = lm.Init()
-	assert.NotNil(t, err)
+	err = lm.init()
+	assert.Error(t, err)
 	assert.EqualError(t, err, "regex not specified for label matcher")
 
 	lm.LabelNames = []string{}
 	lm.Regex = ".+"
-	err = lm.Init()
-	assert.NotNil(t, err)
+	err = lm.init()
+	assert.Error(t, err)
 	assert.EqualError(t, err, "label matcher must have at least one label name specified")
 }
 
@@ -114,7 +104,8 @@ func TestGetConcatenatedLabels(t *testing.T) {
 			Separator:  tc.separator,
 			Regex:      ".+",
 		}
-		lm.Init()
+		err := lm.init()
+		assert.NoError(t, err)
 		t.Run(tc.testName, func(t *testing.T) {
 			concatenatedLabels := lm.getConcatenatedLabels(labels)
 			assert.Equal(t, tc.expected, concatenatedLabels)
@@ -219,7 +210,8 @@ func TestLabelMatcherMatches(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc.labelMatcher.Init()
+		err := tc.labelMatcher.init()
+		assert.NoError(t, err)
 		t.Run(tc.testName, func(t *testing.T) {
 			matches := tc.labelMatcher.Matches(tc.labels)
 			assert.Equal(t, tc.expected, matches)
@@ -233,9 +225,9 @@ func TestMetricDeclarationInit(t *testing.T) {
 		m := &MetricDeclaration{
 			MetricNameSelectors: []string{"a", "b", "aa"},
 		}
-		err := m.Init(logger)
-		assert.Nil(t, err)
-		assert.Equal(t, 3, len(m.metricRegexList))
+		err := m.init(logger)
+		assert.NoError(t, err)
+		assert.Len(t, m.metricRegexList, 3)
 	})
 
 	t.Run("with dimensions", func(t *testing.T) {
@@ -246,10 +238,10 @@ func TestMetricDeclarationInit(t *testing.T) {
 			},
 			MetricNameSelectors: []string{"a.*", "b$", "aa+"},
 		}
-		err := m.Init(logger)
-		assert.Nil(t, err)
-		assert.Equal(t, 3, len(m.metricRegexList))
-		assert.Equal(t, 2, len(m.Dimensions))
+		err := m.init(logger)
+		assert.NoError(t, err)
+		assert.Len(t, m.metricRegexList, 3)
+		assert.Len(t, m.Dimensions, 2)
 	})
 
 	// Test removal of dimension sets with more than 10 elements
@@ -263,10 +255,10 @@ func TestMetricDeclarationInit(t *testing.T) {
 		}
 		obs, logs := observer.New(zap.WarnLevel)
 		obsLogger := zap.New(obs)
-		err := m.Init(obsLogger)
-		assert.Nil(t, err)
-		assert.Equal(t, 3, len(m.metricRegexList))
-		assert.Equal(t, 1, len(m.Dimensions))
+		err := m.init(obsLogger)
+		assert.NoError(t, err)
+		assert.Len(t, m.metricRegexList, 3)
+		assert.Len(t, m.Dimensions, 1)
 		// Check logged warning message
 		expectedLogs := []observer.LoggedEntry{{
 			Entry:   zapcore.Entry{Level: zap.WarnLevel, Message: "Dropped dimension set: > 10 dimensions specified."},
@@ -288,9 +280,9 @@ func TestMetricDeclarationInit(t *testing.T) {
 		}
 		obs, logs := observer.New(zap.DebugLevel)
 		obsLogger := zap.New(obs)
-		err := m.Init(obsLogger)
-		assert.Nil(t, err)
-		assert.Equal(t, 1, len(m.Dimensions))
+		err := m.init(obsLogger)
+		assert.NoError(t, err)
+		assert.Len(t, m.Dimensions, 1)
 		assert.Equal(t, []string{"a", "b", "c"}, m.Dimensions[0])
 		// Check logged warning message
 		expectedLogs := []observer.LoggedEntry{
@@ -310,8 +302,8 @@ func TestMetricDeclarationInit(t *testing.T) {
 	// Test invalid metric declaration
 	t.Run("invalid metric declaration", func(t *testing.T) {
 		m := &MetricDeclaration{}
-		err := m.Init(logger)
-		assert.NotNil(t, err)
+		err := m.init(logger)
+		assert.Error(t, err)
 		assert.EqualError(t, err, "invalid metric declaration: no metric name selectors defined")
 	})
 
@@ -331,9 +323,9 @@ func TestMetricDeclarationInit(t *testing.T) {
 				},
 			},
 		}
-		err := m.Init(logger)
-		assert.Nil(t, err)
-		assert.Equal(t, 2, len(m.LabelMatchers))
+		err := m.init(logger)
+		assert.NoError(t, err)
+		assert.Len(t, m.LabelMatchers, 2)
 		assert.Equal(t, ";", m.LabelMatchers[0].Separator)
 		assert.Equal(t, ".+", m.LabelMatchers[0].Regex)
 		assert.NotNil(t, m.LabelMatchers[0].compiledRegex)
@@ -357,8 +349,8 @@ func TestMetricDeclarationInit(t *testing.T) {
 				},
 			},
 		}
-		err := m.Init(logger)
-		assert.NotNil(t, err)
+		err := m.init(logger)
+		assert.Error(t, err)
 		assert.EqualError(t, err, "label matcher must have at least one label name specified")
 
 		m = &MetricDeclaration{
@@ -369,9 +361,31 @@ func TestMetricDeclarationInit(t *testing.T) {
 				},
 			},
 		}
-		err = m.Init(logger)
-		assert.NotNil(t, err)
+		err = m.init(logger)
+		assert.Error(t, err)
 		assert.EqualError(t, err, "regex not specified for label matcher")
+	})
+}
+
+func TestMetricDeclarationInitInvalidSelector(t *testing.T) {
+	logger := zap.NewNop()
+
+	t.Run("unterminated character class", func(t *testing.T) {
+		m := &MetricDeclaration{
+			MetricNameSelectors: []string{"[unclosed"},
+		}
+		err := m.init(logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid metric name selector")
+	})
+
+	t.Run("invalid selector among valid ones", func(t *testing.T) {
+		m := &MetricDeclaration{
+			MetricNameSelectors: []string{"^a+$", "*invalid", "^b.*$"},
+		}
+		err := m.init(logger)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid metric name selector")
 	})
 }
 
@@ -380,8 +394,8 @@ func TestMetricDeclarationMatchesName(t *testing.T) {
 		MetricNameSelectors: []string{"^a+$", "^b.*$", "^ac+a$"},
 	}
 	logger := zap.NewNop()
-	err := m.Init(logger)
-	assert.Nil(t, err)
+	err := m.init(logger)
+	assert.NoError(t, err)
 
 	assert.True(t, m.MatchesName("a"))
 	assert.True(t, m.MatchesName("aa"))
@@ -496,7 +510,7 @@ func TestMetricDeclarationMatchesLabels(t *testing.T) {
 		},
 	}
 	logger := zap.NewNop()
-	metric := pdata.NewMetric()
+	metric := pmetric.NewMetric()
 	metric.SetName("a")
 
 	for _, tc := range testCases {
@@ -505,8 +519,8 @@ func TestMetricDeclarationMatchesLabels(t *testing.T) {
 			LabelMatchers:       tc.labelMatchers,
 		}
 		t.Run(tc.testName, func(t *testing.T) {
-			err := m.Init(logger)
-			assert.Nil(t, err)
+			err := m.init(logger)
+			assert.NoError(t, err)
 			matches := m.MatchesLabels(labels)
 			assert.Equal(t, tc.expected, matches)
 		})
@@ -577,7 +591,7 @@ func TestExtractDimensions(t *testing.T) {
 			map[string]string{
 				"a": "foo",
 			},
-			nil,
+			[][]string{{}},
 		},
 	}
 	logger := zap.NewNop()
@@ -588,8 +602,8 @@ func TestExtractDimensions(t *testing.T) {
 			MetricNameSelectors: []string{"foo"},
 		}
 		t.Run(tc.testName, func(t *testing.T) {
-			err := m.Init(logger)
-			assert.Nil(t, err)
+			err := m.init(logger)
+			assert.NoError(t, err)
 			dimensions := m.ExtractDimensions(tc.labels)
 			assert.Equal(t, tc.extractedDimensions, dimensions)
 		})

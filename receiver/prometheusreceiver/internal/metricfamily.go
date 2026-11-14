@@ -1,0 +1,822 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package internal // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/prometheusreceiver/internal"
+
+import (
+	"cmp"
+	"fmt"
+	"math"
+	"slices"
+	"strings"
+
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/value"
+	"github.com/prometheus/prometheus/scrape"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/prometheus"
+)
+
+type metricFamily struct {
+	mtype pmetric.MetricType
+	// isMonotonic only applies to sums
+	isMonotonic bool
+	groups      map[uint64]*metricGroup
+	name        string
+	metadata    scrape.MetricMetadata
+	groupOrders []*metricGroup
+	logger      *zap.Logger
+}
+
+// metricGroup, represents a single metric of a metric family. for example a histogram metric is usually represent by
+// a couple data complexValue (buckets and count/sum), a group of a metric family always share a same set of tags. for
+// simple types like counter and gauge, each data point is a group of itself
+type metricGroup struct {
+	mtype    pmetric.MetricType
+	ts       int64
+	ls       labels.Labels
+	count    float64
+	hasCount bool
+	sum      float64
+	hasSum   bool
+	// This corresponds to the `_created` sample found from the metric parsing.
+	// - https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#timestamps
+	// - https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#counter-1
+	createdSeconds float64
+	value          float64
+	hasValue       bool
+	hValue         *histogram.Histogram
+	fhValue        *histogram.FloatHistogram
+	complexValue   []dataPoint
+	exemplars      pmetric.ExemplarSlice
+	hasExemplars   bool
+	isNHCB         bool // true if this is a Native Histogram Custom Buckets (schema -53)
+}
+
+//nolint:unparam
+func newMetricFamily(metricName string, mc scrape.MetricMetadataStore, logger *zap.Logger, isNativeHistogram, isNHCB bool) *metricFamily {
+	metadata, familyName := metadataForMetric(metricName, mc)
+	return newMetricFamilyWithMetadata(metricName, familyName, metadata, logger, isNativeHistogram, isNHCB)
+}
+
+func newMetricFamilyWithMetadata(metricName, familyName string, metadata scrape.MetricMetadata, logger *zap.Logger, isNativeHistogram, isNHCB bool) *metricFamily {
+	// Native histograms have intrinsic metric type, use it,
+	// regardless of what metadata says.
+	if isNativeHistogram {
+		metadata.Type = model.MetricTypeHistogram
+	}
+
+	mtype, isMonotonic := convToMetricType(metadata.Type, isNativeHistogram && !isNHCB)
+	if mtype == pmetric.MetricTypeEmpty {
+		logger.Debug(fmt.Sprintf("Unknown-typed metric : %s %+v", metricName, metadata))
+	}
+
+	return &metricFamily{
+		mtype:       mtype,
+		isMonotonic: isMonotonic,
+		groups:      make(map[uint64]*metricGroup),
+		name:        familyName,
+		metadata:    metadata,
+		logger:      logger,
+	}
+}
+
+// includesMetric returns true if the metric is part of the family
+func (mf *metricFamily) includesMetric(metricName string) bool {
+	if mf.mtype == pmetric.MetricTypeSum {
+		return normalizeMetricName(metricName) == mf.metadata.MetricFamily
+	}
+	if mf.mtype != pmetric.MetricTypeGauge {
+		// If it is a merged family type, then it should match the
+		// family name when suffixes are trimmed.
+		return normalizeMetricName(metricName) == mf.name
+	}
+	// If it isn't a merged type, the metricName and family name should match
+	return metricName == mf.name
+}
+
+func (mg *metricGroup) sortPoints() {
+	slices.SortFunc(mg.complexValue, func(a, b dataPoint) int {
+		return cmp.Compare(a.boundary, b.boundary)
+	})
+}
+
+func (mg *metricGroup) toDistributionPoint(dest pmetric.HistogramDataPointSlice, logger *zap.Logger) {
+	if !mg.hasCount {
+		return
+	}
+
+	pointIsStale := value.IsStaleNaN(mg.sum) || value.IsStaleNaN(mg.count)
+	// NHCB conversion loses whether _count was absent. Reject the inconsistent
+	// form that identifies a sum-only classic histogram.
+	if mg.isNHCB && !pointIsStale && mg.count == 0 && mg.sum != 0 {
+		return
+	}
+
+	mg.sortPoints()
+
+	var point pmetric.HistogramDataPoint
+
+	if mg.isNHCB {
+		var bucketCounts []uint64
+		var validBuckets bool
+		switch {
+		case mg.hValue != nil:
+			bucketCounts, validBuckets = convertNHCBBDeltBuckets(mg.hValue)
+		case mg.fhValue != nil:
+			bucketCounts, validBuckets = convertNHCBAbsoluteBuckets(mg.fhValue)
+		default:
+			validBuckets = true
+		}
+		// A malformed classic histogram converted to NHCB carries negative
+		// bucket counts; drop it instead of emitting invalid OTLP data.
+		if !validBuckets && !pointIsStale {
+			logger.Debug("dropping NHCB datapoint with negative or NaN bucket counts", zap.Any("labels", mg.ls))
+			return
+		}
+		point = dest.AppendEmpty()
+		switch {
+		case mg.hValue != nil:
+			point.ExplicitBounds().FromRaw(mg.hValue.CustomValues)
+		case mg.fhValue != nil:
+			point.ExplicitBounds().FromRaw(mg.fhValue.CustomValues)
+		}
+		point.BucketCounts().FromRaw(bucketCounts)
+	} else {
+		bucketCount := len(mg.complexValue) + 1
+		// if the final bucket is +Inf, we ignore it
+		if bucketCount > 1 && mg.complexValue[bucketCount-2].boundary == math.Inf(1) {
+			bucketCount--
+		}
+		if !pointIsStale {
+			var previousCount float64
+			for i := 0; i < bucketCount-1; i++ {
+				if math.IsNaN(mg.complexValue[i].value) || mg.complexValue[i].value < previousCount {
+					logger.Debug("dropping histogram datapoint with NaN or decreasing bucket counts", zap.Any("labels", mg.ls))
+					return
+				}
+				previousCount = mg.complexValue[i].value
+			}
+			if math.IsNaN(mg.count) || mg.count < previousCount {
+				logger.Debug("dropping histogram datapoint with count that is NaN or below the largest bucket count", zap.Any("labels", mg.ls))
+				return
+			}
+		}
+
+		point = dest.AppendEmpty()
+		// for OTLP the bounds won't include +inf
+		explicitBounds := point.ExplicitBounds()
+		explicitBounds.EnsureCapacity(bucketCount - 1)
+		bucketCountsSlice := point.BucketCounts()
+		bucketCountsSlice.EnsureCapacity(bucketCount)
+		var adjustedCount float64
+
+		for i := 0; i < bucketCount-1; i++ {
+			explicitBounds.Append(mg.complexValue[i].boundary)
+			adjustedCount = mg.complexValue[i].value
+
+			// Buckets still need to be sent to know to set them as stale,
+			// but a staleness NaN converted to uint64 would be an extremely large number.
+			// Setting to 0 instead.
+			if pointIsStale {
+				adjustedCount = 0
+			} else if i != 0 {
+				adjustedCount -= mg.complexValue[i-1].value
+			}
+			bucketCountsSlice.Append(uint64(adjustedCount))
+		}
+
+		// Add the final bucket based on the total count
+		adjustedCount = mg.count
+		if pointIsStale {
+			adjustedCount = 0
+		} else if bucketCount > 1 {
+			adjustedCount -= mg.complexValue[bucketCount-2].value
+		}
+		bucketCountsSlice.Append(uint64(adjustedCount))
+	}
+
+	if pointIsStale {
+		point.SetFlags(pmetric.DefaultDataPointFlags.WithNoRecordedValue(true))
+	} else {
+		point.SetCount(uint64(mg.count))
+		if mg.hasSum {
+			point.SetSum(mg.sum)
+		}
+	}
+
+	// The timestamp MUST be in retrieved from milliseconds and converted to nanoseconds.
+	tsNanos := timestampFromMs(mg.ts)
+	if mg.createdSeconds != 0 {
+		point.SetStartTimestamp(timestampFromFloat64(mg.createdSeconds))
+	}
+	point.SetTimestamp(tsNanos)
+	populateAttributes(pmetric.MetricTypeHistogram, mg.ls, point.Attributes())
+	if mg.hasExemplars {
+		mg.setExemplars(point.Exemplars())
+	}
+}
+
+// toExponentialHistogramDataPoints is based on
+// https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/#exponential-histograms
+func (mg *metricGroup) toExponentialHistogramDataPoints(dest pmetric.ExponentialHistogramDataPointSlice) {
+	if !mg.hasCount {
+		return
+	}
+	point := dest.AppendEmpty()
+	point.SetTimestamp(timestampFromMs(mg.ts))
+
+	// We do not set Min or Max as native histograms don't have that information.
+	switch {
+	case mg.fhValue != nil:
+		fh := mg.fhValue
+
+		if value.IsStaleNaN(fh.Sum) {
+			point.SetFlags(pmetric.DefaultDataPointFlags.WithNoRecordedValue(true))
+			// The count and sum are initialized to 0, so we don't need to set them.
+		} else {
+			point.SetScale(fh.Schema)
+			// Input is a float native histogram. This conversion will lose
+			// precision,but we don't actually expect float histograms in scrape,
+			// since these are typically the result of operations on integer
+			// native histograms in the database.
+			point.SetCount(uint64(fh.Count))
+			point.SetSum(fh.Sum)
+			point.SetZeroThreshold(fh.ZeroThreshold)
+			point.SetZeroCount(uint64(fh.ZeroCount))
+
+			if len(fh.PositiveSpans) > 0 {
+				point.Positive().SetOffset(fh.PositiveSpans[0].Offset - 1) // -1 because OTEL offset are for the lower bound, not the upper bound
+				convertAbsoluteBuckets(fh.PositiveSpans, fh.PositiveBuckets, point.Positive().BucketCounts())
+			}
+			if len(fh.NegativeSpans) > 0 {
+				point.Negative().SetOffset(fh.NegativeSpans[0].Offset - 1) // -1 because OTEL offset are for the lower bound, not the upper bound
+				convertAbsoluteBuckets(fh.NegativeSpans, fh.NegativeBuckets, point.Negative().BucketCounts())
+			}
+		}
+
+	case mg.hValue != nil:
+		h := mg.hValue
+
+		if value.IsStaleNaN(h.Sum) {
+			point.SetFlags(pmetric.DefaultDataPointFlags.WithNoRecordedValue(true))
+			// The count and sum are initialized to 0, so we don't need to set them.
+		} else {
+			point.SetScale(h.Schema)
+			point.SetCount(h.Count)
+			point.SetSum(h.Sum)
+			point.SetZeroThreshold(h.ZeroThreshold)
+			point.SetZeroCount(h.ZeroCount)
+
+			if len(h.PositiveSpans) > 0 {
+				point.Positive().SetOffset(h.PositiveSpans[0].Offset - 1) // -1 because OTEL offset are for the lower bound, not the upper bound
+				convertDeltaBuckets(h.PositiveSpans, h.PositiveBuckets, point.Positive().BucketCounts())
+			}
+			if len(h.NegativeSpans) > 0 {
+				point.Negative().SetOffset(h.NegativeSpans[0].Offset - 1) // -1 because OTEL offset are for the lower bound, not the upper bound
+				convertDeltaBuckets(h.NegativeSpans, h.NegativeBuckets, point.Negative().BucketCounts())
+			}
+		}
+
+	default:
+		// This should never happen.
+		return
+	}
+
+	tsNanos := timestampFromMs(mg.ts)
+	if mg.createdSeconds != 0 {
+		point.SetStartTimestamp(timestampFromFloat64(mg.createdSeconds))
+	}
+	point.SetTimestamp(tsNanos)
+	populateAttributes(pmetric.MetricTypeHistogram, mg.ls, point.Attributes())
+	if mg.hasExemplars {
+		mg.setExemplars(point.Exemplars())
+	}
+}
+
+func convertDeltaBuckets(spans []histogram.Span, deltas []int64, buckets pcommon.UInt64Slice) {
+	buckets.EnsureCapacity(len(deltas))
+	bucketIdx := 0
+	bucketCount := int64(0)
+	for spanIdx, span := range spans {
+		if spanIdx > 0 {
+			for i := int32(0); i < span.Offset; i++ {
+				buckets.Append(uint64(0))
+			}
+		}
+		for i := uint32(0); i < span.Length; i++ {
+			bucketCount += deltas[bucketIdx]
+			bucketIdx++
+			buckets.Append(uint64(bucketCount))
+		}
+	}
+}
+
+func convertAbsoluteBuckets(spans []histogram.Span, counts []float64, buckets pcommon.UInt64Slice) {
+	buckets.EnsureCapacity(len(counts))
+	bucketIdx := 0
+	for spanIdx, span := range spans {
+		if spanIdx > 0 {
+			for i := int32(0); i < span.Offset; i++ {
+				buckets.Append(uint64(0))
+			}
+		}
+		for i := uint32(0); i < span.Length; i++ {
+			buckets.Append(uint64(counts[bucketIdx]))
+			bucketIdx++
+		}
+	}
+}
+
+// convertNHCBBDeltBuckets converts NHCB delta buckets to otel bucket counts.
+// The returned bool is false if any bucket count is negative, which cannot be
+// represented in OTLP.
+func convertNHCBBDeltBuckets(histogram *histogram.Histogram) ([]uint64, bool) {
+	bucketCounts := make([]uint64, len(histogram.CustomValues)+1)
+	if len(histogram.PositiveSpans) == 0 {
+		return bucketCounts, true
+	}
+	valid := true
+	bucketIdx := 0
+	bucketCount := int64(0)
+	deltaIdx := 0
+
+	for _, span := range histogram.PositiveSpans {
+		bucketIdx += int(span.Offset)
+
+		for i := uint32(0); i < span.Length && bucketIdx < len(bucketCounts) && deltaIdx < len(histogram.PositiveBuckets); i++ {
+			bucketCount += histogram.PositiveBuckets[deltaIdx]
+			deltaIdx++
+			if bucketCount < 0 {
+				valid = false
+			}
+
+			if bucketIdx >= 0 && bucketIdx < len(bucketCounts) {
+				bucketCounts[bucketIdx] = uint64(bucketCount)
+			}
+			bucketIdx++
+		}
+	}
+	return bucketCounts, valid
+}
+
+// convertNHCBAbsoluteBuckets converts NHCB absolute buckets to otel bucket counts.
+// The returned bool is false if any bucket count is negative or NaN, which
+// cannot be represented in OTLP.
+func convertNHCBAbsoluteBuckets(histogram *histogram.FloatHistogram) ([]uint64, bool) {
+	bucketCounts := make([]uint64, len(histogram.CustomValues)+1)
+	if len(histogram.PositiveSpans) == 0 {
+		return bucketCounts, true
+	}
+	valid := true
+	bucketIdx := 0
+	for _, span := range histogram.PositiveSpans {
+		bucketIdx += int(span.Offset)
+
+		for i := uint32(0); i < span.Length && bucketIdx < len(bucketCounts) && i < uint32(len(histogram.PositiveBuckets)); i++ {
+			if bucketIdx >= 0 && bucketIdx < len(bucketCounts) {
+				if math.IsNaN(histogram.PositiveBuckets[i]) || histogram.PositiveBuckets[i] < 0 {
+					valid = false
+				}
+				// This intentionally truncates the float value to an integer (e.g. 5.7 becomes 5).
+				bucketCounts[bucketIdx] = uint64(histogram.PositiveBuckets[i])
+			}
+			bucketIdx++
+		}
+	}
+	return bucketCounts, valid
+}
+
+func (mg *metricGroup) setExemplars(exemplars pmetric.ExemplarSlice) {
+	if mg == nil || !mg.hasExemplars {
+		return
+	}
+	if mg.exemplars.Len() > 0 {
+		mg.exemplars.MoveAndAppendTo(exemplars)
+	}
+}
+
+func (mg *metricGroup) toSummaryPoint(dest pmetric.SummaryDataPointSlice) {
+	// expecting count to be provided, however, in the following two cases, they can be missed.
+	// 1. data is corrupted
+	// 2. ignored by startValue evaluation
+	if !mg.hasCount {
+		return
+	}
+
+	mg.sortPoints()
+
+	point := dest.AppendEmpty()
+	pointIsStale := value.IsStaleNaN(mg.sum) || value.IsStaleNaN(mg.count)
+	if pointIsStale {
+		point.SetFlags(pmetric.DefaultDataPointFlags.WithNoRecordedValue(true))
+	} else {
+		if mg.hasSum {
+			point.SetSum(mg.sum)
+		}
+		point.SetCount(uint64(mg.count))
+	}
+
+	quantileValues := point.QuantileValues()
+	quantileValues.EnsureCapacity(len(mg.complexValue))
+	for _, p := range mg.complexValue {
+		quantile := quantileValues.AppendEmpty()
+		// Quantiles still need to be sent to know to set them as stale,
+		// but a staleness NaN converted to uint64 would be an extremely large number.
+		// By not setting the quantile value, it will default to 0.
+		if !pointIsStale {
+			quantile.SetValue(p.value)
+		}
+		quantile.SetQuantile(p.boundary)
+	}
+
+	// Based on the summary description from https://prometheus.io/docs/concepts/metric_types/#summary
+	// the quantiles are calculated over a sliding time window, however, the count is the total count of
+	// observations and the corresponding sum is a sum of all observed values, thus the sum and count used
+	// at the global level of the metricspb.SummaryValue
+	// The timestamp MUST be in retrieved from milliseconds and converted to nanoseconds.
+	tsNanos := timestampFromMs(mg.ts)
+	point.SetTimestamp(tsNanos)
+	if mg.createdSeconds != 0 {
+		point.SetStartTimestamp(timestampFromFloat64(mg.createdSeconds))
+	}
+	populateAttributes(pmetric.MetricTypeSummary, mg.ls, point.Attributes())
+}
+
+func (mg *metricGroup) toNumberDataPoint(dest pmetric.NumberDataPointSlice) {
+	if !mg.hasValue {
+		return
+	}
+	tsNanos := timestampFromMs(mg.ts)
+	point := dest.AppendEmpty()
+	// gauge/undefined types have no start time.
+	if mg.mtype == pmetric.MetricTypeSum {
+		if mg.createdSeconds != 0 {
+			point.SetStartTimestamp(timestampFromFloat64(mg.createdSeconds))
+		}
+	}
+	point.SetTimestamp(tsNanos)
+	if value.IsStaleNaN(mg.value) {
+		point.SetFlags(pmetric.DefaultDataPointFlags.WithNoRecordedValue(true))
+	} else {
+		point.SetDoubleValue(mg.value)
+	}
+	populateAttributes(pmetric.MetricTypeGauge, mg.ls, point.Attributes())
+	if mg.hasExemplars {
+		mg.setExemplars(point.Exemplars())
+	}
+}
+
+func populateAttributes(mType pmetric.MetricType, ls labels.Labels, dest pcommon.Map) {
+	names := getSortedNotUsefulLabels(mType)
+	var buf [16]labels.Label
+	n := 0
+	skipped := 0
+	j := 0
+	ls.Range(func(l labels.Label) {
+		for j < len(names) && names[j] < l.Name {
+			j++
+		}
+		if j < len(names) && l.Name == names[j] {
+			skipped++
+			return
+		}
+		if strings.HasPrefix(l.Name, prometheus.ScopeLabelPrefix) {
+			skipped++
+			return
+		}
+		if l.Value == "" {
+			// empty label values should be omitted
+			skipped++
+			return
+		}
+		if n < len(buf) {
+			buf[n] = l
+			n++
+			return
+		}
+		if n == len(buf) {
+			dest.EnsureCapacity(ls.Len() - skipped)
+			for i := range buf {
+				dest.PutStr(buf[i].Name, buf[i].Value)
+			}
+			n++
+		}
+		dest.PutStr(l.Name, l.Value)
+	})
+	if n > 0 && n <= len(buf) {
+		dest.EnsureCapacity(n)
+		for _, l := range buf[:n] {
+			dest.PutStr(l.Name, l.Value)
+		}
+	}
+}
+
+func (mf *metricFamily) loadMetricGroupOrCreate(groupKey uint64, ls labels.Labels, ts int64) *metricGroup {
+	mg, ok := mf.groups[groupKey]
+	if !ok {
+		mg = &metricGroup{
+			mtype: mf.mtype,
+			ts:    ts,
+			ls:    ls,
+		}
+		switch mf.mtype {
+		case pmetric.MetricTypeHistogram:
+			// Pre-allocate to 16 to accommodate the default OpenTelemetry ExplicitBucketHistogram
+			// boundaries (15 bounds + +Inf = 16 buckets) and Prometheus DefBuckets (11 bounds + +Inf = 12 buckets).
+			mg.complexValue = make([]dataPoint, 0, 16)
+		case pmetric.MetricTypeSummary:
+			// Pre-allocate to 5 to accommodate the 5 quantiles of Prometheus's default
+			// go_gc_duration_seconds summary (0, 0.25, 0.5, 0.75, 1).
+			mg.complexValue = make([]dataPoint, 0, 5)
+		}
+		mf.groups[groupKey] = mg
+		// maintaining data insertion order is helpful to generate stable/reproducible metric output
+		mf.groupOrders = append(mf.groupOrders, mg)
+	}
+	return mg
+}
+
+func (mf *metricFamily) addSeries(seriesRef uint64, metricName string, ls labels.Labels, t int64, v float64) error {
+	mg := mf.loadMetricGroupOrCreate(seriesRef, ls, t)
+	if mg.ts != t {
+		return fmt.Errorf("inconsistent timestamps on metric points for metric %v", metricName)
+	}
+	switch mf.mtype {
+	case pmetric.MetricTypeHistogram, pmetric.MetricTypeSummary:
+		switch {
+		case strings.HasSuffix(metricName, metricsSuffixSum):
+			mg.sum = v
+			mg.hasSum = true
+		case strings.HasSuffix(metricName, metricsSuffixCount):
+			// always use the timestamp from count, because is the only required field for histograms and summaries.
+			mg.ts = t
+			mg.count = v
+			mg.hasCount = true
+		case isCreatedMetric(metricName, mf.metadata.MetricFamily):
+			mg.createdSeconds = v
+		default:
+			boundary, err := getBoundary(mf.mtype, ls)
+			if err != nil {
+				return err
+			}
+			mg.complexValue = append(mg.complexValue, dataPoint{value: v, boundary: boundary})
+		}
+	case pmetric.MetricTypeExponentialHistogram:
+		if isCreatedMetric(metricName, mf.metadata.MetricFamily) {
+			mg.createdSeconds = v
+		}
+	case pmetric.MetricTypeSum:
+		if isCreatedMetric(metricName, mf.metadata.MetricFamily) {
+			mg.createdSeconds = v
+		} else {
+			mg.value = v
+			mg.hasValue = true
+		}
+	default:
+		mg.value = v
+		mg.hasValue = true
+	}
+
+	return nil
+}
+
+func isCreatedMetric(metricName, familyName string) bool {
+	return strings.HasSuffix(metricName, metricSuffixCreated) &&
+		metricName[:len(metricName)-len(metricSuffixCreated)] == familyName
+}
+
+// addCreationTimestamp updates the metric group cache with the created timestamp for the group.
+// The parser gets the created time in ms however and we must convert it to seconds here.
+// - https://github.com/prometheus/prometheus/blob/2bf6f4c9dcbb1ad2e8fef70c6a48d8fc44a7f57c/model/textparse/interface.go#L77-L80
+func (mf *metricFamily) addCreationTimestamp(seriesRef uint64, ls labels.Labels, atMs, ctMs int64) {
+	mg := mf.loadMetricGroupOrCreate(seriesRef, ls, atMs)
+	mg.createdSeconds = float64(ctMs) / 1000.0
+}
+
+func (mf *metricFamily) addExponentialHistogramSeries(seriesRef uint64, metricName string, ls labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) error {
+	mg := mf.loadMetricGroupOrCreate(seriesRef, ls, t)
+	if mg.ts != t {
+		return fmt.Errorf("inconsistent timestamps on metric points for metric %v", metricName)
+	}
+	if mg.mtype != pmetric.MetricTypeExponentialHistogram {
+		return fmt.Errorf("metric type mismatch for exponential histogram metric %v type %s", metricName, mg.mtype.String())
+	}
+	switch {
+	case fh != nil:
+		if mg.hValue != nil {
+			return fmt.Errorf("exponential histogram %v already has integer counts", metricName)
+		}
+		mg.count = fh.Count
+		mg.sum = fh.Sum
+		mg.hasCount = true
+		mg.hasSum = true
+		mg.fhValue = fh
+	case h != nil:
+		if mg.fhValue != nil {
+			return fmt.Errorf("exponential histogram %v already has float counts", metricName)
+		}
+		mg.count = float64(h.Count)
+		mg.sum = h.Sum
+		mg.hasCount = true
+		mg.hasSum = true
+		mg.hValue = h
+	}
+	return nil
+}
+
+// addNHCBSeries adds a Native Histogram Custom Buckets (NHCB) series to the metric family.
+func (mf *metricFamily) addNHCBSeries(seriesRef uint64, metricName string, ls labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) error {
+	mg := mf.loadMetricGroupOrCreate(seriesRef, ls, t)
+	if mg.ts != t {
+		return fmt.Errorf("inconsistent timestamps on metric points for metric %v", metricName)
+	}
+	if mg.mtype != pmetric.MetricTypeHistogram {
+		return fmt.Errorf("metric type mismatch for NHCB metric %v type %s", metricName, mg.mtype.String())
+	}
+	mg.isNHCB = true
+
+	switch {
+	case h != nil:
+		mg.hValue = h
+		mg.count = float64(h.Count)
+		mg.hasCount = true
+		mg.sum = h.Sum
+		mg.hasSum = true
+	case fh != nil:
+		mg.fhValue = fh
+		mg.count = fh.Count
+		mg.hasCount = true
+		mg.sum = fh.Sum
+		mg.hasSum = true
+	default:
+		return fmt.Errorf("NHCB metric %v has no histogram data", metricName)
+	}
+
+	return nil
+}
+
+func (mf *metricFamily) appendMetric(metrics pmetric.MetricSlice, trimSuffixes bool) {
+	if len(mf.groupOrders) == 0 {
+		return
+	}
+	metric := metrics.AppendEmpty()
+	// Trims type and unit suffixes from metric name
+	name := mf.name
+	if trimSuffixes {
+		name = prometheus.TrimPromSuffixes(name, mf.mtype, mf.metadata.Unit)
+	}
+	metric.SetName(name)
+	metric.SetDescription(mf.metadata.Help)
+	metric.SetUnit(prometheus.UnitWordToUCUM(mf.metadata.Unit))
+	metric.Metadata().PutStr(prometheus.MetricMetadataTypeKey, string(mf.metadata.Type))
+
+	var pointCount int
+
+	switch mf.mtype {
+	case pmetric.MetricTypeHistogram:
+		histogram := metric.SetEmptyHistogram()
+		histogram.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		hdpL := histogram.DataPoints()
+		hdpL.EnsureCapacity(len(mf.groupOrders))
+		for _, mg := range mf.groupOrders {
+			mg.toDistributionPoint(hdpL, mf.logger)
+		}
+		pointCount = hdpL.Len()
+
+	case pmetric.MetricTypeSummary:
+		summary := metric.SetEmptySummary()
+		sdpL := summary.DataPoints()
+		sdpL.EnsureCapacity(len(mf.groupOrders))
+		for _, mg := range mf.groupOrders {
+			mg.toSummaryPoint(sdpL)
+		}
+		pointCount = sdpL.Len()
+
+	case pmetric.MetricTypeSum:
+		sum := metric.SetEmptySum()
+		sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		sum.SetIsMonotonic(mf.isMonotonic)
+		sdpL := sum.DataPoints()
+		sdpL.EnsureCapacity(len(mf.groupOrders))
+		for _, mg := range mf.groupOrders {
+			mg.toNumberDataPoint(sdpL)
+		}
+		pointCount = sdpL.Len()
+
+	case pmetric.MetricTypeExponentialHistogram:
+		histogram := metric.SetEmptyExponentialHistogram()
+		histogram.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		hdpL := histogram.DataPoints()
+		hdpL.EnsureCapacity(len(mf.groupOrders))
+		for _, mg := range mf.groupOrders {
+			mg.toExponentialHistogramDataPoints(hdpL)
+		}
+		pointCount = hdpL.Len()
+
+	default: // Everything else should be set to a Gauge.
+		gauge := metric.SetEmptyGauge()
+		gdpL := gauge.DataPoints()
+		gdpL.EnsureCapacity(len(mf.groupOrders))
+		for _, mg := range mf.groupOrders {
+			mg.toNumberDataPoint(gdpL)
+		}
+		pointCount = gdpL.Len()
+	}
+
+	if pointCount == 0 {
+		metrics.RemoveIf(func(m pmetric.Metric) bool {
+			return m == metric
+		})
+	}
+}
+
+func (mf *metricFamily) addExemplar(seriesRef uint64, e exemplar.Exemplar) {
+	if mf.mtype == pmetric.MetricTypeSummary {
+		return
+	}
+	mg := mf.groups[seriesRef]
+	if mg == nil {
+		return
+	}
+	if !mg.hasExemplars {
+		mg.exemplars = pmetric.NewExemplarSlice()
+		mg.hasExemplars = true
+	}
+	convertExemplar(e, mg.exemplars.AppendEmpty())
+}
+
+// convertExemplar converts a Prometheus exemplar's labels to an OTel exemplar.
+// A trace_id/span_id label converts only when it's exactly OTel width and
+// non-zero; anything else becomes a filtered attribute instead of being zero
+// padded or truncated. An empty value is dropped, same as an absent label.
+func convertExemplar(pe exemplar.Exemplar, e pmetric.Exemplar) {
+	e.SetTimestamp(timestampFromMs(pe.Ts))
+	e.SetDoubleValue(pe.Value)
+	pe.Labels.Range(func(lb labels.Label) {
+		switch {
+		case strings.EqualFold(lb.Name, prometheus.ExemplarTraceIDKey):
+			if lb.Value == "" {
+				return
+			}
+			var tid [16]byte
+			if decodeHexString(tid[:], lb.Value) {
+				// all-zero looks unset already, so keep the original value instead of setting it
+				if traceID := pcommon.TraceID(tid); !traceID.IsEmpty() {
+					e.SetTraceID(traceID)
+					return
+				}
+			}
+			e.FilteredAttributes().PutStr(lb.Name, lb.Value)
+		case strings.EqualFold(lb.Name, prometheus.ExemplarSpanIDKey):
+			if lb.Value == "" {
+				return
+			}
+			var sid [8]byte
+			if decodeHexString(sid[:], lb.Value) {
+				// all-zero looks unset already, so keep the original value instead of setting it
+				if spanID := pcommon.SpanID(sid); !spanID.IsEmpty() {
+					e.SetSpanID(spanID)
+					return
+				}
+			}
+			e.FilteredAttributes().PutStr(lb.Name, lb.Value)
+		default:
+			e.FilteredAttributes().PutStr(lb.Name, lb.Value)
+		}
+	})
+}
+
+func decodeHexByte(c byte) (byte, bool) {
+	switch {
+	case '0' <= c && c <= '9':
+		return c - '0', true
+	case 'a' <= c && c <= 'f':
+		return c - 'a' + 10, true
+	case 'A' <= c && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func decodeHexString(dst []byte, s string) bool {
+	if len(s) != len(dst)*2 {
+		return false
+	}
+	for i := range dst {
+		hi, ok1 := decodeHexByte(s[i*2])
+		lo, ok2 := decodeHexByte(s[i*2+1])
+		if !ok1 || !ok2 {
+			return false
+		}
+		dst[i] = (hi << 4) | lo
+	}
+	return true
+}

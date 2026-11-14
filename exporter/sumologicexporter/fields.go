@@ -1,61 +1,87 @@
-// Copyright 2020 OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package sumologicexporter
+package sumologicexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/sumologicexporter"
 
 import (
-	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
-	"go.opentelemetry.io/collector/consumer/pdata"
-	tracetranslator "go.opentelemetry.io/collector/translator/trace"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
 // fields represents metadata
 type fields struct {
-	orig     pdata.AttributeMap
-	replacer *strings.Replacer
+	orig        pcommon.Map
+	initialized bool
 }
 
-func newFields(attrMap pdata.AttributeMap) fields {
+func newFields(attrMap pcommon.Map) fields {
 	return fields{
-		orig:     attrMap,
-		replacer: strings.NewReplacer(",", "_", "=", ":", "\n", "_"),
+		orig:        attrMap,
+		initialized: true,
 	}
+}
+
+func (f fields) isInitialized() bool {
+	return f.initialized
 }
 
 // string returns fields as ordered key=value string with `, ` as separator
 func (f fields) string() string {
+	if !f.initialized {
+		return ""
+	}
+
 	returnValue := make([]string, 0, f.orig.Len())
-	f.orig.Range(func(k string, v pdata.AttributeValue) bool {
+
+	for k, v := range f.orig.All() {
+		// Don't add source related attributes to fields as they are handled separately
+		// and are added to the payload either as special HTTP headers or as resources
+		// attributes.
+		if k == attributeKeySourceCategory || k == attributeKeySourceHost || k == attributeKeySourceName {
+			continue
+		}
+
+		sv := v.AsString()
+
+		// Skip empty field
+		if sv == "" {
+			continue
+		}
+
+		key := []byte(k)
+		f.sanitizeField(key)
+		value := []byte(sv)
+		f.sanitizeField(value)
+		sb := strings.Builder{}
+		sb.Grow(len(key) + len(value) + 1)
+		sb.Write(key)
+		sb.WriteRune('=')
+		sb.Write(value)
+
 		returnValue = append(
 			returnValue,
-			fmt.Sprintf(
-				"%s=%s",
-				f.sanitizeField(k),
-				f.sanitizeField(tracetranslator.AttributeValueToString(v)),
-			),
+			sb.String(),
 		)
-		return true
-	})
-	sort.Strings(returnValue)
+	}
+	slices.Sort(returnValue)
 
 	return strings.Join(returnValue, ", ")
 }
 
 // sanitizeFields sanitize field (key or value) to be correctly parsed by sumologic receiver
-func (f fields) sanitizeField(fld string) string {
-	return f.replacer.Replace(fld)
+// It modifies the field in place.
+func (fields) sanitizeField(fld []byte) {
+	for i := range fld {
+		switch fld[i] {
+		case ',':
+			fld[i] = '_'
+		case '=':
+			fld[i] = ':'
+		case '\n':
+			fld[i] = '_'
+		default:
+		}
+	}
 }

@@ -1,97 +1,107 @@
-// Copyright 2019 OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package awskinesisexporter
+//go:generate make mdatagen
+
+package awskinesisexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awskinesisexporter"
 
 import (
 	"context"
 
-	awskinesis "github.com/signalfx/opencensus-go-exporter-kinesis"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/config/configretry"
+	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awskinesisexporter/internal/batch"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awskinesisexporter/internal/metadata"
 )
 
 const (
-	// The value of "type" key in configuration.
-	typeStr      = "awskinesis"
-	exportFormat = "jaeger-proto"
+	defaultEncoding    = "otlp"
+	defaultCompression = "none"
 )
 
 // NewFactory creates a factory for Kinesis exporter.
-func NewFactory() component.ExporterFactory {
-	return exporterhelper.NewFactory(
-		typeStr,
+func NewFactory() exporter.Factory {
+	return exporter.NewFactory(
+		metadata.Type,
 		createDefaultConfig,
-		exporterhelper.WithTraces(createTracesExporter))
+		exporter.WithTraces(newTracesExporter, metadata.TracesStability),
+		exporter.WithMetrics(newMetricsExporter, metadata.MetricsStability),
+		exporter.WithLogs(newLogsExporter, metadata.LogsStability),
+	)
 }
 
-func createDefaultConfig() config.Exporter {
+func createDefaultConfig() component.Config {
 	return &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
+		TimeoutSettings: exporterhelper.NewDefaultTimeoutConfig(),
+		BackOffConfig:   configretry.NewDefaultBackOffConfig(),
+		QueueSettings:   configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
+		Encoding: Encoding{
+			Name:        defaultEncoding,
+			Compression: defaultCompression,
+		},
 		AWS: AWSConfig{
 			Region: "us-west-2",
 		},
-		KPL: KPLConfig{
-			BatchSize:            5242880,
-			BatchCount:           1000,
-			BacklogCount:         2000,
-			FlushIntervalSeconds: 5,
-			MaxConnections:       24,
-		},
-
-		QueueSize:            100000,
-		NumWorkers:           8,
-		FlushIntervalSeconds: 5,
-		MaxBytesPerBatch:     100000,
-		MaxBytesPerSpan:      900000,
+		MaxRecordsPerBatch: batch.MaxBatchedRecords,
+		MaxRecordSize:      batch.MaxRecordSize,
+		IdleConnTimeout:    defaultIdleConnTimeout,
 	}
 }
 
-func createTracesExporter(
-	_ context.Context,
-	params component.ExporterCreateSettings,
-	config config.Exporter,
-) (component.TracesExporter, error) {
-	c := config.(*Config)
-	k, err := awskinesis.NewExporter(&awskinesis.Options{
-		Name:               c.ID().String(),
-		StreamName:         c.AWS.StreamName,
-		AWSRegion:          c.AWS.Region,
-		AWSRole:            c.AWS.Role,
-		AWSKinesisEndpoint: c.AWS.KinesisEndpoint,
-
-		KPLAggregateBatchSize:   c.KPL.AggregateBatchSize,
-		KPLAggregateBatchCount:  c.KPL.AggregateBatchCount,
-		KPLBatchSize:            c.KPL.BatchSize,
-		KPLBatchCount:           c.KPL.BatchCount,
-		KPLBacklogCount:         c.KPL.BacklogCount,
-		KPLFlushIntervalSeconds: c.KPL.FlushIntervalSeconds,
-		KPLMaxConnections:       c.KPL.MaxConnections,
-		KPLMaxRetries:           c.KPL.MaxRetries,
-		KPLMaxBackoffSeconds:    c.KPL.MaxBackoffSeconds,
-
-		QueueSize:             c.QueueSize,
-		NumWorkers:            c.NumWorkers,
-		MaxAllowedSizePerSpan: c.MaxBytesPerSpan,
-		MaxListSize:           c.MaxBytesPerBatch,
-		ListFlushInterval:     c.FlushIntervalSeconds,
-		Encoding:              exportFormat,
-	}, params.Logger)
+func newTracesExporter(ctx context.Context, params exporter.Settings, conf component.Config) (exporter.Traces, error) {
+	exp, err := createExporter(ctx, conf, params.Logger)
 	if err != nil {
 		return nil, err
 	}
+	c := conf.(*Config)
+	return exporterhelper.NewTraces(
+		ctx,
+		params,
+		conf,
+		exp.consumeTraces,
+		exporterhelper.WithStart(exp.start),
+		exporterhelper.WithTimeout(c.TimeoutSettings),
+		exporterhelper.WithRetry(c.BackOffConfig),
+		exporterhelper.WithQueue(c.QueueSettings),
+	)
+}
 
-	return Exporter{k, params.Logger}, nil
+func newMetricsExporter(ctx context.Context, params exporter.Settings, conf component.Config) (exporter.Metrics, error) {
+	exp, err := createExporter(ctx, conf, params.Logger)
+	if err != nil {
+		return nil, err
+	}
+	c := conf.(*Config)
+	return exporterhelper.NewMetrics(
+		ctx,
+		params,
+		c,
+		exp.consumeMetrics,
+		exporterhelper.WithStart(exp.start),
+		exporterhelper.WithTimeout(c.TimeoutSettings),
+		exporterhelper.WithRetry(c.BackOffConfig),
+		exporterhelper.WithQueue(c.QueueSettings),
+	)
+}
+
+func newLogsExporter(ctx context.Context, params exporter.Settings, conf component.Config) (exporter.Logs, error) {
+	exp, err := createExporter(ctx, conf, params.Logger)
+	if err != nil {
+		return nil, err
+	}
+	c := conf.(*Config)
+	return exporterhelper.NewLogs(
+		ctx,
+		params,
+		c,
+		exp.consumeLogs,
+		exporterhelper.WithStart(exp.start),
+		exporterhelper.WithTimeout(c.TimeoutSettings),
+		exporterhelper.WithRetry(c.BackOffConfig),
+		exporterhelper.WithQueue(c.QueueSettings),
+	)
 }

@@ -1,18 +1,7 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package fluentforwardreceiver
+package fluentforwardreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/fluentforwardreceiver"
 
 import (
 	"context"
@@ -21,13 +10,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/tinylib/msgp/msgp"
-	"go.opencensus.io/stats"
 	"go.uber.org/zap"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/fluentforwardreceiver/observ"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/fluentforwardreceiver/internal"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/fluentforwardreceiver/internal/metadata"
 )
 
 // The initial size of the read buffer. Messages can come in that are bigger
@@ -35,14 +25,21 @@ import (
 const readBufferSize = 10 * 1024
 
 type server struct {
-	outCh  chan<- Event
-	logger *zap.Logger
+	outCh            chan<- eventWithACK
+	ackWaitTimeout   time.Duration
+	logger           *zap.Logger
+	telemetryBuilder *metadata.TelemetryBuilder
+	conns            map[net.Conn]struct{}
+	mu               sync.Mutex
 }
 
-func newServer(outCh chan<- Event, logger *zap.Logger) *server {
+func newServer(outCh chan<- eventWithACK, ackWaitTimeout time.Duration, logger *zap.Logger, telemetryBuilder *metadata.TelemetryBuilder) *server {
 	return &server{
-		outCh:  outCh,
-		logger: logger,
+		outCh:            outCh,
+		ackWaitTimeout:   ackWaitTimeout,
+		logger:           logger,
+		telemetryBuilder: telemetryBuilder,
+		conns:            make(map[net.Conn]struct{}),
 	}
 }
 
@@ -65,19 +62,28 @@ func (s *server) handleConnections(ctx context.Context, listener net.Listener) {
 		// keep trying to accept connections if at all possible. Put in a sleep
 		// to prevent hot loops in case the error persists.
 		if err != nil {
-			time.Sleep(10 * time.Second)
-			continue
+			timer := time.NewTimer(10 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+				continue
+			}
 		}
-		stats.Record(ctx, observ.ConnectionsOpened.M(1))
+
+		s.telemetryBuilder.FluentOpenedConnections.Add(ctx, 1)
 
 		s.logger.Debug("Got connection", zap.String("remoteAddr", conn.RemoteAddr().String()))
+		s.addConn(conn)
 
 		go func() {
-			defer stats.Record(ctx, observ.ConnectionsClosed.M(1))
+			defer s.telemetryBuilder.FluentClosedConnections.Add(ctx, 1)
+			defer s.removeConn(conn)
 
 			err := s.handleConn(ctx, conn)
 			if err != nil {
-				if err == io.EOF {
+				if errors.Is(err, io.EOF) {
 					s.logger.Debug("Closing connection", zap.String("remoteAddr", conn.RemoteAddr().String()), zap.Error(err))
 				} else {
 					s.logger.Debug("Unexpected error handling connection", zap.String("remoteAddr", conn.RemoteAddr().String()), zap.Error(err))
@@ -92,62 +98,103 @@ func (s *server) handleConn(ctx context.Context, conn net.Conn) error {
 	reader := msgp.NewReaderSize(conn, readBufferSize)
 
 	for {
-		mode, err := DetermineNextEventMode(reader.R)
+		mode, err := determineNextEventMode(reader.R)
 		if err != nil {
 			return err
 		}
 
-		var event Event
+		var e event
 		switch mode {
-		case UnknownMode:
-			return errors.New("could not determine event mode")
-		case MessageMode:
-			event = &MessageEventLogRecord{}
-		case ForwardMode:
-			event = &ForwardEventLogRecords{}
-		case PackedForwardMode:
-			event = &PackedForwardEventLogRecords{}
+		case unknownMode:
+			return errors.New("could not determine e mode")
+		case messageMode:
+			e = &messageEventLogRecord{}
+		case forwardMode:
+			e = &forwardEventLogRecords{}
+		case packedForwardMode:
+			e = &packedForwardEventLogRecords{}
 		default:
 			panic("programmer bug in mode handling")
 		}
 
-		err = event.DecodeMsg(reader)
+		err = e.DecodeMsg(reader)
 		if err != nil {
-			if err != io.EOF {
-				stats.Record(ctx, observ.FailedToParse.M(1))
+			if !errors.Is(err, io.EOF) {
+				s.telemetryBuilder.FluentParseFailures.Add(ctx, 1)
 			}
-			return fmt.Errorf("failed to parse %s mode event: %v", mode.String(), err)
+			return fmt.Errorf("failed to parse %s mode e: %w", mode.String(), err)
 		}
 
-		stats.Record(ctx, observ.EventsParsed.M(1))
+		s.telemetryBuilder.FluentEventsParsed.Add(ctx, 1)
 
-		s.outCh <- event
-
-		// We must acknowledge the 'chunk' option if given. We could do this in
-		// another goroutine if it is too much of a bottleneck to reading
-		// messages -- this is the only thing that sends data back to the
-		// client.
-		if event.Chunk() != "" {
-			err := msgp.Encode(conn, AckResponse{Ack: event.Chunk()})
-			if err != nil {
-				return fmt.Errorf("failed to acknowledge chunk %s: %v", event.Chunk(), err)
+		chunk := e.Chunk()
+		if chunk == "" {
+			if enqErr := s.enqueueEvent(ctx, eventWithACK{event: e}); enqErr != nil {
+				return enqErr
 			}
+			continue
+		}
+
+		// Chunked events must be acknowledged only after the pipeline has
+		// accepted them. Bound the enqueue so a backed-up collector cannot pin
+		// this connection indefinitely; on timeout the connection is closed
+		// without an ACK and the client retries the chunk.
+		ackCh := make(chan error, 1)
+		enqueueCtx, cancel := context.WithTimeout(ctx, s.ackWaitTimeout)
+		enqErr := s.enqueueEvent(enqueueCtx, eventWithACK{event: e, ackCh: ackCh})
+		cancel()
+		if enqErr != nil {
+			return enqErr
+		}
+
+		if ackErr := s.waitForACK(ctx, conn, chunk, ackCh); ackErr != nil {
+			return ackErr
 		}
 	}
 }
 
-// DetermineNextEventMode inspects the next bit of data from the given peeker
+func (s *server) enqueueEvent(ctx context.Context, e eventWithACK) error {
+	select {
+	case s.outCh <- e:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *server) waitForACK(ctx context.Context, conn net.Conn, chunk string, ackCh <-chan error) error {
+	timer := time.NewTimer(s.ackWaitTimeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-ackCh:
+		if err != nil {
+			return fmt.Errorf("downstream consumer failed processing chunk %s: %w", chunk, err)
+		}
+		err = msgp.Encode(conn, internal.AckResponse{Ack: chunk})
+		if err != nil {
+			return fmt.Errorf("failed to acknowledge chunk %s: %w", chunk, err)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("timed out waiting for downstream consumer to process chunk %s", chunk)
+	}
+}
+
+// determineNextEventMode inspects the next bit of data from the given peeker
 // reader to determine which type of event mode it is.  According to the
 // forward protocol spec: "Server MUST detect the carrier mode by inspecting
 // the second element of the array."  It is assumed that peeker is aligned at
 // the start of a new event, otherwise the result is undefined and will
 // probably error.
-func DetermineNextEventMode(peeker Peeker) (EventMode, error) {
+func determineNextEventMode(peeker peeker) (eventMode, error) {
 	var chunk []byte
 	var err error
 	chunk, err = peeker.Peek(2)
 	if err != nil {
-		return UnknownMode, err
+		return unknownMode, err
 	}
 
 	// The first byte is the array header, which will always be 1 byte since no
@@ -165,23 +212,23 @@ func DetermineNextEventMode(peeker Peeker) (EventMode, error) {
 		case 0xd9:
 			chunk, err = peeker.Peek(3)
 			if err != nil {
-				return UnknownMode, err
+				return unknownMode, err
 			}
 			tagLen += 1 + int(chunk[2])
 		case 0xda:
 			chunk, err = peeker.Peek(4)
 			if err != nil {
-				return UnknownMode, err
+				return unknownMode, err
 			}
 			tagLen += 2 + int(binary.BigEndian.Uint16(chunk[2:]))
 		case 0xdb:
 			chunk, err = peeker.Peek(6)
 			if err != nil {
-				return UnknownMode, err
+				return unknownMode, err
 			}
 			tagLen += 4 + int(binary.BigEndian.Uint32(chunk[2:]))
 		default:
-			return UnknownMode, errors.New("malformed tag field")
+			return unknownMode, errors.New("malformed tag field")
 		}
 	}
 
@@ -189,19 +236,39 @@ func DetermineNextEventMode(peeker Peeker) (EventMode, error) {
 	// one byte into the second field -- that is enough to know its type.
 	chunk, err = peeker.Peek(1 + tagLen + 1)
 	if err != nil {
-		return UnknownMode, err
+		return unknownMode, err
 	}
 
 	secondElmType := msgp.NextType(chunk[1+tagLen:])
 
 	switch secondElmType {
 	case msgp.IntType, msgp.UintType, msgp.ExtensionType:
-		return MessageMode, nil
+		return messageMode, nil
 	case msgp.ArrayType:
-		return ForwardMode, nil
+		return forwardMode, nil
 	case msgp.BinType, msgp.StrType:
-		return PackedForwardMode, nil
+		return packedForwardMode, nil
 	default:
-		return UnknownMode, fmt.Errorf("unable to determine next event mode for type %v", secondElmType)
+		return unknownMode, fmt.Errorf("unable to determine next event mode for type %v", secondElmType)
 	}
+}
+
+func (s *server) addConn(c net.Conn) {
+	s.mu.Lock()
+	s.conns[c] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *server) removeConn(c net.Conn) {
+	s.mu.Lock()
+	delete(s.conns, c)
+	s.mu.Unlock()
+}
+
+func (s *server) closeAllConns() {
+	s.mu.Lock()
+	for c := range s.conns {
+		_ = c.Close() // Ignore errors
+	}
+	s.mu.Unlock()
 }

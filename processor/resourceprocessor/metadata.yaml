@@ -1,0 +1,16 @@
+display_name: Resource Processor
+type: resource
+
+status:
+  class: processor
+  stability:
+    development: [profiles]
+    beta: [traces, metrics, logs]
+  distributions: [core, contrib, k8s]
+  warnings: [Identity Conflict]
+  codeowners:
+    active: [jinja2, jkoronaAtCisco]
+    emeritus: [dmitryax]
+
+tests:
+  config:

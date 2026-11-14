@@ -1,0 +1,57 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package metrics // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor/internal/metrics"
+
+import (
+	"maps"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottldatapoint"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottlexemplar"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottlmetric"
+	xprofilefuncs "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/xprofile/ottlfuncs"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/ottlfuncs"
+	xottlfuncs "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/xottl/ottlfuncs"
+)
+
+func DataPointFunctions() map[string]ottl.Factory[*ottldatapoint.TransformContext] {
+	functions := xottlfuncs.WithExperimentalConverters(xprofilefuncs.WithProfileConverters(ottlfuncs.StandardFuncs[*ottldatapoint.TransformContext]()))
+
+	datapointFunctions := ottl.CreateFactoryMap(
+		newConvertSummarySumValToSumFactory(),
+		newConvertSummaryCountValToSumFactory(),
+		newMergeHistogramBucketsFactory(),
+	)
+
+	maps.Copy(functions, datapointFunctions)
+
+	return functions
+}
+
+func ExemplarFunctions() map[string]ottl.Factory[*ottlexemplar.TransformContext] {
+	return xottlfuncs.WithExperimentalConverters(xprofilefuncs.WithProfileConverters(ottlfuncs.StandardFuncs[*ottlexemplar.TransformContext]()))
+}
+
+func MetricFunctions() map[string]ottl.Factory[*ottlmetric.TransformContext] {
+	functions := xottlfuncs.WithExperimentalConverters(xprofilefuncs.WithProfileConverters(ottlfuncs.StandardFuncs[*ottlmetric.TransformContext]()))
+
+	metricFunctions := ottl.CreateFactoryMap(
+		newExtractSumMetricFactory(),
+		newExtractCountMetricFactory(),
+		newExtractAvgMetricFactory(),
+		newExtractPercentileMetricFactory(),
+		newConvertGaugeToSumFactory(),
+		newConvertSumToGaugeFactory(),
+		newCopyMetricFactory(),
+		newScaleMetricFactory(),
+		newAggregateOnAttributesFactory(),
+		newconvertExponentialHistToExplicitHistFactory(),
+		newAggregateOnAttributeValueFactory(),
+		newConvertSummaryQuantileValToGaugeFactory(),
+	)
+
+	maps.Copy(functions, metricFunctions)
+
+	return functions
+}

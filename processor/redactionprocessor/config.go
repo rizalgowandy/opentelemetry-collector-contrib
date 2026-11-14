@@ -1,0 +1,175 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package redactionprocessor // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/redactionprocessor"
+
+import (
+	"crypto/fips140"
+	"encoding"
+	"errors"
+	"fmt"
+	"strings"
+
+	"go.opentelemetry.io/collector/config/configopaque"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/redactionprocessor/internal/db"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/redactionprocessor/internal/url"
+)
+
+var _ encoding.TextUnmarshaler = (*HashFunction)(nil)
+
+type HashFunction string
+
+const (
+	None       HashFunction = ""
+	SHA1       HashFunction = "sha1"
+	SHA3       HashFunction = "sha3"
+	MD5        HashFunction = "md5"
+	HMACSHA256 HashFunction = "hmac-sha256"
+	HMACSHA512 HashFunction = "hmac-sha512"
+)
+
+type Config struct {
+	// AllowAllKeys is a flag to allow all span attribute keys. Setting this
+	// to true disables the AllowedKeys list. The list of BlockedValues is
+	// applied regardless. If you just want to block values, set this to true.
+	AllowAllKeys bool `mapstructure:"allow_all_keys"`
+
+	// AllowedKeys is a list of allowed span attribute keys. Span attributes
+	// not on the list are removed. The list fails closed if it's empty. To
+	// allow all keys, you should explicitly set AllowAllKeys
+	AllowedKeys []string `mapstructure:"allowed_keys"`
+
+	// BlockedKeyPatterns is a list of blocked span attribute key patterns. Span attributes
+	// matching the regexes on the list are masked.
+	BlockedKeyPatterns []string `mapstructure:"blocked_key_patterns"`
+
+	// HashFunction defines the function for hashing the values instead of
+	// masking them with a fixed string. By default, no hash function is used
+	// and masking with a fixed string is performed. md5 and sha1 are rejected
+	// when the collector runs in FIPS 140-3 mode.
+	HashFunction HashFunction `mapstructure:"hash_function"`
+
+	// HMACKey is the secret key used for HMAC hashing when HashFunction is set to hmac-sha256 or hmac-sha512.
+	// This should be loaded from a secure source like environment variables.
+	// Minimum length: 32 bytes for HMAC-SHA256, 64 bytes for HMAC-SHA512.
+	HMACKey configopaque.String `mapstructure:"hmac_key"`
+
+	// IgnoredKeys is a list of span attribute keys that are not redacted.
+	// Span attributes in this list are allowed to pass through the filter
+	// without being changed or removed.
+	IgnoredKeys []string `mapstructure:"ignored_keys"`
+
+	// IgnoredKeyPatterns is a list of attribute key patterns (regex) that are not redacted.
+	// attributes matching any of these patterns are allowed to pass through the filter
+	// without their values being checked or modified.
+	IgnoredKeyPatterns []string `mapstructure:"ignored_key_patterns"`
+
+	// RedactAllTypes of attributes, including those that are not string, by converting to a string representation.
+	// By default only string values are redacted.
+	RedactAllTypes bool `mapstructure:"redact_all_types"`
+
+	// BlockedValues is a list of regular expressions for blocking values of
+	// allowed span attributes. Values that match are masked.
+	BlockedValues []string `mapstructure:"blocked_values"`
+
+	// AllowedValues is a list of regular expressions for allowing values of
+	// blocked span attributes. Values that match are not masked.
+	AllowedValues []string `mapstructure:"allowed_values"`
+
+	// DBSanitizer is a flag to enable database query sanitization.
+	DBSanitizer db.DBSanitizerConfig `mapstructure:"db_sanitizer"`
+
+	// Summary controls the verbosity level of the diagnostic attributes that
+	// the processor adds to the spans when it redacts or masks other
+	// attributes. In some contexts a list of redacted attributes leaks
+	// information, while it is valuable when integrating and testing a new
+	// configuration. Possible values are `debug`, `info`, and `silent`.
+	Summary string `mapstructure:"summary"`
+
+	// URLSanitization is a flag to sanitize URLs by removing UUIDs, timestamps, and other non-essential information
+	URLSanitization url.URLSanitizationConfig `mapstructure:"url_sanitizer"`
+
+	// MaskingString is the string that replaces the values being masked.
+	// If not set, the masked values will be replaced with "****".
+	// If HashFunction is set, this value must not be set
+	MaskingString string `mapstructure:"masking_string"`
+}
+
+func (u HashFunction) String() string {
+	return string(u)
+}
+
+// UnmarshalText unmarshalls text to a HashFunction.
+func (u *HashFunction) UnmarshalText(text []byte) error {
+	if u == nil {
+		return errors.New("cannot unmarshal to a nil *HashFunction")
+	}
+
+	str := strings.ToLower(string(text))
+	switch str {
+	case strings.ToLower(SHA1.String()):
+		*u = SHA1
+		return nil
+	case strings.ToLower(MD5.String()):
+		*u = MD5
+		return nil
+	case strings.ToLower(SHA3.String()):
+		*u = SHA3
+		return nil
+	case strings.ToLower(HMACSHA256.String()):
+		*u = HMACSHA256
+		return nil
+	case strings.ToLower(HMACSHA512.String()):
+		*u = HMACSHA512
+		return nil
+	case strings.ToLower(None.String()):
+		*u = None
+		return nil
+	}
+	return fmt.Errorf("unknown HashFunction %s, allowed functions are %s, %s, %s, %s and %s", str, SHA1, SHA3, MD5, HMACSHA256, HMACSHA512)
+}
+
+// Validate validates the configuration
+func (cfg *Config) Validate() error {
+	if err := cfg.validateHashFunction(fips140.Enabled()); err != nil {
+		return err
+	}
+
+	// Validate HMAC key requirements
+	if cfg.HashFunction == HMACSHA256 || cfg.HashFunction == HMACSHA512 {
+		key := string(cfg.HMACKey)
+		if key == "" {
+			return fmt.Errorf("hmac_key must not be empty when hash_function is %q", cfg.HashFunction)
+		}
+
+		// Enforce minimum key lengths for security
+		minLength := 32
+		if cfg.HashFunction == HMACSHA512 {
+			minLength = 64
+		}
+
+		if len(key) < minLength {
+			return fmt.Errorf("hmac_key must be at least %d bytes long for %q, got %d bytes", minLength, cfg.HashFunction, len(key))
+		}
+	}
+
+	if cfg.MaskingString != "" && cfg.HashFunction != None {
+		return errors.New("masking_string must not be set when hash_function is defined")
+	}
+
+	return nil
+}
+
+// validateHashFunction rejects hash functions that are not FIPS 140-3 approved
+// when the collector runs in FIPS mode (GODEBUG=fips140=on or only)
+func (cfg *Config) validateHashFunction(fipsEnabled bool) error {
+	if !fipsEnabled {
+		return nil
+	}
+	switch cfg.HashFunction {
+	case MD5, SHA1:
+		return fmt.Errorf("hash_function %q is not allowed when the collector runs in FIPS 140-3 mode, use %s, %s or %s", cfg.HashFunction, SHA3, HMACSHA256, HMACSHA512)
+	}
+	return nil
+}

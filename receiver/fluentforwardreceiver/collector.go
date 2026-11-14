@@ -1,87 +1,106 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package fluentforwardreceiver
+package fluentforwardreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/fluentforwardreceiver"
 
 import (
 	"context"
+	"time"
 
-	"go.opencensus.io/stats"
 	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/receiver/receiverhelper"
 	"go.uber.org/zap"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/fluentforwardreceiver/observ"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/fluentforwardreceiver/internal/metadata"
 )
 
-// Collector acts as an aggregator of LogRecords so that we don't have to
-// generate as many pdata.Logs instances...we can pre-batch the LogRecord
+// collector acts as an aggregator of LogRecords so that we don't have to
+// generate as many plog.Logs instances...we can pre-batch the LogRecord
 // instances from several Forward events into one to hopefully reduce
 // allocations and GC overhead.
-type Collector struct {
-	nextConsumer consumer.Logs
-	eventCh      <-chan Event
-	logger       *zap.Logger
+type collector struct {
+	nextConsumer     consumer.Logs
+	eventCh          <-chan eventWithACK
+	ackWaitTimeout   time.Duration
+	logger           *zap.Logger
+	obsrecv          *receiverhelper.ObsReport
+	telemetryBuilder *metadata.TelemetryBuilder
 }
 
-func newCollector(eventCh <-chan Event, next consumer.Logs, logger *zap.Logger) *Collector {
-	return &Collector{
-		nextConsumer: next,
-		eventCh:      eventCh,
-		logger:       logger,
+func newCollector(eventCh <-chan eventWithACK, next consumer.Logs, ackWaitTimeout time.Duration, logger *zap.Logger, obsrecv *receiverhelper.ObsReport, telemetryBuilder *metadata.TelemetryBuilder) *collector {
+	return &collector{
+		nextConsumer:     next,
+		eventCh:          eventCh,
+		ackWaitTimeout:   ackWaitTimeout,
+		logger:           logger,
+		obsrecv:          obsrecv,
+		telemetryBuilder: telemetryBuilder,
 	}
 }
 
-func (c *Collector) Start(ctx context.Context) {
+func (c *collector) Start(ctx context.Context) {
 	go c.processEvents(ctx)
 }
 
-func (c *Collector) processEvents(ctx context.Context) {
+func (c *collector) processEvents(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case e := <-c.eventCh:
-			buffered := []Event{e}
+			out := plog.NewLogs()
+			rls := out.ResourceLogs().AppendEmpty()
+			logSlice := rls.ScopeLogs().AppendEmpty().LogRecords()
+			e.LogRecords().MoveAndAppendTo(logSlice)
+
+			var ackChs []chan error
+			if e.ackCh != nil {
+				ackChs = append(ackChs, e.ackCh)
+			}
+
 			// Pull out anything waiting on the eventCh to get better
 			// efficiency on LogResource allocations.
-			buffered = fillBufferUntilChanEmpty(c.eventCh, buffered)
+			ackChs = c.fillBufferUntilChanEmpty(logSlice, ackChs)
 
-			logs := collectLogRecords(buffered)
-			c.nextConsumer.ConsumeLogs(ctx, logs)
+			logRecordCount := out.LogRecordCount()
+			c.telemetryBuilder.FluentRecordsGenerated.Add(ctx, int64(logRecordCount))
+			obsCtx := c.obsrecv.StartLogsOp(ctx)
+			// Bound ConsumeLogs only when the batch carries chunk ACK waiters, so
+			// a stuck pipeline cannot hold a client's chunk open past the wait
+			// timeout. Batches without waiters keep the original unbounded behavior.
+			consumeCtx := obsCtx
+			cancel := context.CancelFunc(func() {})
+			if len(ackChs) > 0 && c.ackWaitTimeout > 0 {
+				consumeCtx, cancel = context.WithTimeout(obsCtx, c.ackWaitTimeout)
+			}
+			err := c.nextConsumer.ConsumeLogs(consumeCtx, out)
+			cancel()
+			c.obsrecv.EndLogsOp(obsCtx, "fluent", logRecordCount, err)
+			c.completeACKs(ackChs, err)
 		}
 	}
 }
 
-func fillBufferUntilChanEmpty(eventCh <-chan Event, buf []Event) []Event {
+func (c *collector) fillBufferUntilChanEmpty(dest plog.LogRecordSlice, ackChs []chan error) []chan error {
 	for {
 		select {
-		case e2 := <-eventCh:
-			buf = append(buf, e2)
+		case e := <-c.eventCh:
+			e.LogRecords().MoveAndAppendTo(dest)
+			if e.ackCh != nil {
+				ackChs = append(ackChs, e.ackCh)
+			}
 		default:
-			return buf
+			return ackChs
 		}
 	}
 }
 
-func collectLogRecords(events []Event) pdata.Logs {
-	out := pdata.NewLogs()
-	rls := out.ResourceLogs().AppendEmpty()
-	logSlice := rls.InstrumentationLibraryLogs().AppendEmpty().Logs()
-	for i := range events {
-		events[i].LogRecords().MoveAndAppendTo(logSlice)
+func (*collector) completeACKs(ackChs []chan error, err error) {
+	for _, ackCh := range ackChs {
+		select {
+		case ackCh <- err:
+		default:
+		}
 	}
-	stats.Record(context.Background(), observ.RecordsGenerated.M(int64(out.LogRecordCount())))
-	return out
 }

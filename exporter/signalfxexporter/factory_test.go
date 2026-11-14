@@ -1,78 +1,139 @@
-// Copyright 2019, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package signalfxexporter
 
 import (
-	"context"
 	"encoding/json"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	agentmetricspb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/metrics/v1"
-	metricspb "github.com/census-instrumentation/opencensus-proto/gen-go/metrics/v1"
 	sfxpb "github.com/signalfx/com_signalfx_metrics_protobuf/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configcheck"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/configopaque"
+	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
-	"go.opentelemetry.io/collector/translator/internaldata"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
-	"google.golang.org/protobuf/types/known/timestamppb"
+	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/signalfxexporter/translation"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/signalfxexporter/translation/dpfilters"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/signalfxexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/signalfxexporter/internal/translation"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/signalfxexporter/internal/translation/dpfilters"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/golden"
 )
 
 func TestCreateDefaultConfig(t *testing.T) {
 	cfg := createDefaultConfig()
 	assert.NotNil(t, cfg, "failed to create default config")
-	assert.NoError(t, configcheck.ValidateConfig(cfg))
+	assert.NoError(t, componenttest.CheckConfigStruct(cfg))
 }
 
-func TestCreateMetricsExporter(t *testing.T) {
+func TestCreateMetrics(t *testing.T) {
 	cfg := createDefaultConfig()
 	c := cfg.(*Config)
 	c.AccessToken = "access_token"
 	c.Realm = "us0"
 
-	_, err := createMetricsExporter(context.Background(), component.ExporterCreateSettings{Logger: zap.NewNop()}, cfg)
+	_, err := createMetricsExporter(t.Context(), exportertest.NewNopSettings(metadata.Type), cfg)
 	assert.NoError(t, err)
 }
 
-func TestCreateTracesExporter(t *testing.T) {
+func TestLogDeprecatedMetricsWarnings(t *testing.T) {
+	tests := []struct {
+		name           string
+		includeMetrics []dpfilters.MetricFilter
+		wantWarnings   []string
+	}{
+		{
+			name:           "metric is not included",
+			includeMetrics: []dpfilters.MetricFilter{},
+		},
+		{
+			name: "non-deprecated metric is included",
+			includeMetrics: []dpfilters.MetricFilter{{
+				MetricNames: []string{"cpu.user", "system.network.packets"},
+			}},
+		},
+		{
+			name: "include_metrics:metric_name",
+			includeMetrics: []dpfilters.MetricFilter{{
+				MetricName: "container_cpu_utilization",
+			}},
+			wantWarnings: []string{
+				`The metric "container_cpu_utilization" has been deprecated and will be removed in a future release. Please use "container.cpu.usage" instead.`,
+			},
+		},
+		{
+			name: "include_metrics:metric_names",
+			includeMetrics: []dpfilters.MetricFilter{{
+				MetricNames: []string{"container_cpu_utilization"},
+			}},
+			wantWarnings: []string{
+				`The metric "container_cpu_utilization" has been deprecated and will be removed in a future release. Please use "container.cpu.usage" instead.`,
+			},
+		},
+		{
+			name: "all deprecated metrics",
+			includeMetrics: []dpfilters.MetricFilter{
+				{MetricName: "memory.total"},
+				{MetricNames: []string{
+					"process.cpu_time_seconds",
+					"system.disk.operations.total",
+					"system.network.io.total",
+					"system.network.packets.total",
+				}},
+			},
+			wantWarnings: []string{
+				`The metric "memory.total" has been deprecated and will be removed in a future release. Please use "system.memory.limit" (disabled by default in the hostmetrics receiver) instead.`,
+				`The metric "process.cpu_time_seconds" has been deprecated and will be removed in a future release. Please use "process.cpu.time" summed across the "user" and "system" states instead.`,
+				`The metric "system.disk.operations.total" has been deprecated and will be removed in a future release. Please use "system.disk.operations" summed across "device" instead.`,
+				`The metric "system.network.io.total" has been deprecated and will be removed in a future release. Please use "system.network.io" summed across "device" instead.`,
+				`The metric "system.network.packets.total" has been deprecated and will be removed in a future release. Please use "system.network.packets" (excluded by default) summed across "device" instead.`,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := createDefaultConfig().(*Config)
+			cfg.AccessToken = "access_token"
+			cfg.Realm = "us0"
+			cfg.IncludeMetrics = tt.includeMetrics
+
+			observedCore, observedLogs := observer.New(zap.WarnLevel)
+			logger := zap.New(observedCore)
+			settings := exportertest.NewNopSettings(metadata.Type)
+			settings.Logger = logger
+
+			_, err := NewFactory().CreateMetrics(t.Context(), settings, cfg)
+			require.NoError(t, err)
+
+			var gotWarnings []string
+			for _, entry := range observedLogs.All() {
+				gotWarnings = append(gotWarnings, entry.Message)
+			}
+			assert.Equal(t, tt.wantWarnings, gotWarnings)
+		})
+	}
+}
+
+func TestCreateTraces(t *testing.T) {
 	cfg := createDefaultConfig()
 	c := cfg.(*Config)
 	c.AccessToken = "access_token"
 	c.Realm = "us0"
 
-	_, err := createTracesExporter(context.Background(), component.ExporterCreateSettings{Logger: zap.NewNop()}, cfg)
+	_, err := createTracesExporter(t.Context(), exportertest.NewNopSettings(metadata.Type), cfg)
 	assert.NoError(t, err)
-}
-
-func TestCreateTracesExporterNoAccessToken(t *testing.T) {
-	cfg := createDefaultConfig()
-	c := cfg.(*Config)
-	c.Realm = "us0"
-
-	_, err := createTracesExporter(context.Background(), component.ExporterCreateSettings{Logger: zap.NewNop()}, cfg)
-	assert.EqualError(t, err, "access_token is required")
 }
 
 func TestCreateInstanceViaFactory(t *testing.T) {
@@ -83,10 +144,11 @@ func TestCreateInstanceViaFactory(t *testing.T) {
 	c.AccessToken = "access_token"
 	c.Realm = "us0"
 
-	exp, err := factory.CreateMetricsExporter(
-		context.Background(),
-		component.ExporterCreateSettings{Logger: zap.NewNop()},
-		cfg)
+	exp, err := factory.CreateMetrics(
+		t.Context(),
+		exportertest.NewNopSettings(metadata.Type),
+		cfg,
+	)
 	assert.NoError(t, err)
 	assert.NotNil(t, exp)
 
@@ -94,830 +156,407 @@ func TestCreateInstanceViaFactory(t *testing.T) {
 	expCfg := cfg.(*Config)
 	expCfg.AccessToken = "testToken"
 	expCfg.Realm = "us1"
-	exp, err = factory.CreateMetricsExporter(
-		context.Background(),
-		component.ExporterCreateSettings{Logger: zap.NewNop()},
-		cfg)
+	exp, err = factory.CreateMetrics(
+		t.Context(),
+		exportertest.NewNopSettings(metadata.Type),
+		cfg,
+	)
 	assert.NoError(t, err)
 	require.NotNil(t, exp)
 
-	logExp, err := factory.CreateLogsExporter(
-		context.Background(),
-		component.ExporterCreateSettings{Logger: zap.NewNop()},
-		cfg)
+	logExp, err := factory.CreateLogs(
+		t.Context(),
+		exportertest.NewNopSettings(metadata.Type),
+		cfg,
+	)
 	assert.NoError(t, err)
 	require.NotNil(t, logExp)
 
-	assert.NoError(t, exp.Shutdown(context.Background()))
+	assert.NoError(t, exp.Shutdown(t.Context()))
+	assert.NoError(t, logExp.Shutdown(t.Context()))
 }
 
-func TestCreateMetricsExporter_CustomConfig(t *testing.T) {
+func TestCreateMetrics_CustomConfig(t *testing.T) {
+	clientConfig := confighttp.NewDefaultClientConfig()
+	clientConfig.Timeout = 2 * time.Second
+	clientConfig.Headers = configopaque.MapList{
+		{Name: "added-entry", Value: "added value"},
+		{Name: "dot.test", Value: "test"},
+	}
 	config := &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-		AccessToken:      "testToken",
-		Realm:            "us1",
-		Headers: map[string]string{
-			"added-entry": "added value",
-			"dot.test":    "test",
-		},
-		TimeoutSettings: exporterhelper.TimeoutSettings{Timeout: 2 * time.Second},
+		AccessToken:  "testToken",
+		Realm:        "us1",
+		ClientConfig: clientConfig,
 	}
 
-	te, err := createMetricsExporter(context.Background(), component.ExporterCreateSettings{Logger: zap.NewNop()}, config)
+	te, err := createMetricsExporter(t.Context(), exportertest.NewNopSettings(metadata.Type), config)
 	assert.NoError(t, err)
 	assert.NotNil(t, te)
 }
 
-func TestFactory_CreateMetricsExporterFails(t *testing.T) {
-	tests := []struct {
-		name         string
-		config       *Config
-		errorMessage string
-	}{
-		{
-			name: "negative_duration",
-			config: &Config{
-				ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-				AccessToken:      "testToken",
-				Realm:            "lab",
-				TimeoutSettings:  exporterhelper.TimeoutSettings{Timeout: -2 * time.Second},
-			},
-			errorMessage: "failed to process \"signalfx\" config: cannot have a negative \"timeout\"",
-		},
-		{
-			name: "empty_realm_and_urls",
-			config: &Config{
-				ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-				AccessToken:      "testToken",
-			},
-			errorMessage: "failed to process \"signalfx\" config: requires a non-empty \"realm\"," +
-				" or \"ingest_url\" and \"api_url\" should be explicitly set",
-		},
-		{
-			name: "empty_realm_and_api_url",
-			config: &Config{
-				ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-				AccessToken:      "testToken",
-				IngestURL:        "http://localhost:123",
-			},
-			errorMessage: "failed to process \"signalfx\" config: requires a non-empty \"realm\"," +
-				" or \"ingest_url\" and \"api_url\" should be explicitly set",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			te, err := createMetricsExporter(context.Background(), component.ExporterCreateSettings{Logger: zap.NewNop()}, tt.config)
-			assert.EqualError(t, err, tt.errorMessage)
-			assert.Nil(t, te)
-		})
-	}
-}
-
 func TestDefaultTranslationRules(t *testing.T) {
-	rules, err := loadDefaultTranslationRules()
-	require.NoError(t, err)
+	rules := defaultTranslationRules
 	require.NotNil(t, rules, "rules are nil")
-	tr, err := translation.NewMetricTranslator(rules, 1)
+	tr, err := translation.NewMetricTranslator(rules, 1, make(chan struct{}))
 	require.NoError(t, err)
-	data := testMetricsData()
+	data := testMetricsData(false)
 
-	c, err := translation.NewMetricsConverter(zap.NewNop(), tr, nil, nil, "")
+	c, err := translation.NewMetricsConverter(zap.NewNop(), tr, nil, nil, "", false, true)
 	require.NoError(t, err)
-	translated := c.MetricDataToSignalFxV2(data)
+	translated := c.MetricsToSignalFxV2(data)
 	require.NotNil(t, translated)
 
 	metrics := make(map[string][]*sfxpb.DataPoint)
 	for _, pt := range translated {
-		if _, ok := metrics[pt.Metric]; !ok {
-			metrics[pt.Metric] = make([]*sfxpb.DataPoint, 0, 1)
-		}
 		metrics[pt.Metric] = append(metrics[pt.Metric], pt)
 	}
 
 	// memory.utilization new metric calculation
 	dps, ok := metrics["memory.utilization"]
 	require.True(t, ok, "memory.utilization metric not found")
-	require.Equal(t, 1, len(dps))
+	require.Len(t, dps, 1)
 	require.Equal(t, 40.0, *dps[0].Value.DoubleValue)
 
-	// system.network.operations.total new metric calculation
+	// system.disk.operations.total new metric calculation
 	dps, ok = metrics["system.disk.operations.total"]
-	require.True(t, ok, "system.network.operations.total metrics not found")
-	require.Equal(t, 4, len(dps))
-	require.Equal(t, 2, len(dps[0].Dimensions))
+	require.True(t, ok, "system.disk.operations.total metrics not found")
+	require.Len(t, dps, 4)
+	require.Len(t, dps[0].Dimensions, 2)
 
-	// system.network.io.total new metric calculation
+	// system.disk.io.total new metric calculation
 	dps, ok = metrics["system.disk.io.total"]
-	require.True(t, ok, "system.network.io.total metrics not found")
-	require.Equal(t, 2, len(dps))
-	require.Equal(t, 2, len(dps[0].Dimensions))
+	require.True(t, ok, "system.disk.io.total metrics not found")
+	require.Len(t, dps, 2)
+	require.Len(t, dps[0].Dimensions, 2)
 	for _, dp := range dps {
-		require.Equal(t, "direction", dp.Dimensions[1].Key)
-		switch dp.Dimensions[1].Value {
-		case "write":
-			require.Equal(t, int64(11e9), *dp.Value.IntValue)
-		case "read":
-			require.Equal(t, int64(3e9), *dp.Value.IntValue)
+		var directionFound bool
+		for _, dim := range dp.Dimensions {
+			if dim.Key != "direction" {
+				continue
+			}
+			directionFound = true
+			switch dim.Value {
+			case "write":
+				require.Equal(t, int64(11e9), *dp.Value.IntValue)
+			case "read":
+				require.Equal(t, int64(3e9), *dp.Value.IntValue)
+			}
 		}
+		require.True(t, directionFound, `missing dimension: direction`)
 	}
 
-	// disk_ops.total gauge from system.disk.operations cumulative, where is disk_ops.total
-	// is the cumulative across devices and directions.
-	dps, ok = metrics["disk_ops.total"]
-	require.True(t, ok, "disk_ops.total metrics not found")
-	require.Equal(t, 1, len(dps))
-	require.Equal(t, int64(8e3), *dps[0].Value.IntValue)
-	require.Equal(t, 1, len(dps[0].Dimensions))
-	require.Equal(t, "host", dps[0].Dimensions[0].Key)
-	require.Equal(t, "host0", dps[0].Dimensions[0].Value)
+	require.NotContains(t, metrics, "disk_ops.total")
 
 	// system.network.io.total new metric calculation
 	dps, ok = metrics["system.network.io.total"]
 	require.True(t, ok, "system.network.io.total metrics not found")
-	require.Equal(t, 2, len(dps))
-	require.Equal(t, 4, len(dps[0].Dimensions))
+	require.Len(t, dps, 2)
+	require.Len(t, dps[0].Dimensions, 4)
 
 	// system.network.packets.total new metric calculation
 	dps, ok = metrics["system.network.packets.total"]
 	require.True(t, ok, "system.network.packets.total metrics not found")
-	require.Equal(t, 1, len(dps))
-	require.Equal(t, 4, len(dps[0].Dimensions))
+	require.Len(t, dps, 1)
+	require.Len(t, dps[0].Dimensions, 4)
 	require.Equal(t, int64(350), *dps[0].Value.IntValue)
-	require.Equal(t, "direction", dps[0].Dimensions[0].Key)
-	require.Equal(t, "receive", dps[0].Dimensions[0].Value)
+	requireDimension(t, dps[0].Dimensions, "direction", "receive")
 
 	// network.total new metric calculation
 	dps, ok = metrics["network.total"]
 	require.True(t, ok, "network.total metrics not found")
-	require.Equal(t, 1, len(dps))
-	require.Equal(t, 3, len(dps[0].Dimensions))
+	require.Len(t, dps, 1)
+	require.Len(t, dps[0].Dimensions, 3)
 	require.Equal(t, int64(10e9), *dps[0].Value.IntValue)
 }
 
-func TestCreateMetricsExporterWithDefaultExcludeMetrics(t *testing.T) {
-	config := &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-		AccessToken:      "testToken",
-		Realm:            "us1",
+func TestDefaultTranslationRules_MemoryTotalIncludesInactive(t *testing.T) {
+	rules := defaultTranslationRules
+	require.NotNil(t, rules, "rules are nil")
+	tr, err := translation.NewMetricTranslator(rules, 1, make(chan struct{}))
+	require.NoError(t, err)
+
+	c, err := translation.NewMetricsConverter(zap.NewNop(), tr, nil, nil, "", false, true)
+	require.NoError(t, err)
+
+	md := pmetric.NewMetrics()
+	m := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	m.SetName("system.memory.usage")
+	m.SetDescription("Bytes of memory in use")
+	m.SetUnit("bytes")
+	g := m.SetEmptyGauge().DataPoints()
+
+	add := func(state string, value int64) {
+		dp := g.AppendEmpty()
+		dp.Attributes().PutStr("state", state)
+		dp.Attributes().PutStr("host", "host0")
+		dp.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+		dp.SetIntValue(value)
 	}
 
-	te, err := createMetricsExporter(context.Background(), component.ExporterCreateSettings{Logger: zap.NewNop()}, config)
-	require.NoError(t, err)
-	require.NotNil(t, te)
+	add("used", 6)
+	add("free", 2)
+	add("inactive", 2)
 
-	// Validate that default excludes are always loaded.
-	assert.Equal(t, 11, len(config.ExcludeMetrics))
+	translated := c.MetricsToSignalFxV2(md)
+	require.NotNil(t, translated)
+
+	metrics := make(map[string][]*sfxpb.DataPoint)
+	for _, pt := range translated {
+		metrics[pt.Metric] = append(metrics[pt.Metric], pt)
+	}
+
+	total, ok := metrics["memory.total"]
+	require.True(t, ok, "memory.total metric not found")
+	require.Len(t, total, 1)
+	require.EqualValues(t, 10, *total[0].Value.IntValue)
+
+	util, ok := metrics["memory.utilization"]
+	require.True(t, ok, "memory.utilization metric not found")
+	require.Len(t, util, 1)
+	require.Equal(t, 60.0, *util[0].Value.DoubleValue)
 }
 
-func TestCreateMetricsExporterWithExcludeMetrics(t *testing.T) {
-	config := &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-		AccessToken:      "testToken",
-		Realm:            "us1",
-		ExcludeMetrics: []dpfilters.MetricFilter{
-			{
-				MetricNames: []string{"metric1"},
-			},
-		},
+func requireDimension(t *testing.T, dims []*sfxpb.Dimension, key, val string) {
+	var found bool
+	for _, dim := range dims {
+		if dim.Key != key {
+			continue
+		}
+		found = true
+		require.Equal(t, val, dim.Value)
 	}
-
-	te, err := createMetricsExporter(context.Background(), component.ExporterCreateSettings{Logger: zap.NewNop()}, config)
-	require.NoError(t, err)
-	require.NotNil(t, te)
-
-	// Validate that default excludes are always loaded.
-	assert.Equal(t, 12, len(config.ExcludeMetrics))
+	require.True(t, found, `missing dimension: %s`, key)
 }
 
-func TestCreateMetricsExporterWithEmptyExcludeMetrics(t *testing.T) {
-	config := &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-		AccessToken:      "testToken",
-		Realm:            "us1",
-		ExcludeMetrics:   []dpfilters.MetricFilter{},
+func requireNoDimension(t *testing.T, dims []*sfxpb.Dimension, key string) {
+	for _, dim := range dims {
+		require.NotEqual(t, key, dim.Key)
 	}
-
-	te, err := createMetricsExporter(context.Background(), component.ExporterCreateSettings{Logger: zap.NewNop()}, config)
-	require.NoError(t, err)
-	require.NotNil(t, te)
-
-	// Validate that default excludes are overridden when exclude metrics
-	// is explicitly set to an empty slice.
-	assert.Equal(t, 0, len(config.ExcludeMetrics))
 }
 
-func testMetricsData() pdata.ResourceMetrics {
-	md := agentmetricspb.ExportMetricsServiceRequest{
-		Metrics: []*metricspb.Metric{
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name:        "system.memory.usage",
-					Description: "Bytes of memory in use",
-					Unit:        "bytes",
-					Type:        metricspb.MetricDescriptor_GAUGE_INT64,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "state"},
-						{Key: "host"},
-						{Key: "kubernetes_node"},
-						{Key: "kubernetes_cluster"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "used",
-							HasValue: true,
-						}, {
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "node0",
-							HasValue: true,
-						}, {
-							Value:    "cluster0",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 4e9,
-							},
-						}},
-					},
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "free",
-							HasValue: true,
-						}, {
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "node0",
-							HasValue: true,
-						}, {
-							Value:    "cluster0",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 6e9,
-							},
-						}},
-					},
-				},
-			},
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name:        "system.disk.io",
-					Description: "Disk I/O.",
-					Type:        metricspb.MetricDescriptor_CUMULATIVE_INT64,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "host"},
-						{Key: "direction"},
-						{Key: "device"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "read",
-							HasValue: true,
-						}, {
-							Value:    "sda1",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 1e9,
-							},
-						}},
-					},
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "read",
-							HasValue: true,
-						}, {
-							Value:    "sda2",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 2e9,
-							},
-						}},
-					},
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "write",
-							HasValue: true,
-						}, {
-							Value:    "sda1",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 3e9,
-							},
-						}},
-					},
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "write",
-							HasValue: true,
-						}, {
-							Value:    "sda2",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 8e9,
-							},
-						}},
-					},
-				},
-			},
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name:        "system.disk.operations",
-					Description: "Disk operations count.",
-					Unit:        "bytes",
-					Type:        metricspb.MetricDescriptor_CUMULATIVE_INT64,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "host"},
-						{Key: "direction"},
-						{Key: "device"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "read",
-							HasValue: true,
-						}, {
-							Value:    "sda1",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 4e3,
-							},
-						}},
-					},
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "read",
-							HasValue: true,
-						}, {
-							Value:    "sda2",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 6e3,
-							},
-						}},
-					},
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "write",
-							HasValue: true,
-						}, {
-							Value:    "sda1",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 1e3,
-							},
-						}},
-					},
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "write",
-							HasValue: true,
-						}, {
-							Value:    "sda2",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 5e3,
-							},
-						}},
-					},
-				},
-			},
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name:        "system.disk.operations",
-					Description: "Disk operations count.",
-					Unit:        "bytes",
-					Type:        metricspb.MetricDescriptor_CUMULATIVE_INT64,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "host"},
-						{Key: "direction"},
-						{Key: "device"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "read",
-							HasValue: true,
-						}, {
-							Value:    "sda1",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000060,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 6e3,
-							},
-						}},
-					},
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "read",
-							HasValue: true,
-						}, {
-							Value:    "sda2",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000060,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 8e3,
-							},
-						}},
-					},
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "write",
-							HasValue: true,
-						}, {
-							Value:    "sda1",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000060,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 3e3,
-							},
-						}},
-					},
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "write",
-							HasValue: true,
-						}, {
-							Value:    "sda2",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000060,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 7e3,
-							},
-						}},
-					},
-				},
-			},
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name:        "system.network.io",
-					Description: "The number of bytes transmitted and received",
-					Unit:        "bytes",
-					Type:        metricspb.MetricDescriptor_GAUGE_INT64,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "direction"},
-						{Key: "device"},
-						{Key: "host"},
-						{Key: "kubernetes_node"},
-						{Key: "kubernetes_cluster"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "receive",
-							HasValue: true,
-						}, {
-							Value:    "eth0",
-							HasValue: true,
-						}, {
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "node0",
-							HasValue: true,
-						}, {
-							Value:    "cluster0",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 4e9,
-							},
-						}},
-					},
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "transmit",
-							HasValue: true,
-						}, {
-							Value:    "eth0",
-							HasValue: true,
-						}, {
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "node0",
-							HasValue: true,
-						}, {
-							Value:    "cluster0",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 6e9,
-							},
-						}},
-					},
-				},
-			},
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name:        "system.network.packets",
-					Description: "The number of packets transferred",
-					Type:        metricspb.MetricDescriptor_GAUGE_INT64,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "direction"},
-						{Key: "device"},
-						{Key: "host"},
-						{Key: "kubernetes_node"},
-						{Key: "kubernetes_cluster"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "receive",
-							HasValue: true,
-						}, {
-							Value:    "eth0",
-							HasValue: true,
-						}, {
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "node0",
-							HasValue: true,
-						}, {
-							Value:    "cluster0",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 200,
-							},
-						}},
-					},
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "receive",
-							HasValue: true,
-						}, {
-							Value:    "eth1",
-							HasValue: true,
-						}, {
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "node0",
-							HasValue: true,
-						}, {
-							Value:    "cluster0",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 150,
-							},
-						}},
-					},
-				},
-			},
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name: "container.memory.working_set",
-					Unit: "bytes",
-					Type: metricspb.MetricDescriptor_GAUGE_INT64,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "host"},
-						{Key: "kubernetes_node"},
-						{Key: "kubernetes_cluster"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "node0",
-							HasValue: true,
-						}, {
-							Value:    "cluster0",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 1000,
-							},
-						}},
-					},
-				},
-			},
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name: "container.memory.page_faults",
-					Unit: "",
-					Type: metricspb.MetricDescriptor_GAUGE_INT64,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "host"},
-						{Key: "kubernetes_node"},
-						{Key: "kubernetes_cluster"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "node0",
-							HasValue: true,
-						}, {
-							Value:    "cluster0",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 1000,
-							},
-						}},
-					},
-				},
-			},
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name: "container.memory.major_page_faults",
-					Unit: "",
-					Type: metricspb.MetricDescriptor_GAUGE_INT64,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "host"},
-						{Key: "kubernetes_node"},
-						{Key: "kubernetes_cluster"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						StartTimestamp: &timestamppb.Timestamp{},
-						LabelValues: []*metricspb.LabelValue{{
-							Value:    "host0",
-							HasValue: true,
-						}, {
-							Value:    "node0",
-							HasValue: true,
-						}, {
-							Value:    "cluster0",
-							HasValue: true,
-						}},
-						Points: []*metricspb.Point{{
-							Timestamp: &timestamppb.Timestamp{
-								Seconds: 1596000000,
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: 1000,
-							},
-						}},
-					},
-				},
-			},
-		},
+func testMetricsData(addHistogram bool) pmetric.Metrics {
+	md := pmetric.NewMetrics()
+
+	m1 := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	m1.SetName("system.memory.usage")
+	m1.SetDescription("Bytes of memory in use")
+	m1.SetUnit("bytes")
+	dp11 := m1.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp11.Attributes().PutStr("state", "used")
+	dp11.Attributes().PutStr("host", "host0")
+	dp11.Attributes().PutStr("kubernetes_node", "node0")
+	dp11.Attributes().PutStr("kubernetes_cluster", "cluster0")
+	dp11.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp11.SetIntValue(4e9)
+	dp12 := m1.Gauge().DataPoints().AppendEmpty()
+	dp12.Attributes().PutStr("state", "free")
+	dp12.Attributes().PutStr("host", "host0")
+	dp12.Attributes().PutStr("kubernetes_node", "node0")
+	dp12.Attributes().PutStr("kubernetes_cluster", "cluster0")
+	dp12.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp12.SetIntValue(6e9)
+
+	if addHistogram {
+		buildHistogram(m1, "histogram", pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)), 5)
 	}
-	return internaldata.OCToMetrics(md.Node, md.Resource, md.Metrics).ResourceMetrics().At(0)
+
+	sm2 := md.ResourceMetrics().At(0).ScopeMetrics().AppendEmpty().Metrics()
+	m2 := sm2.AppendEmpty()
+	m2.SetName("system.disk.io")
+	m2.SetDescription("Disk I/O.")
+	m2.SetEmptySum().SetIsMonotonic(true)
+	m2.Sum().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	dp21 := m2.Sum().DataPoints().AppendEmpty()
+	dp21.Attributes().PutStr("host", "host0")
+	dp21.Attributes().PutStr("direction", "read")
+	dp21.Attributes().PutStr("device", "sda1")
+	dp21.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp21.SetIntValue(1e9)
+	dp22 := m2.Sum().DataPoints().AppendEmpty()
+	dp22.Attributes().PutStr("host", "host0")
+	dp22.Attributes().PutStr("direction", "read")
+	dp22.Attributes().PutStr("device", "sda2")
+	dp22.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp22.SetIntValue(2e9)
+	dp23 := m2.Sum().DataPoints().AppendEmpty()
+	dp23.Attributes().PutStr("host", "host0")
+	dp23.Attributes().PutStr("direction", "write")
+	dp23.Attributes().PutStr("device", "sda1")
+	dp23.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp23.SetIntValue(3e9)
+	dp24 := m2.Sum().DataPoints().AppendEmpty()
+	dp24.Attributes().PutStr("host", "host0")
+	dp24.Attributes().PutStr("direction", "write")
+	dp24.Attributes().PutStr("device", "sda2")
+	dp24.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp24.SetIntValue(8e9)
+
+	if addHistogram {
+		buildHistogram(m2, "histogram", pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)), 5)
+	}
+
+	m3 := sm2.AppendEmpty()
+	m3.SetName("system.disk.operations")
+	m3.SetDescription("Disk operations count.")
+	m3.SetUnit("bytes")
+	m3.SetEmptySum().SetIsMonotonic(true)
+	m3.Sum().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	dp31 := m3.Sum().DataPoints().AppendEmpty()
+	dp31.Attributes().PutStr("host", "host0")
+	dp31.Attributes().PutStr("direction", "write")
+	dp31.Attributes().PutStr("device", "sda1")
+	dp31.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp31.SetIntValue(4e3)
+	dp32 := m3.Sum().DataPoints().AppendEmpty()
+	dp32.Attributes().PutStr("host", "host0")
+	dp32.Attributes().PutStr("direction", "read")
+	dp32.Attributes().PutStr("device", "sda2")
+	dp32.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp32.SetIntValue(6e3)
+	dp33 := m3.Sum().DataPoints().AppendEmpty()
+	dp33.Attributes().PutStr("host", "host0")
+	dp33.Attributes().PutStr("direction", "write")
+	dp33.Attributes().PutStr("device", "sda1")
+	dp33.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp33.SetIntValue(1e3)
+	dp34 := m3.Sum().DataPoints().AppendEmpty()
+	dp34.Attributes().PutStr("host", "host0")
+	dp34.Attributes().PutStr("direction", "write")
+	dp34.Attributes().PutStr("device", "sda2")
+	dp34.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp34.SetIntValue(5e3)
+
+	if addHistogram {
+		buildHistogram(m3, "histogram", pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)), 5)
+	}
+
+	m4 := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	m4.SetName("system.disk.operations")
+	m4.SetDescription("Disk operations count.")
+	m4.SetUnit("bytes")
+	m4.SetEmptySum().SetIsMonotonic(true)
+	m4.Sum().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	dp41 := m4.Sum().DataPoints().AppendEmpty()
+	dp41.Attributes().PutStr("host", "host0")
+	dp41.Attributes().PutStr("direction", "read")
+	dp41.Attributes().PutStr("device", "sda1")
+	dp41.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000060, 0)))
+	dp41.SetIntValue(6e3)
+	dp42 := m4.Sum().DataPoints().AppendEmpty()
+	dp42.Attributes().PutStr("host", "host0")
+	dp42.Attributes().PutStr("direction", "read")
+	dp42.Attributes().PutStr("device", "sda2")
+	dp42.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000060, 0)))
+	dp42.SetIntValue(8e3)
+	dp43 := m4.Sum().DataPoints().AppendEmpty()
+	dp43.Attributes().PutStr("host", "host0")
+	dp43.Attributes().PutStr("direction", "write")
+	dp43.Attributes().PutStr("device", "sda1")
+	dp43.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000060, 0)))
+	dp43.SetIntValue(3e3)
+	dp44 := m4.Sum().DataPoints().AppendEmpty()
+	dp44.Attributes().PutStr("host", "host0")
+	dp44.Attributes().PutStr("direction", "write")
+	dp44.Attributes().PutStr("device", "sda2")
+	dp44.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000060, 0)))
+	dp44.SetIntValue(7e3)
+
+	if addHistogram {
+		buildHistogram(m4, "histogram", pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)), 5)
+	}
+
+	sm5 := md.ResourceMetrics().At(0).ScopeMetrics().AppendEmpty().Metrics()
+	m5 := sm5.AppendEmpty()
+	m5.SetName("system.network.io")
+	m5.SetDescription("The number of bytes transmitted and received")
+	m5.SetUnit("bytes")
+	dp51 := m5.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp51.Attributes().PutStr("host", "host0")
+	dp51.Attributes().PutStr("direction", "receive")
+	dp51.Attributes().PutStr("device", "eth0")
+	dp51.Attributes().PutStr("kubernetes_node", "node0")
+	dp51.Attributes().PutStr("kubernetes_cluster", "cluster0")
+	dp51.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp51.SetIntValue(4e9)
+	dp52 := m5.Gauge().DataPoints().AppendEmpty()
+	dp52.Attributes().PutStr("host", "host0")
+	dp52.Attributes().PutStr("direction", "transmit")
+	dp52.Attributes().PutStr("device", "eth0")
+	dp52.Attributes().PutStr("kubernetes_node", "node0")
+	dp52.Attributes().PutStr("kubernetes_cluster", "cluster0")
+	dp52.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp52.SetIntValue(6e9)
+
+	if addHistogram {
+		buildHistogram(m5, "histogram", pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)), 5)
+	}
+
+	m6 := sm5.AppendEmpty()
+	m6.SetName("system.network.packets")
+	m6.SetDescription("The number of packets transferred")
+	dp61 := m6.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp61.Attributes().PutStr("host", "host0")
+	dp61.Attributes().PutStr("direction", "receive")
+	dp61.Attributes().PutStr("device", "eth0")
+	dp61.Attributes().PutStr("kubernetes_node", "node0")
+	dp61.Attributes().PutStr("kubernetes_cluster", "cluster0")
+	dp61.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp61.SetIntValue(200)
+	dp62 := m6.Gauge().DataPoints().AppendEmpty()
+	dp62.Attributes().PutStr("host", "host0")
+	dp62.Attributes().PutStr("direction", "receive")
+	dp62.Attributes().PutStr("device", "eth1")
+	dp62.Attributes().PutStr("kubernetes_node", "node0")
+	dp62.Attributes().PutStr("kubernetes_cluster", "cluster0")
+	dp62.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp62.SetIntValue(150)
+
+	if addHistogram {
+		buildHistogram(m6, "histogram", pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)), 5)
+	}
+
+	sm7 := md.ResourceMetrics().At(0).ScopeMetrics().AppendEmpty().Metrics()
+	m7 := sm7.AppendEmpty()
+	m7.SetName("container.memory.working_set")
+	m7.SetUnit("bytes")
+	dp71 := m7.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp71.Attributes().PutStr("host", "host0")
+	dp71.Attributes().PutStr("kubernetes_node", "node0")
+	dp71.Attributes().PutStr("kubernetes_cluster", "cluster0")
+	dp71.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp71.SetIntValue(1000)
+
+	if addHistogram {
+		buildHistogram(m7, "histogram", pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)), 5)
+	}
+
+	m8 := sm7.AppendEmpty()
+	m8.SetName("container.memory.page_faults")
+	dp81 := m8.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp81.Attributes().PutStr("host", "host0")
+	dp81.Attributes().PutStr("kubernetes_node", "node0")
+	dp81.Attributes().PutStr("kubernetes_cluster", "cluster0")
+	dp81.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp81.SetIntValue(1000)
+
+	if addHistogram {
+		buildHistogram(m8, "histogram", pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)), 5)
+	}
+
+	m9 := sm7.AppendEmpty()
+	m9.SetName("container.memory.major_page_faults")
+	dp91 := m9.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp91.Attributes().PutStr("host", "host0")
+	dp91.Attributes().PutStr("kubernetes_node", "node0")
+	dp91.Attributes().PutStr("kubernetes_cluster", "cluster0")
+	dp91.SetTimestamp(pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)))
+	dp91.SetIntValue(1000)
+
+	if addHistogram {
+		buildHistogram(m9, "histogram", pcommon.NewTimestampFromTime(time.Unix(1596000000, 0)), 5)
+	}
+
+	return md
 }
 
 func TestDefaultDiskTranslations(t *testing.T) {
@@ -947,21 +586,20 @@ func TestDefaultDiskTranslations(t *testing.T) {
 
 	du, ok := m["disk.utilization"]
 	require.True(t, ok)
-	require.Equal(t, 4, len(du[0].Dimensions))
+	require.Len(t, du[0].Dimensions, 4)
 	// cheap test for pct conversion
-	require.True(t, *du[0].Value.DoubleValue > 1)
+	require.Greater(t, *du[0].Value.DoubleValue, 1.0)
 
 	dsu, ok := m["disk.summary_utilization"]
 	require.True(t, ok)
-	require.Equal(t, 3, len(dsu[0].Dimensions))
-	require.True(t, *dsu[0].Value.DoubleValue > 1)
+	require.Len(t, dsu[0].Dimensions, 3)
+	require.Greater(t, *dsu[0].Value.DoubleValue, 1.0)
 }
 
 func testGetTranslator(t *testing.T) *translation.MetricTranslator {
-	rules, err := loadDefaultTranslationRules()
-	require.NoError(t, err)
+	rules := defaultTranslationRules
 	require.NotNil(t, rules, "rules are nil")
-	tr, err := translation.NewMetricTranslator(rules, 3600)
+	tr, err := translation.NewMetricTranslator(rules, 3600, make(chan struct{}))
 	require.NoError(t, err)
 	return tr
 }
@@ -992,85 +630,327 @@ func TestDefaultCPUTranslations(t *testing.T) {
 	}
 
 	cpuUtil := m["cpu.utilization"]
-	require.Equal(t, 1, len(cpuUtil))
+	require.Len(t, cpuUtil, 1)
 	for _, pt := range cpuUtil {
 		require.Equal(t, 66, int(*pt.Value.DoubleValue))
 	}
+
+	cpuNumProcessors := m["cpu.num_processors"]
+	require.Len(t, cpuNumProcessors, 1)
+	require.Equal(t, 8, int(*cpuNumProcessors[0].Value.IntValue))
+
+	cpuIdle := m["cpu.idle"]
+	require.Len(t, cpuIdle, 1)
+
+	cpuStateMetrics := []string{"cpu.idle", "cpu.interrupt", "cpu.system", "cpu.user"}
+	for _, metric := range cpuStateMetrics {
+		dps, ok := m[metric]
+		require.Truef(t, ok, "%s metrics not found", metric)
+		require.Len(t, dps, 1)
+	}
+
+	for metric, dps := range m {
+		switch metric {
+		case "cpu.num_processors", "cpu.utilization", "cpu.idle", "cpu.interrupt", "cpu.nice",
+			"cpu.softirq", "cpu.steal", "cpu.system", "cpu.user", "cpu.wait":
+			require.Len(t, dps, 1)
+			for _, dp := range dps {
+				requireNoDimension(t, dp.Dimensions, "cpu")
+			}
+		}
+	}
 }
 
-func TestDefaultExcludes_translated(t *testing.T) {
+func TestHostmetricsCPUTranslations(t *testing.T) {
 	f := NewFactory()
 	cfg := f.CreateDefaultConfig().(*Config)
-	setDefaultExcludes(cfg)
+	require.NoError(t, setDefaultExcludes(cfg))
+	converter, err := translation.NewMetricsConverter(zap.NewNop(), testGetTranslator(t), cfg.ExcludeMetrics, cfg.IncludeMetrics, "", false, true)
+	require.NoError(t, err)
 
-	converter, err := translation.NewMetricsConverter(zap.NewNop(), testGetTranslator(t), cfg.ExcludeMetrics, cfg.IncludeMetrics, "")
+	md1, err := golden.ReadMetrics(filepath.Join("testdata", "hostmetrics_system_cpu_time_1.yaml"))
+	require.NoError(t, err)
+
+	_ = converter.MetricsToSignalFxV2(md1)
+
+	md2, err := golden.ReadMetrics(filepath.Join("testdata", "hostmetrics_system_cpu_time_2.yaml"))
+	require.NoError(t, err)
+
+	translated2 := converter.MetricsToSignalFxV2(md2)
+
+	m := map[string][]*sfxpb.DataPoint{}
+	for _, pt := range translated2 {
+		pts := m[pt.Metric]
+		pts = append(pts, pt)
+		m[pt.Metric] = pts
+	}
+
+	cpuUtil := m["cpu.utilization"]
+	require.Len(t, cpuUtil, 1)
+	require.Equal(t, sfxpb.MetricType_GAUGE, *cpuUtil[0].MetricType)
+	require.Equal(t, 59, int(*cpuUtil[0].Value.DoubleValue))
+
+	cpuNumProcessors := m["cpu.num_processors"]
+	require.Len(t, cpuNumProcessors, 1)
+	require.Equal(t, sfxpb.MetricType_GAUGE, *cpuNumProcessors[0].MetricType)
+	require.Equal(t, 2, int(*cpuNumProcessors[0].Value.IntValue))
+
+	cpuIdle := m["cpu.idle"]
+	require.Len(t, cpuIdle, 1)
+	require.Equal(t, sfxpb.MetricType_CUMULATIVE_COUNTER, *cpuIdle[0].MetricType)
+	require.Equal(t, 590, int(*cpuIdle[0].Value.IntValue))
+}
+
+func TestDefaultExcludesTranslated(t *testing.T) {
+	f := NewFactory()
+	cfg := f.CreateDefaultConfig().(*Config)
+	require.NoError(t, setDefaultExcludes(cfg))
+
+	converter, err := translation.NewMetricsConverter(zap.NewNop(), testGetTranslator(t), cfg.ExcludeMetrics, cfg.IncludeMetrics, "", false, true)
 	require.NoError(t, err)
 
 	var metrics []map[string]string
 	err = testReadJSON("testdata/json/non_default_metrics.json", &metrics)
 	require.NoError(t, err)
 
-	rms := getResourceMetrics(metrics)
-	require.Equal(t, 9, rms.InstrumentationLibraryMetrics().At(0).Metrics().Len())
-	dps := converter.MetricDataToSignalFxV2(rms)
+	md := getMetrics(metrics)
+	require.Equal(t, 7, md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().Len())
+	dps := converter.MetricsToSignalFxV2(md)
 
-	// the default cpu.utilization metric is added after applying the default translations
-	// (because cpu.utilization_per_core is supplied) and should not be excluded
-	require.Equal(t, 1, len(dps))
-	require.Equal(t, "cpu.utilization", dps[0].Metric)
-
+	require.Empty(t, dps)
 }
 
 func TestDefaultExcludes_not_translated(t *testing.T) {
 	f := NewFactory()
 	cfg := f.CreateDefaultConfig().(*Config)
-	setDefaultExcludes(cfg)
+	require.NoError(t, setDefaultExcludes(cfg))
 
-	converter, err := translation.NewMetricsConverter(zap.NewNop(), nil, cfg.ExcludeMetrics, cfg.IncludeMetrics, "")
+	converter, err := translation.NewMetricsConverter(zap.NewNop(), nil, cfg.ExcludeMetrics, cfg.IncludeMetrics, "", false, true)
 	require.NoError(t, err)
 
 	var metrics []map[string]string
 	err = testReadJSON("testdata/json/non_default_metrics_otel_convention.json", &metrics)
 	require.NoError(t, err)
 
-	rms := getResourceMetrics(metrics)
-	require.Equal(t, 71, rms.InstrumentationLibraryMetrics().At(0).Metrics().Len())
-	dps := converter.MetricDataToSignalFxV2(rms)
-	require.Equal(t, 0, len(dps))
+	md := getMetrics(metrics)
+	require.Equal(t, 45, md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().Len())
+	dps := converter.MetricsToSignalFxV2(md)
+	require.Empty(t, dps)
 }
 
-func getResourceMetrics(metrics []map[string]string) pdata.ResourceMetrics {
-	rms := pdata.NewResourceMetrics()
-	ilms := rms.InstrumentationLibraryMetrics().AppendEmpty()
-	ilms.Metrics().Resize(len(metrics))
+func TestIncludeExcludeTranslatedCPUMetric(t *testing.T) {
+	tests := []struct {
+		name                string
+		includeMetric       string
+		expectedMetricNames []string
+	}{
+		{
+			name: "default excludes",
+			expectedMetricNames: []string{
+				"container.cpu.usage",
+			},
+		},
+		{
+			name:          "include overrides excludes",
+			includeMetric: "container_cpu_utilization",
+			expectedMetricNames: []string{
+				"container.cpu.usage",
+				"container_cpu_utilization",
+			},
+		},
+	}
 
-	for i, mp := range metrics {
-		m := ilms.Metrics().At(i)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := NewFactory()
+			cfg := f.CreateDefaultConfig().(*Config)
+			if tt.includeMetric != "" {
+				cfg.IncludeMetrics = []dpfilters.MetricFilter{{MetricNames: []string{tt.includeMetric}}}
+			}
+			require.NoError(t, setDefaultExcludes(cfg))
+
+			converter, err := translation.NewMetricsConverter(zap.NewNop(), testGetTranslator(t), cfg.ExcludeMetrics, cfg.IncludeMetrics, "", false, true)
+			require.NoError(t, err)
+
+			metrics := []map[string]string{
+				{"container.cpu.time": ""},
+				{"container.cpu.usage": ""},
+			}
+			dps := converter.MetricsToSignalFxV2(getMetrics(metrics))
+			metricNames := make([]string, 0, len(dps))
+			for _, dp := range dps {
+				metricNames = append(metricNames, dp.Metric)
+			}
+			require.ElementsMatch(t, tt.expectedMetricNames, metricNames)
+		})
+	}
+}
+
+func TestIncludeExcludeDeprecatedTranslatedMetrics(t *testing.T) {
+	deprecated := []string{
+		"memory.total",
+		"process.cpu_time_seconds",
+		"system.disk.operations.total",
+		"system.network.io.total",
+		"system.network.packets.total",
+	}
+
+	tests := []struct {
+		name           string
+		includeMetrics []dpfilters.MetricFilter
+		wantDeprecated bool
+	}{
+		{
+			name: "default excludes",
+		},
+		{
+			name:           "include overrides excludes",
+			includeMetrics: []dpfilters.MetricFilter{{MetricNames: deprecated}},
+			wantDeprecated: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := NewFactory()
+			cfg := f.CreateDefaultConfig().(*Config)
+			cfg.IncludeMetrics = tt.includeMetrics
+			require.NoError(t, setDefaultExcludes(cfg))
+
+			converter, err := translation.NewMetricsConverter(zap.NewNop(), testGetTranslator(t), cfg.ExcludeMetrics, cfg.IncludeMetrics, "", false, true)
+			require.NoError(t, err)
+
+			metrics := []map[string]string{
+				{"system.memory.usage": "", "state": "used"},
+				{"system.memory.usage": "", "state": "free"},
+				{"process.cpu.time": "", "state": "user"},
+				{"system.disk.operations": "", "device": "sda"},
+				{"system.network.io": "", "device": "eth0"},
+				{"system.network.packets": "", "device": "eth0"},
+			}
+			dps := converter.MetricsToSignalFxV2(getMetrics(metrics))
+			metricNames := make([]string, 0, len(dps))
+			for _, dp := range dps {
+				metricNames = append(metricNames, dp.Metric)
+			}
+
+			for _, name := range deprecated {
+				if tt.wantDeprecated {
+					assert.Contains(t, metricNames, name)
+				} else {
+					assert.NotContains(t, metricNames, name)
+				}
+			}
+		})
+	}
+}
+
+func TestDefaultExcludesKubeletMemoryMetrics(t *testing.T) {
+	f := NewFactory()
+	cfg := f.CreateDefaultConfig().(*Config)
+	require.NoError(t, setDefaultExcludes(cfg))
+
+	converter, err := translation.NewMetricsConverter(zap.NewNop(), nil, cfg.ExcludeMetrics, cfg.IncludeMetrics, "", false, true)
+	require.NoError(t, err)
+
+	var metrics []map[string]string
+	for _, prefix := range []string{"container", "k8s.node", "k8s.pod"} {
+		for _, suffix := range []string{"available", "major_page_faults", "page_faults", "rss", "usage", "working_set"} {
+			metrics = append(metrics, map[string]string{prefix + ".memory." + suffix: ""})
+		}
+	}
+
+	dps := converter.MetricsToSignalFxV2(getMetrics(metrics))
+	metricNames := make([]string, 0, len(dps))
+	for _, dp := range dps {
+		metricNames = append(metricNames, dp.Metric)
+	}
+	require.ElementsMatch(t, []string{
+		"container.memory.rss",
+		"container.memory.usage",
+		"container.memory.working_set",
+	}, metricNames)
+}
+
+// Benchmark test for default translation rules on an example hostmetrics dataset.
+func BenchmarkMetricConversion(b *testing.B) {
+	rules := defaultTranslationRules
+	require.NotNil(b, rules, "rules are nil")
+	tr, err := translation.NewMetricTranslator(rules, 1, make(chan struct{}))
+	require.NoError(b, err)
+
+	c, err := translation.NewMetricsConverter(zap.NewNop(), tr, nil, nil, "", false, true)
+	require.NoError(b, err)
+
+	bytes, err := os.ReadFile("testdata/json/hostmetrics.json")
+	require.NoError(b, err)
+
+	unmarshaller := &pmetric.JSONUnmarshaler{}
+	metrics, err := unmarshaller.UnmarshalMetrics(bytes)
+	require.NoError(b, err)
+
+	for b.Loop() {
+		translated := c.MetricsToSignalFxV2(metrics)
+		require.NotNil(b, translated)
+	}
+}
+
+func getMetrics(metrics []map[string]string) pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	ilms := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	ilms.Metrics().EnsureCapacity(len(metrics))
+
+	for _, mp := range metrics {
+		m := ilms.Metrics().AppendEmpty()
 		// Set data type to some arbitrary since it does not matter for this test.
-		m.SetDataType(pdata.MetricDataTypeIntSum)
-		dp := m.IntSum().DataPoints().AppendEmpty()
-		dp.SetValue(0)
-		labelsMap := dp.LabelsMap()
+		dp := m.SetEmptySum().DataPoints().AppendEmpty()
+		dp.SetIntValue(0)
+		attributesMap := dp.Attributes()
 		for k, v := range mp {
 			if v == "" {
 				m.SetName(k)
 				continue
 			}
-			labelsMap.Insert(k, v)
+			attributesMap.PutStr(k, v)
 		}
 	}
-	return rms
+	return md
 }
 
-func testReadJSON(f string, v interface{}) error {
-	file, err := os.Open(f)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = file.Close() }()
-	bytes, err := ioutil.ReadAll(file)
+func testReadJSON(f string, v any) error {
+	bytes, err := os.ReadFile(f)
 	if err != nil {
 		return err
 	}
 	return json.Unmarshal(bytes, &v)
+}
+
+func TestExporterHelperBatchingEnabled(t *testing.T) {
+	factory := NewFactory()
+	set := exportertest.NewNopSettings(metadata.Type)
+	create := map[string]func(*Config) (component.Component, error){
+		"metrics": func(cfg *Config) (component.Component, error) { return factory.CreateMetrics(t.Context(), set, cfg) },
+		"logs":    func(cfg *Config) (component.Component, error) { return factory.CreateLogs(t.Context(), set, cfg) },
+	}
+
+	for signal, fn := range create {
+		t.Run(signal, func(t *testing.T) {
+			for _, enabled := range []bool{true, false} {
+				cfg := factory.CreateDefaultConfig().(*Config)
+				cfg.AccessToken = "access_token"
+				cfg.Realm = "us0"
+				if enabled {
+					cfg.QueueSettings.Get().Batch.GetOrInsertDefault()
+				} else {
+					cfg.QueueSettings.Get().Batch = configoptional.None[exporterhelper.BatchConfig]()
+				}
+
+				exp, err := fn(cfg)
+				require.NoError(t, err)
+				b, ok := exp.(interface{ ExporterHelperBatchingEnabled() bool })
+				require.True(t, ok)
+				assert.Equal(t, enabled, b.ExporterHelperBatchingEnabled())
+			}
+		})
+	}
 }

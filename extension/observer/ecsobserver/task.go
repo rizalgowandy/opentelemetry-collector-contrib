@@ -1,40 +1,31 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package ecsobserver
+package ecsobserver // import "github.com/open-telemetry/opentelemetry-collector-contrib/extension/observer/ecsobserver"
 
 import (
 	"fmt"
+	"maps"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/aws/aws-sdk-go/service/ecs"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"go.uber.org/zap"
 )
 
-// Task contains both raw task info and its definition.
+// taskAnnotated contains both raw task info and its definition.
 // It is generated from taskFetcher.
-type Task struct {
-	Task       *ecs.Task
-	Definition *ecs.TaskDefinition
-	EC2        *ec2.Instance
-	Service    *ecs.Service
-	Matched    []MatchedContainer
+type taskAnnotated struct {
+	Task       *ecstypes.Task
+	Definition *ecstypes.TaskDefinition
+	EC2        *ec2types.Instance
+	Service    *ecstypes.Service
+	Matched    []matchedContainer
 }
 
 // AddMatchedContainer tries to add a new matched container.
 // If the container already exists will merge targets within one container (i.e. different port/metrics path).
-func (t *Task) AddMatchedContainer(newContainer MatchedContainer) {
+func (t *taskAnnotated) AddMatchedContainer(newContainer matchedContainer) {
 	for i, oldContainer := range t.Matched {
 		if oldContainer.ContainerIndex == newContainer.ContainerIndex {
 			t.Matched[i].MergeTargets(newContainer.Targets)
@@ -44,13 +35,13 @@ func (t *Task) AddMatchedContainer(newContainer MatchedContainer) {
 	t.Matched = append(t.Matched, newContainer)
 }
 
-func (t *Task) TaskTags() map[string]string {
+func (t *taskAnnotated) TaskTags() map[string]string {
 	if len(t.Task.Tags) == 0 {
 		return nil
 	}
 	tags := make(map[string]string, len(t.Task.Tags))
 	for _, tag := range t.Task.Tags {
-		tags[aws.StringValue(tag.Key)] = aws.StringValue(tag.Value)
+		tags[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
 	}
 	return tags
 }
@@ -58,37 +49,35 @@ func (t *Task) TaskTags() map[string]string {
 // EC2Tags returns ec2 instance tags as it is. Sanitize to prometheus label format is done during export.
 // NOTE: the tag to string conversion is duplicated because the Tag struct is defined in each service's own API package.
 // i.e. services don't import a common package that includes tag definition.
-func (t *Task) EC2Tags() map[string]string {
+func (t *taskAnnotated) EC2Tags() map[string]string {
 	if t.EC2 == nil || len(t.EC2.Tags) == 0 {
 		return nil
 	}
 	tags := make(map[string]string, len(t.EC2.Tags))
 	for _, tag := range t.EC2.Tags {
-		tags[aws.StringValue(tag.Key)] = aws.StringValue(tag.Value)
+		tags[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
 	}
 	return tags
 }
 
-func (t *Task) ContainerLabels(containerIndex int) map[string]string {
+func (t *taskAnnotated) ContainerLabels(containerIndex int) map[string]string {
 	def := t.Definition.ContainerDefinitions[containerIndex]
 	if len(def.DockerLabels) == 0 {
 		return nil
 	}
 	labels := make(map[string]string, len(def.DockerLabels))
-	for k, v := range def.DockerLabels {
-		labels[k] = aws.StringValue(v)
-	}
+	maps.Copy(labels, def.DockerLabels)
 	return labels
 }
 
-// ErrPrivateIPNotFound indicates the awsvpc private ip or EC2 instance ip is not found.
-type ErrPrivateIPNotFound struct {
+// errPrivateIPNotFound indicates the awsvpc private ip or EC2 instance ip is not found.
+type errPrivateIPNotFound struct {
 	TaskArn     string
-	NetworkMode string
+	NetworkMode ecstypes.NetworkMode
 	Extra       string // extra message
 }
 
-func (e *ErrPrivateIPNotFound) Error() string {
+func (e *errPrivateIPNotFound) Error() string {
 	m := fmt.Sprintf("private ip not found for network mode %q and task %s", e.NetworkMode, e.TaskArn)
 	if e.Extra != "" {
 		m = m + " " + e.Extra
@@ -96,14 +85,24 @@ func (e *ErrPrivateIPNotFound) Error() string {
 	return m
 }
 
+func (*errPrivateIPNotFound) message() string {
+	return "private ip not found"
+}
+
+func (e *errPrivateIPNotFound) zapFields() []zap.Field {
+	return []zap.Field{
+		zap.String("NetworkMode", string(e.NetworkMode)),
+		zap.String("Extra", e.Extra),
+	}
+}
+
 // PrivateIP returns private ip address based on network mode.
 // EC2 launch type can use host/bridge mode and the private ip is the EC2 instance's ip.
 // awsvpc has its own ip regardless of launch type.
-func (t *Task) PrivateIP() (string, error) {
-	arn := aws.StringValue(t.Task.TaskArn)
-	mode := aws.StringValue(t.Definition.NetworkMode)
-	errNotFound := &ErrPrivateIPNotFound{
-		TaskArn:     arn,
+func (t *taskAnnotated) PrivateIP() (string, error) {
+	mode := t.Definition.NetworkMode
+	errNotFound := &errPrivateIPNotFound{
+		TaskArn:     aws.ToString(t.Task.TaskArn),
 		NetworkMode: mode,
 	}
 	switch mode {
@@ -111,76 +110,87 @@ func (t *Task) PrivateIP() (string, error) {
 	// For fargate it has to be awsvpc and will error on task creation if invalid config is given.
 	// See https://docs.aws.amazon.com/AmazonECS/latest/userguide/fargate-task-defs.html#fargate-tasks-networkmod
 	// In another word, when network mode is empty, it must be EC2 bridge.
-	case "", ecs.NetworkModeHost, ecs.NetworkModeBridge:
+	case "", ecstypes.NetworkModeHost, ecstypes.NetworkModeBridge:
 		if t.EC2 == nil {
 			errNotFound.Extra = "EC2 info not found"
 			return "", errNotFound
 		}
-		return aws.StringValue(t.EC2.PrivateIpAddress), nil
-	case ecs.NetworkModeAwsvpc:
+		return aws.ToString(t.EC2.PrivateIpAddress), nil
+	case ecstypes.NetworkModeAwsvpc:
 		for _, v := range t.Task.Attachments {
-			if aws.StringValue(v.Type) == "ElasticNetworkInterface" {
+			if aws.ToString(v.Type) == "ElasticNetworkInterface" {
 				for _, d := range v.Details {
-					if aws.StringValue(d.Name) == "privateIPv4Address" {
-						return aws.StringValue(d.Value), nil
+					if aws.ToString(d.Name) == "privateIPv4Address" {
+						return aws.ToString(d.Value), nil
 					}
 				}
 			}
 		}
 		return "", errNotFound
-	case ecs.NetworkModeNone:
+	case ecstypes.NetworkModeNone:
 		return "", errNotFound
 	default:
 		return "", errNotFound
 	}
 }
 
-// ErrMappedPortNotFound indicates the port specified in config does not exists
+// errMappedPortNotFound indicates the port specified in config does not exists
 // or the location for mapped ports has changed on ECS side.
-type ErrMappedPortNotFound struct {
+type errMappedPortNotFound struct {
 	TaskArn       string
-	NetworkMode   string
+	NetworkMode   ecstypes.NetworkMode
 	ContainerName string
-	ContainerPort int64
+	ContainerPort int32
 }
 
-func (e *ErrMappedPortNotFound) Error() string {
+func (e *errMappedPortNotFound) Error() string {
 	// Output the error message in this order to make searching easier as only task arn changes frequently.
 	// %q for network mode because empty string is valid for ECS EC2.
 	return fmt.Sprintf("mapped port not found for container port %d network mode %q on container %s in task %s",
 		e.ContainerPort, e.NetworkMode, e.ContainerName, e.TaskArn)
 }
 
+func (*errMappedPortNotFound) message() string {
+	return "mapped port not found"
+}
+
+func (e *errMappedPortNotFound) zapFields() []zap.Field {
+	return []zap.Field{
+		zap.String("NetworkMode", string(e.NetworkMode)),
+		zap.Int32("ContainerPort", e.ContainerPort),
+	}
+}
+
 // MappedPort returns 'external' port based on network mode.
 // EC2 bridge uses a random host port while EC2 host/awsvpc uses a port specified by the user.
-func (t *Task) MappedPort(def *ecs.ContainerDefinition, containerPort int64) (int64, error) {
-	arn := aws.StringValue(t.Task.TaskArn)
-	mode := aws.StringValue(t.Definition.NetworkMode)
+func (t *taskAnnotated) MappedPort(def ecstypes.ContainerDefinition, containerPort int32) (int32, error) {
+	mode := t.Definition.NetworkMode
 	// the error is same for all network modes (if any)
-	errNotFound := &ErrMappedPortNotFound{
-		TaskArn:       arn,
+	errNotFound := &errMappedPortNotFound{
+		TaskArn:       aws.ToString(t.Task.TaskArn),
 		NetworkMode:   mode,
-		ContainerName: aws.StringValue(def.Name),
+		ContainerName: aws.ToString(def.Name),
 		ContainerPort: containerPort,
 	}
 	switch mode {
-	case ecs.NetworkModeNone:
+	case ecstypes.NetworkModeNone:
 		return 0, errNotFound
-	case ecs.NetworkModeHost, ecs.NetworkModeAwsvpc:
+	case ecstypes.NetworkModeHost, ecstypes.NetworkModeAwsvpc:
 		// taskDefinition->containerDefinitions->portMappings
 		for _, v := range def.PortMappings {
-			if containerPort == aws.Int64Value(v.ContainerPort) {
-				return aws.Int64Value(v.HostPort), nil
+			if containerPort == aws.ToInt32(v.ContainerPort) {
+				return aws.ToInt32(v.HostPort), nil
 			}
 		}
 		return 0, errNotFound
-	case "", ecs.NetworkModeBridge:
+	case "", ecstypes.NetworkModeBridge:
 		//  task->containers->networkBindings
-		for _, c := range t.Task.Containers {
-			if aws.StringValue(def.Name) == aws.StringValue(c.Name) {
+		for i := range t.Task.Containers {
+			c := &t.Task.Containers[i]
+			if aws.ToString(def.Name) == aws.ToString(c.Name) {
 				for _, b := range c.NetworkBindings {
-					if containerPort == aws.Int64Value(b.ContainerPort) {
-						return aws.Int64Value(b.HostPort), nil
+					if containerPort == aws.ToInt32(b.ContainerPort) {
+						return aws.ToInt32(b.HostPort), nil
 					}
 				}
 			}

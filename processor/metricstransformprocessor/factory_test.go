@@ -1,52 +1,40 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package metricstransformprocessor
 
 import (
-	"context"
 	"fmt"
-	"path"
-	"reflect"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/collector/component"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configcheck"
-	"go.opentelemetry.io/collector/config/configtest"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
 	"go.opentelemetry.io/collector/consumer/consumertest"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/processor/processortest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/aggregateutil"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/metricstransformprocessor/internal/metadata"
 )
 
 func TestType(t *testing.T) {
 	factory := NewFactory()
 	pType := factory.Type()
-	assert.Equal(t, pType, config.Type("metricstransform"))
+	assert.Equal(t, pType, metadata.Type)
 }
 
 func TestCreateDefaultConfig(t *testing.T) {
 	factory := NewFactory()
 	cfg := factory.CreateDefaultConfig()
-	assert.Equal(t, cfg, &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewID(typeStr)),
-	})
-	assert.NoError(t, configcheck.ValidateConfig(cfg))
+	assert.Equal(t, &Config{}, cfg)
+	assert.NoError(t, componenttest.CheckConfigStruct(cfg))
 }
 
 func TestCreateProcessors(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		configName   string
 		succeed      bool
@@ -59,95 +47,110 @@ func TestCreateProcessors(t *testing.T) {
 		{
 			configName:   "config_invalid_newname.yaml",
 			succeed:      false,
-			errorMessage: fmt.Sprintf("missing required field %q while %q is %v", NewNameFieldName, ActionFieldName, Insert),
+			errorMessage: fmt.Sprintf("missing required field %q while %q is %v", newNameFieldName, actionFieldName, Insert),
+		},
+		{
+			configName:   "config_invalid_combine_newname.yaml",
+			succeed:      false,
+			errorMessage: fmt.Sprintf("missing required field %q while %q is %v", newNameFieldName, actionFieldName, Combine),
+		},
+		{
+			configName:   "config_invalid_combine_aggregationtype.yaml",
+			succeed:      false,
+			errorMessage: fmt.Sprintf("missing required field %q while %q is %v", aggregationTypeFieldName, actionFieldName, Combine),
 		},
 		{
 			configName:   "config_invalid_group.yaml",
 			succeed:      false,
-			errorMessage: fmt.Sprintf("missing required field %q while %q is %v", GroupResourceLabelsFieldName, ActionFieldName, Group),
+			errorMessage: fmt.Sprintf("missing required field %q while %q is %v", groupResourceLabelsFieldName, actionFieldName, Group),
 		},
 		{
 			configName:   "config_invalid_action.yaml",
 			succeed:      false,
-			errorMessage: fmt.Sprintf("%q must be in %q", ActionFieldName, actions),
+			errorMessage: fmt.Sprintf("%q must be in %q", actionFieldName, actions),
 		},
 		{
 			configName:   "config_invalid_include.yaml",
 			succeed:      false,
-			errorMessage: fmt.Sprintf("missing required field %q", IncludeFieldName),
-		},
-		{
-			configName:   "config_invalid_include_and_metricname.yaml",
-			succeed:      false,
-			errorMessage: fmt.Sprintf("cannot supply both %q and %q, use %q with %q match type", IncludeFieldName, MetricNameFieldName, IncludeFieldName, StrictMatchType),
+			errorMessage: fmt.Sprintf("missing required field %q", includeFieldName),
 		},
 		{
 			configName:   "config_invalid_matchtype.yaml",
 			succeed:      false,
-			errorMessage: fmt.Sprintf("%q must be in %q", MatchTypeFieldName, matchTypes),
+			errorMessage: fmt.Sprintf("%q must be in %q", matchTypeFieldName, matchTypes),
 		},
 		{
 			configName:   "config_invalid_label.yaml",
 			succeed:      false,
-			errorMessage: fmt.Sprintf("operation %v: missing required field %q while %q is %v", 1, LabelFieldName, ActionFieldName, UpdateLabel),
+			errorMessage: fmt.Sprintf("operation %v: missing required field %q while %q is %v", 1, labelFieldName, actionFieldName, updateLabel),
+		},
+		{
+			configName:   "config_invalid_scale.yaml",
+			succeed:      false,
+			errorMessage: fmt.Sprintf("operation %v: missing required field %q while %q is %v", 1, scaleFieldName, actionFieldName, scaleValue),
 		},
 		{
 			configName:   "config_invalid_regexp.yaml",
 			succeed:      false,
-			errorMessage: fmt.Sprintf("%q, error parsing regexp: missing closing ]: `[\\da`", IncludeFieldName),
+			errorMessage: fmt.Sprintf("%q, error parsing regexp: missing closing ]: `[\\da`", includeFieldName),
 		},
 		{
 			configName:   "config_invalid_aggregationtype.yaml",
 			succeed:      false,
-			errorMessage: fmt.Sprintf("%q must be in %q", AggregationTypeFieldName, aggregationTypes),
+			errorMessage: fmt.Sprintf("%q must be in %q", aggregationTypeFieldName, aggregateutil.AggregationTypes),
 		},
 		{
 			configName:   "config_invalid_operation_action.yaml",
 			succeed:      false,
-			errorMessage: fmt.Sprintf("operation %v: %q must be in %q", 1, ActionFieldName, operationActions),
+			errorMessage: fmt.Sprintf("operation %v: %q must be in %q", 1, actionFieldName, operationActions),
 		},
 		{
 			configName:   "config_invalid_operation_aggregationtype.yaml",
 			succeed:      false,
-			errorMessage: fmt.Sprintf("operation %v: %q must be in %q", 1, AggregationTypeFieldName, aggregationTypes),
+			errorMessage: fmt.Sprintf("operation %v: %q must be in %q", 1, aggregationTypeFieldName, aggregateutil.AggregationTypes),
 		},
 		{
 			configName:   "config_invalid_submatchcase.yaml",
 			succeed:      false,
-			errorMessage: fmt.Sprintf("%q must be in %q", SubmatchCaseFieldName, submatchCases),
+			errorMessage: fmt.Sprintf("%q must be in %q", submatchCaseFieldName, submatchCases),
 		},
 	}
 
-	for _, test := range tests {
-		factories, err := componenttest.NopFactories()
-		assert.NoError(t, err)
+	for _, tt := range tests {
+		cm, err := confmaptest.LoadConf(filepath.Join("testdata", tt.configName))
+		require.NoError(t, err)
 
-		factory := NewFactory()
-		factories.Processors[typeStr] = factory
-		config, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", test.configName), factories)
-		assert.NoError(t, err)
+		for k := range cm.ToStringMap() {
+			// Check if all processor variations that are defined in test config can be actually created
+			t.Run(tt.configName, func(t *testing.T) {
+				factory := NewFactory()
+				cfg := factory.CreateDefaultConfig()
 
-		for name, cfg := range config.Processors {
-			t.Run(fmt.Sprintf("%s/%s", test.configName, name), func(t *testing.T) {
-				tp, tErr := factory.CreateTracesProcessor(
-					context.Background(),
-					component.ProcessorCreateSettings{Logger: zap.NewNop()},
+				sub, err := cm.Sub(k)
+				require.NoError(t, err)
+				require.NoError(t, sub.Unmarshal(cfg))
+
+				tp, tErr := factory.CreateTraces(
+					t.Context(),
+					processortest.NewNopSettings(metadata.Type),
 					cfg,
-					consumertest.NewNop())
+					consumertest.NewNop(),
+				)
 				// Not implemented error
 				assert.Error(t, tErr)
 				assert.Nil(t, tp)
 
-				mp, mErr := factory.CreateMetricsProcessor(
-					context.Background(),
-					component.ProcessorCreateSettings{Logger: zap.NewNop()},
+				mp, mErr := factory.CreateMetrics(
+					t.Context(),
+					processortest.NewNopSettings(metadata.Type),
 					cfg,
-					consumertest.NewNop())
-				if test.succeed {
+					consumertest.NewNop(),
+				)
+				if tt.succeed {
 					assert.NotNil(t, mp)
 					assert.NoError(t, mErr)
 				} else {
-					assert.EqualError(t, mErr, test.errorMessage)
+					assert.EqualError(t, mErr, tt.errorMessage)
 				}
 			})
 		}
@@ -156,13 +159,16 @@ func TestCreateProcessors(t *testing.T) {
 
 func TestFactory_validateConfiguration(t *testing.T) {
 	v1 := Config{
-		Transforms: []Transform{
+		Transforms: []transform{
 			{
-				MetricName: "mymetric",
-				Action:     Update,
-				Operations: []Operation{
+				MetricIncludeFilter: filterConfig{
+					Include:   "mymetric",
+					MatchType: strictMatchType,
+				},
+				Action: Update,
+				Operations: []operation{
 					{
-						Action:   AddLabel,
+						Action:   addLabel,
 						NewValue: "bar",
 					},
 				},
@@ -170,16 +176,19 @@ func TestFactory_validateConfiguration(t *testing.T) {
 		},
 	}
 	err := validateConfiguration(&v1)
-	assert.Equal(t, "operation 1: missing required field \"new_label\" while \"action\" is add_label", err.Error())
+	assert.EqualError(t, err, "operation 1: missing required field \"new_label\" while \"action\" is add_label")
 
 	v2 := Config{
-		Transforms: []Transform{
+		Transforms: []transform{
 			{
-				MetricName: "mymetric",
-				Action:     Update,
-				Operations: []Operation{
+				MetricIncludeFilter: filterConfig{
+					Include:   "mymetric",
+					MatchType: strictMatchType,
+				},
+				Action: Update,
+				Operations: []operation{
 					{
-						Action:   AddLabel,
+						Action:   addLabel,
 						NewLabel: "foo",
 					},
 				},
@@ -188,7 +197,28 @@ func TestFactory_validateConfiguration(t *testing.T) {
 	}
 
 	err = validateConfiguration(&v2)
-	assert.Equal(t, "operation 1: missing required field \"new_value\" while \"action\" is add_label", err.Error())
+	assert.EqualError(t, err, "operation 1: missing required field \"new_value\" while \"action\" is add_label")
+}
+
+func TestBuildHelperConfig_SubmatchCaseCopied(t *testing.T) {
+	cfg := &Config{
+		Transforms: []transform{
+			{
+				MetricIncludeFilter: filterConfig{
+					Include:   "^(?P<label>.*)_total$",
+					MatchType: regexpMatchType,
+				},
+				Action:          Combine,
+				NewName:         "combined",
+				AggregationType: aggregateutil.Sum,
+				SubmatchCase:    "lower",
+			},
+		},
+	}
+	helpers, err := buildHelperConfig(cfg, "1.0.0")
+	require.NoError(t, err)
+	require.Len(t, helpers, 1)
+	assert.Equal(t, submatchCase("lower"), helpers[0].SubmatchCase)
 }
 
 func TestCreateProcessorsFilledData(t *testing.T) {
@@ -196,22 +226,25 @@ func TestCreateProcessorsFilledData(t *testing.T) {
 	cfg := factory.CreateDefaultConfig()
 	oCfg := cfg.(*Config)
 
-	oCfg.Transforms = []Transform{
+	oCfg.Transforms = []transform{
 		{
-			MetricName: "name",
-			Action:     Update,
-			NewName:    "new-name",
-			Operations: []Operation{
+			MetricIncludeFilter: filterConfig{
+				Include:   "name",
+				MatchType: strictMatchType,
+			},
+			Action:  Update,
+			NewName: "new-name",
+			Operations: []operation{
 				{
-					Action:   AddLabel,
+					Action:   addLabel,
 					NewLabel: "new-label",
 					NewValue: "new-value {{version}}",
 				},
 				{
-					Action:   UpdateLabel,
+					Action:   updateLabel,
 					Label:    "label",
 					NewLabel: "new-label",
-					ValueActions: []ValueAction{
+					ValueActions: []valueAction{
 						{
 							Value:    "value",
 							NewValue: "new/value {{version}}",
@@ -219,16 +252,16 @@ func TestCreateProcessorsFilledData(t *testing.T) {
 					},
 				},
 				{
-					Action:          AggregateLabels,
+					Action:          aggregateLabels,
 					LabelSet:        []string{"label1", "label2"},
-					AggregationType: Sum,
+					AggregationType: aggregateutil.Sum,
 				},
 				{
-					Action:           AggregateLabelValues,
+					Action:           aggregateLabelValues,
 					Label:            "label",
 					AggregatedValues: []string{"value1", "value2"},
 					NewValue:         "new-value",
-					AggregationType:  Sum,
+					AggregationType:  aggregateutil.Sum,
 				},
 			},
 		},
@@ -241,18 +274,18 @@ func TestCreateProcessorsFilledData(t *testing.T) {
 			NewName:             "new-name",
 			Operations: []internalOperation{
 				{
-					configOperation: Operation{
-						Action:   AddLabel,
+					configOperation: &operation{
+						Action:   addLabel,
 						NewLabel: "new-label",
 						NewValue: "new-value v0.0.1",
 					},
 				},
 				{
-					configOperation: Operation{
-						Action:   UpdateLabel,
+					configOperation: &operation{
+						Action:   updateLabel,
 						Label:    "label",
 						NewLabel: "new-label",
-						ValueActions: []ValueAction{
+						ValueActions: []valueAction{
 							{
 								Value:    "value",
 								NewValue: "new/value v0.0.1",
@@ -262,10 +295,10 @@ func TestCreateProcessorsFilledData(t *testing.T) {
 					valueActionsMapping: map[string]string{"value": "new/value v0.0.1"},
 				},
 				{
-					configOperation: Operation{
-						Action:          AggregateLabels,
+					configOperation: &operation{
+						Action:          aggregateLabels,
 						LabelSet:        []string{"label1", "label2"},
-						AggregationType: Sum,
+						AggregationType: aggregateutil.Sum,
 					},
 					labelSetMap: map[string]bool{
 						"label1": true,
@@ -273,12 +306,12 @@ func TestCreateProcessorsFilledData(t *testing.T) {
 					},
 				},
 				{
-					configOperation: Operation{
-						Action:           AggregateLabelValues,
+					configOperation: &operation{
+						Action:           aggregateLabelValues,
 						Label:            "label",
 						AggregatedValues: []string{"value1", "value2"},
 						NewValue:         "new-value",
-						AggregationType:  Sum,
+						AggregationType:  aggregateutil.Sum,
 					},
 					aggregatedValuesSet: map[string]bool{
 						"value1": true,
@@ -289,7 +322,8 @@ func TestCreateProcessorsFilledData(t *testing.T) {
 		},
 	}
 
-	internalTransforms := buildHelperConfig(oCfg, "v0.0.1")
+	internalTransforms, err := buildHelperConfig(oCfg, "v0.0.1")
+	assert.NoError(t, err)
 
 	for i, expTr := range expData {
 		mtpT := internalTransforms[i]
@@ -299,9 +333,9 @@ func TestCreateProcessorsFilledData(t *testing.T) {
 		for j, expOp := range expTr.Operations {
 			mtpOp := mtpT.Operations[j]
 			assert.Equal(t, expOp.configOperation, mtpOp.configOperation)
-			assert.True(t, reflect.DeepEqual(mtpOp.valueActionsMapping, expOp.valueActionsMapping))
-			assert.True(t, reflect.DeepEqual(mtpOp.labelSetMap, expOp.labelSetMap))
-			assert.True(t, reflect.DeepEqual(mtpOp.aggregatedValuesSet, expOp.aggregatedValuesSet))
+			assert.Equal(t, expOp.valueActionsMapping, mtpOp.valueActionsMapping)
+			assert.Equal(t, expOp.labelSetMap, mtpOp.labelSetMap)
+			assert.Equal(t, expOp.aggregatedValuesSet, mtpOp.aggregatedValuesSet)
 		}
 	}
 }

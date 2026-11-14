@@ -2,17 +2,15 @@ receivers:
   fluentforward:
     endpoint: 0.0.0.0:24224
 
-processors:
-  batch:
-
 exporters:
-  logging:
-    loglevel: debug
-  loadbalancing:
+  debug:
+    verbosity: detailed
+  load_balancing:
     protocol:
       otlp:
         timeout: 1s
-        insecure: true
+        tls:
+          insecure: true
     resolver:
       static:
         hostnames:
@@ -30,5 +28,4 @@ service:
   pipelines:
     logs:
       receivers: [fluentforward]
-      processors: [batch]
-      exporters: [loadbalancing, logging]
+      exporters: [load_balancing, debug]

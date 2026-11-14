@@ -1,88 +1,78 @@
-// Copyright 2019, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package awsxrayexporter
+package awsxrayexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsxrayexporter"
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/xray"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/xray"
+	"github.com/aws/smithy-go"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
 	"go.opentelemetry.io/collector/consumer/consumererror"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsxrayexporter/translator"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsxrayexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsxrayexporter/internal/translator"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/awsutil"
+	awsxray "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/xray"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/xray/telemetry"
 )
 
 const (
 	maxSegmentsPerPut = int(50) // limit imposed by PutTraceSegments API
 )
 
-// newTracesExporter creates an component.TracesExporter that converts to an X-Ray PutTraceSegments
+// newTracesExporter creates an exporter.Traces that converts to an X-Ray PutTraceSegments
 // request and then posts the request to the configured region's X-Ray endpoint.
-func newTracesExporter(
-	config config.Exporter, params component.ExporterCreateSettings, cn awsutil.ConnAttr) (component.TracesExporter, error) {
-	typeLog := zap.String("type", string(config.ID().Type()))
-	nameLog := zap.String("name", config.ID().String())
-	logger := params.Logger
-	awsConfig, session, err := awsutil.GetAWSConfigSession(logger, cn, &config.(*Config).AWSSessionSettings)
+func newTracesExporter(ctx context.Context, cfg *Config, set exporter.Settings, registry telemetry.Registry) (exporter.Traces, error) {
+	awsConfig, err := awsutil.GetAWSConfig(ctx, set.Logger, &cfg.AWSSessionSettings)
 	if err != nil {
 		return nil, err
 	}
-	xrayClient := newXRay(logger, awsConfig, params.BuildInfo, session)
-	return exporterhelper.NewTracesExporter(
-		config,
-		logger,
-		func(ctx context.Context, td pdata.Traces) error {
+
+	client := awsxray.NewXRayClient(set.Logger, awsConfig, set.BuildInfo)
+	return newTracesExporterWithClient(ctx, cfg, set, registry, awsConfig, client)
+}
+
+func newTracesExporterWithClient(ctx context.Context, cfg *Config, set exporter.Settings, registry telemetry.Registry, awsConfig aws.Config, xrayClient awsxray.XRayClient) (exporter.Traces, error) {
+	typeLog := zap.String("type", set.ID.Type().String())
+	nameLog := zap.String("name", set.ID.String())
+	logger := set.Logger
+
+	sender := telemetry.NewNopSender()
+	if cfg.TelemetryConfig.Enabled {
+		opts := telemetry.ToOptions(ctx, cfg.TelemetryConfig, awsConfig, &cfg.AWSSessionSettings)
+		opts = append(opts, telemetry.WithLogger(set.Logger))
+		sender = registry.Register(set.ID, cfg.TelemetryConfig, xrayClient, opts...)
+	}
+	return exporterhelper.NewTraces(context.Background(), set, cfg,
+		func(ctx context.Context, td ptrace.Traces) error {
 			var err error
 			logger.Debug("TracesExporter", typeLog, nameLog, zap.Int("#spans", td.SpanCount()))
-			documents := make([]*string, 0, td.SpanCount())
-			for i := 0; i < td.ResourceSpans().Len(); i++ {
-				rspans := td.ResourceSpans().At(i)
-				resource := rspans.Resource()
-				for j := 0; j < rspans.InstrumentationLibrarySpans().Len(); j++ {
-					spans := rspans.InstrumentationLibrarySpans().At(j).Spans()
-					for k := 0; k < spans.Len(); k++ {
-						document, localErr := translator.MakeSegmentDocumentString(spans.At(k), resource,
-							config.(*Config).IndexedAttributes, config.(*Config).IndexAllAttributes)
-						if localErr != nil {
-							logger.Debug("Error translating span.", zap.Error(localErr))
-							continue
-						}
-						documents = append(documents, &document)
-					}
-				}
-			}
+
+			documents := extractResourceSpans(cfg, logger, td)
+
 			for offset := 0; offset < len(documents); offset += maxSegmentsPerPut {
-				nextOffset := offset + maxSegmentsPerPut
-				if nextOffset > td.SpanCount() {
-					nextOffset = td.SpanCount()
-				}
-				input := xray.PutTraceSegmentsInput{TraceSegmentDocuments: documents[offset:nextOffset]}
-				logger.Debug("request: " + input.String())
-				output, localErr := xrayClient.PutTraceSegments(&input)
+				nextOffset := min(offset+maxSegmentsPerPut, len(documents))
+				input := &xray.PutTraceSegmentsInput{TraceSegmentDocuments: documents[offset:nextOffset]}
+				logger.Debug("request: " + fmt.Sprintf("%+v", input))
+				output, localErr := xrayClient.PutTraceSegments(ctx, input)
 				if localErr != nil {
 					logger.Debug("response error", zap.Error(localErr))
-					err = wrapErrorIfBadRequest(&localErr) // record error
+					err = wrapErrorIfBadRequest(localErr) // record error
+					sender.RecordConnectionError(localErr)
+				} else {
+					sender.RecordSegmentsSent(len(input.TraceSegmentDocuments))
 				}
 				if output != nil {
-					logger.Debug("response: " + output.String())
+					logger.Debug("response: " + fmt.Sprintf("%+v", output))
 				}
 				if err != nil {
 					break
@@ -90,17 +80,60 @@ func newTracesExporter(
 			}
 			return err
 		},
+		exporterhelper.WithStart(func(_ context.Context, _ component.Host) error {
+			if metadata.ExporterAwsxrayDontEmitV0HTTPNetworkConventionsFeatureGate.IsEnabled() &&
+				!metadata.ExporterAwsxrayEmitV1HTTPNetworkConventionsFeatureGate.IsEnabled() {
+				return errors.New("feature gate exporter.awsxray.DontEmitV0HTTPNetworkConventions requires exporter.awsxray.EmitV1HTTPNetworkConventions to also be enabled")
+			}
+			if metadata.ExporterAwsxrayDontEmitV0DBConventionsFeatureGate.IsEnabled() &&
+				!metadata.ExporterAwsxrayEmitV1DBConventionsFeatureGate.IsEnabled() {
+				return errors.New("feature gate exporter.awsxray.DontEmitV0DBConventions requires exporter.awsxray.EmitV1DBConventions to also be enabled")
+			}
+			sender.Start(ctx)
+			return nil
+		}),
 		exporterhelper.WithShutdown(func(context.Context) error {
+			sender.Stop()
 			_ = logger.Sync()
 			return nil
 		}),
 	)
 }
 
-func wrapErrorIfBadRequest(err *error) error {
-	_, ok := (*err).(awserr.RequestFailure)
-	if ok && (*err).(awserr.RequestFailure).StatusCode() < 500 {
-		return consumererror.Permanent(*err)
+func extractResourceSpans(config component.Config, logger *zap.Logger, td ptrace.Traces) []string {
+	documents := make([]string, 0, td.SpanCount())
+
+	for i := 0; i < td.ResourceSpans().Len(); i++ {
+		rspans := td.ResourceSpans().At(i)
+		resource := rspans.Resource()
+		for j := 0; j < rspans.ScopeSpans().Len(); j++ {
+			spans := rspans.ScopeSpans().At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				documentsForSpan, localErr := translator.MakeSegmentDocuments(
+					spans.At(k), resource,
+					config.(*Config).IndexedAttributes,
+					config.(*Config).IndexAllAttributes,
+					config.(*Config).LogGroupNames,
+					config.(*Config).skipTimestampValidation,
+				)
+
+				if localErr != nil {
+					logger.Debug("Error translating span.", zap.Error(localErr))
+					continue
+				}
+
+				documents = append(documents, documentsForSpan...)
+			}
+		}
 	}
-	return *err
+	return documents
+}
+
+func wrapErrorIfBadRequest(err error) error {
+	var ae smithy.APIError
+	if errors.As(err, &ae) && ae.ErrorFault() == smithy.FaultClient {
+		return consumererror.NewPermanent(err)
+	}
+
+	return err
 }

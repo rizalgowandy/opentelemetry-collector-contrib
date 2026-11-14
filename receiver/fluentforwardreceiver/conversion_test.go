@@ -1,53 +1,42 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package fluentforwardreceiver
 
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	"github.com/tinylib/msgp/msgp"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatatest/plogtest"
 )
 
 func TestMessageEventConversion(t *testing.T) {
 	eventBytes := parseHexDump("testdata/message-event")
 	reader := msgp.NewReader(bytes.NewReader(eventBytes))
 
-	var event MessageEventLogRecord
+	var event messageEventLogRecord
 	err := event.DecodeMsg(reader)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
-	le := event.LogRecords().At(0)
-	le.Attributes().Sort()
-
-	expected := Logs(
-		Log{
+	expectedLog := logConstructor(
+		log{
 			Timestamp: 1593031012000000000,
-			Body:      pdata.NewAttributeValueString("..."),
-			Attributes: map[string]pdata.AttributeValue{
-				"container_id":   pdata.NewAttributeValueString("b00a67eb645849d6ab38ff8beb4aad035cc7e917bf123c3e9057c7e89fc73d2d"),
-				"container_name": pdata.NewAttributeValueString("/unruffled_cannon"),
-				"fluent.tag":     pdata.NewAttributeValueString("b00a67eb6458"),
-				"source":         pdata.NewAttributeValueString("stdout"),
+			Body:      pcommon.NewValueStr("..."),
+			Attributes: map[string]any{
+				"container_id":   "b00a67eb645849d6ab38ff8beb4aad035cc7e917bf123c3e9057c7e89fc73d2d",
+				"container_name": "/unruffled_cannon",
+				"fluent.tag":     "b00a67eb6458",
+				"source":         "stdout",
 			},
 		},
-	)
-	require.EqualValues(t, expected.ResourceLogs().At(0).InstrumentationLibraryLogs().At(0).Logs().At(0), le)
+	).ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
+	require.NoError(t, plogtest.CompareLogRecord(expectedLog, event.LogRecords().At(0)))
 }
 
 func TestAttributeTypeConversion(t *testing.T) {
@@ -56,7 +45,7 @@ func TestAttributeTypeConversion(t *testing.T) {
 	b = msgp.AppendArrayHeader(b, 3)
 	b = msgp.AppendString(b, "my-tag")
 	b = msgp.AppendInt(b, 5000)
-	b = msgp.AppendMapHeader(b, 15)
+	b = msgp.AppendMapHeader(b, 16)
 	b = msgp.AppendString(b, "a")
 	b = msgp.AppendFloat64(b, 5.0)
 	b = msgp.AppendString(b, "b")
@@ -89,56 +78,59 @@ func TestAttributeTypeConversion(t *testing.T) {
 	b = msgp.AppendString(b, "second")
 	b = msgp.AppendString(b, "o")
 	b, err := msgp.AppendIntf(b, []uint8{99, 100, 101})
+	b = msgp.AppendString(b, "p")
+	b = msgp.AppendNil(b)
 
 	require.NoError(t, err)
 
 	reader := msgp.NewReader(bytes.NewReader(b))
 
-	var event MessageEventLogRecord
+	var event messageEventLogRecord
 	err = event.DecodeMsg(reader)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	le := event.LogRecords().At(0)
-	le.Attributes().Sort()
-	require.EqualValues(t, Logs(
-		Log{
+
+	require.NoError(t, plogtest.CompareLogRecord(logConstructor(
+		log{
 			Timestamp: 5000000000000,
-			Body:      pdata.NewAttributeValueNull(),
-			Attributes: map[string]pdata.AttributeValue{
-				"a":          pdata.NewAttributeValueDouble(5.0),
-				"b":          pdata.NewAttributeValueDouble(6.0),
-				"c":          pdata.NewAttributeValueBool(true),
-				"d":          pdata.NewAttributeValueInt(1),
-				"e":          pdata.NewAttributeValueInt(2),
-				"f":          pdata.NewAttributeValueInt(3),
-				"fluent.tag": pdata.NewAttributeValueString("my-tag"),
-				"g":          pdata.NewAttributeValueInt(4),
-				"h":          pdata.NewAttributeValueInt(255),
-				"i":          pdata.NewAttributeValueInt(65535),
-				"j":          pdata.NewAttributeValueInt(4294967295),
-				"k":          pdata.NewAttributeValueInt(-1),
-				"l":          pdata.NewAttributeValueString("(0+0i)"),
-				"m":          pdata.NewAttributeValueString("\001e\002"),
-				"n":          pdata.NewAttributeValueString(`["first","second"]`),
-				"o":          pdata.NewAttributeValueString("cde"),
+			Body:      pcommon.NewValueEmpty(),
+			Attributes: map[string]any{
+				"a":          5.0,
+				"b":          6.0,
+				"c":          true,
+				"d":          1,
+				"e":          2,
+				"f":          3,
+				"fluent.tag": "my-tag",
+				"g":          4,
+				"h":          255,
+				"i":          65535,
+				"j":          4294967295,
+				"k":          strconv.FormatUint(^uint64(0), 10),
+				"l":          "(0+0i)",
+				"m":          "\001e\002",
+				"n":          []any{"first", "second"},
+				"o":          "cde",
+				"p":          nil,
 			},
 		},
-	).ResourceLogs().At(0).InstrumentationLibraryLogs().At(0).Logs().At(0), le)
+	).ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0), le))
 }
 
 func TestEventMode(t *testing.T) {
-	require.Equal(t, "unknown", UnknownMode.String())
-	require.Equal(t, "message", MessageMode.String())
-	require.Equal(t, "forward", ForwardMode.String())
-	require.Equal(t, "packedforward", PackedForwardMode.String())
+	require.Equal(t, "unknown", unknownMode.String())
+	require.Equal(t, "message", messageMode.String())
+	require.Equal(t, "forward", forwardMode.String())
+	require.Equal(t, "packedforward", packedForwardMode.String())
 
-	const TestMode EventMode = 6
+	const TestMode eventMode = 6
 	require.Panics(t, func() { _ = TestMode.String() })
 }
 
 func TestTimeFromTimestampBadType(t *testing.T) {
 	_, err := timeFromTimestamp("bad")
-	require.NotNil(t, err)
+	require.Error(t, err)
 }
 
 func TestMessageEventConversionWithErrors(t *testing.T) {
@@ -155,22 +147,11 @@ func TestMessageEventConversionWithErrors(t *testing.T) {
 		t.Run(fmt.Sprintf("EOF at byte %d", i), func(t *testing.T) {
 			reader := msgp.NewReader(bytes.NewReader(b[:i]))
 
-			var event MessageEventLogRecord
+			var event messageEventLogRecord
 			err := event.DecodeMsg(reader)
-			require.NotNil(t, err)
+			require.Error(t, err)
 		})
 	}
-
-	t.Run("Invalid timestamp type uint", func(t *testing.T) {
-		in := make([]byte, len(b))
-		copy(in, b)
-		in[8] = 0xcd
-		reader := msgp.NewReader(bytes.NewReader(in))
-
-		var event MessageEventLogRecord
-		err := event.DecodeMsg(reader)
-		require.NotNil(t, err)
-	})
 }
 
 func TestForwardEventConversionWithErrors(t *testing.T) {
@@ -180,9 +161,9 @@ func TestForwardEventConversionWithErrors(t *testing.T) {
 		t.Run(fmt.Sprintf("EOF at byte %d", i), func(t *testing.T) {
 			reader := msgp.NewReader(bytes.NewReader(b[:i]))
 
-			var event ForwardEventLogRecords
+			var event forwardEventLogRecords
 			err := event.DecodeMsg(reader)
-			require.NotNil(t, err)
+			require.Error(t, err)
 		})
 	}
 }
@@ -194,9 +175,9 @@ func TestPackedForwardEventConversionWithErrors(t *testing.T) {
 		t.Run(fmt.Sprintf("EOF at byte %d", i), func(t *testing.T) {
 			reader := msgp.NewReader(bytes.NewReader(b[:i]))
 
-			var event PackedForwardEventLogRecords
+			var event packedForwardEventLogRecords
 			err := event.DecodeMsg(reader)
-			require.NotNil(t, err)
+			require.Error(t, err)
 		})
 	}
 
@@ -206,10 +187,96 @@ func TestPackedForwardEventConversionWithErrors(t *testing.T) {
 		in[0x71] = 0xff
 		reader := msgp.NewReader(bytes.NewReader(in))
 
-		var event PackedForwardEventLogRecords
+		var event packedForwardEventLogRecords
 		err := event.DecodeMsg(reader)
-		require.NotNil(t, err)
-		require.Contains(t, err.Error(), "gzip")
-		print(err.Error())
+		require.ErrorContains(t, err, "gzip")
+		fmt.Println(err.Error())
+	})
+}
+
+func TestBodyConversion(t *testing.T) {
+	var b []byte
+
+	b = msgp.AppendArrayHeader(b, 3)
+	b = msgp.AppendString(b, "my-tag")
+	b = msgp.AppendInt(b, 5000)
+	b = msgp.AppendMapHeader(b, 1)
+	b = msgp.AppendString(b, "log")
+	b = msgp.AppendMapHeader(b, 3)
+	b = msgp.AppendString(b, "a")
+	b = msgp.AppendString(b, "value")
+	b = msgp.AppendString(b, "b")
+	b = msgp.AppendArrayHeader(b, 2)
+	b = msgp.AppendString(b, "first")
+	b = msgp.AppendString(b, "second")
+	b = msgp.AppendString(b, "c")
+	b = msgp.AppendMapHeader(b, 1)
+	b = msgp.AppendString(b, "d")
+	b = msgp.AppendInt(b, 24)
+	b = msgp.AppendString(b, "o")
+	b, err := msgp.AppendIntf(b, []uint8{99, 100, 101})
+
+	require.NoError(t, err)
+
+	reader := msgp.NewReader(bytes.NewReader(b))
+
+	var event messageEventLogRecord
+	err = event.DecodeMsg(reader)
+	require.NoError(t, err)
+
+	le := event.LogRecords().At(0)
+
+	body := pcommon.NewValueMap()
+	body.Map().PutStr("a", "value")
+
+	bv := body.Map().PutEmptySlice("b")
+	bv.AppendEmpty().SetStr("first")
+	bv.AppendEmpty().SetStr("second")
+
+	cv := body.Map().PutEmptyMap("c")
+	cv.PutInt("d", 24)
+
+	require.NoError(t, plogtest.CompareLogRecord(logConstructor(
+		log{
+			Timestamp: 5000000000000,
+			Body:      body,
+			Attributes: map[string]any{
+				"fluent.tag": "my-tag",
+			},
+		},
+	).ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0), le))
+}
+
+func TestDecodeMsgLimits(t *testing.T) {
+	t.Run("Entry count exceeds limit", func(t *testing.T) {
+		var b []byte
+		// Forward mode is an array of size 3 (tag, entries array, options) or 2 (tag, entries array)
+		b = msgp.AppendArrayHeader(b, 2)
+		b = msgp.AppendString(b, "my-tag")
+		// Specify too large an entries array
+		b = msgp.AppendArrayHeader(b, maxEntryCount+1)
+
+		reader := msgp.NewReader(bytes.NewReader(b))
+		var event forwardEventLogRecords
+		err := event.DecodeMsg(reader)
+		require.ErrorContains(t, err, "exceeds maximum")
+	})
+
+	t.Run("Option count exceeds limit", func(t *testing.T) {
+		var b []byte
+		// Message mode: arrLen 4, tag, time, record map, options map
+		b = msgp.AppendArrayHeader(b, 4)
+		b = msgp.AppendString(b, "my-tag")
+		b = msgp.AppendInt(b, 5000)
+		b = msgp.AppendMapHeader(b, 1)
+		b = msgp.AppendString(b, "a")
+		b = msgp.AppendFloat64(b, 5.0)
+		// Options map with excessive size
+		b = msgp.AppendMapHeader(b, maxOptionCount+1)
+
+		reader := msgp.NewReader(bytes.NewReader(b))
+		var event messageEventLogRecord
+		err := event.DecodeMsg(reader)
+		require.ErrorContains(t, err, "exceeds maximum")
 	})
 }

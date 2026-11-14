@@ -1,0 +1,24 @@
+schema/with-all-options:
+  cache_cooldown: 10m
+  cache_retry_limit: 3
+  # Prefetch is an optional field that allows
+  # the collector to fetch the defined schema files
+  # as the collector starts.
+  prefetch:
+    - https://opentelemetry.io/schemas/1.9.0
+
+  # Targets is a required field that will enable
+  # the processor to convert all telemetry sent
+  # via the semantic convention family (ie. opentelemetry.io/schemas/*)
+  # to the defined schema identifier set in the target.
+  # This example will convert signals to 1.4.2 for all opentelemetry.io/schemas/
+  # and 1.2.0 for example.com/otel/schemas/.
+  targets:
+    - https://opentelemetry.io/schemas/1.4.2
+    - https://example.com/otel/schemas/1.2.0
+
+  # Migration preserves the original attribute alongside the renamed one
+  # during schema translation, giving operators a safe migration window.
+  migration:
+    - target: https://opentelemetry.io/schemas/1.4.2
+      from: https://opentelemetry.io/schemas/1.0.0

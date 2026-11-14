@@ -1,168 +1,231 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package splunkhecexporter
 
 import (
-	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configcheck"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/exporter/xexporter"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/splunkhecexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/splunk"
 )
 
 func TestCreateDefaultConfig(t *testing.T) {
 	cfg := createDefaultConfig()
 	assert.NotNil(t, cfg, "failed to create default config")
-	assert.NoError(t, configcheck.ValidateConfig(cfg))
+	assert.NoError(t, componenttest.CheckConfigStruct(cfg))
 }
 
-func TestCreateMetricsExporter(t *testing.T) {
+func TestCreateMetrics(t *testing.T) {
 	cfg := createDefaultConfig().(*Config)
-	cfg.Endpoint = "https://example.com:8088/services/collector"
+	cfg.ClientConfig.Endpoint = "https://example.com:8088/services/collector"
 	cfg.Token = "1234-1234"
 
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	_, err := createMetricsExporter(context.Background(), params, cfg)
+	params := exportertest.NewNopSettings(metadata.Type)
+	_, err := createMetricsExporter(t.Context(), params, cfg)
 	assert.NoError(t, err)
 }
 
-func TestCreateMetricsExporterNoConfig(t *testing.T) {
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	_, err := createMetricsExporter(context.Background(), params, nil)
-	assert.Error(t, err)
-}
-
-func TestCreateTracesExporter(t *testing.T) {
+func TestCreateTraces(t *testing.T) {
 	cfg := createDefaultConfig().(*Config)
-	cfg.Endpoint = "https://example.com:8088/services/collector"
+	cfg.ClientConfig.Endpoint = "https://example.com:8088/services/collector"
 	cfg.Token = "1234-1234"
 
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	_, err := createTracesExporter(context.Background(), params, cfg)
+	params := exportertest.NewNopSettings(metadata.Type)
+	_, err := createTracesExporter(t.Context(), params, cfg)
 	assert.NoError(t, err)
 }
 
-func TestCreateTracesExporterNoConfig(t *testing.T) {
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	_, err := createTracesExporter(context.Background(), params, nil)
-	assert.Error(t, err)
-}
-
-func TestCreateTracesExporterInvalidEndpoint(t *testing.T) {
+func TestCreateLogs(t *testing.T) {
 	cfg := createDefaultConfig().(*Config)
-	cfg.Endpoint = "urn:something:12345"
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	_, err := createTracesExporter(context.Background(), params, cfg)
-	assert.Error(t, err)
-}
-
-func TestCreateLogsExporter(t *testing.T) {
-	cfg := createDefaultConfig().(*Config)
-	cfg.Endpoint = "https://example.com:8088/services/collector"
+	cfg.ClientConfig.Endpoint = "https://example.com:8088/services/collector"
 	cfg.Token = "1234-1234"
 
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	_, err := createLogsExporter(context.Background(), params, cfg)
+	params := exportertest.NewNopSettings(metadata.Type)
+	_, err := createLogsExporter(t.Context(), params, cfg)
 	assert.NoError(t, err)
-}
-
-func TestCreateLogsExporterNoConfig(t *testing.T) {
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	_, err := createLogsExporter(context.Background(), params, nil)
-	assert.Error(t, err)
-}
-
-func TestCreateLogsExporterInvalidEndpoint(t *testing.T) {
-	cfg := createDefaultConfig().(*Config)
-	cfg.Endpoint = "urn:something:12345"
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	_, err := createLogsExporter(context.Background(), params, cfg)
-	assert.Error(t, err)
 }
 
 func TestCreateInstanceViaFactory(t *testing.T) {
 	factory := NewFactory()
 
 	cfg := factory.CreateDefaultConfig().(*Config)
-	cfg.Endpoint = "https://example.com:8088/services/collector"
+	cfg.ClientConfig.Endpoint = "https://example.com:8088/services/collector"
 	cfg.Token = "1234-1234"
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	exp, err := factory.CreateMetricsExporter(
-		context.Background(), params,
-		cfg)
+	params := exportertest.NewNopSettings(metadata.Type)
+	exp, err := factory.CreateMetrics(
+		t.Context(), params,
+		cfg,
+	)
 	assert.NoError(t, err)
 	assert.NotNil(t, exp)
 
 	// Set values that don't have a valid default.
 	cfg.Token = "testToken"
-	cfg.Endpoint = "https://example.com"
-	exp, err = factory.CreateMetricsExporter(
-		context.Background(), params,
-		cfg)
+	cfg.ClientConfig.Endpoint = "https://example.com"
+	exp, err = factory.CreateMetrics(
+		t.Context(), params,
+		cfg,
+	)
 	assert.NoError(t, err)
 	require.NotNil(t, exp)
 
-	assert.NoError(t, exp.Shutdown(context.Background()))
+	assert.NoError(t, exp.Shutdown(t.Context()))
 }
 
-func TestFactory_CreateMetricsExporter(t *testing.T) {
+func TestFactory_CreateMetrics(t *testing.T) {
+	clientConfig := confighttp.NewDefaultClientConfig()
+	clientConfig.Endpoint = "https://example.com:8000"
 	config := &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-		Token:            "testToken",
-		Endpoint:         "https://example.com:8000",
+		Token:        "testToken",
+		ClientConfig: clientConfig,
 	}
 
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	te, err := createMetricsExporter(context.Background(), params, config)
+	params := exportertest.NewNopSettings(metadata.Type)
+	te, err := createMetricsExporter(t.Context(), params, config)
 	assert.NoError(t, err)
 	assert.NotNil(t, te)
 }
 
-func TestFactory_CreateMetricsExporterFails(t *testing.T) {
-	tests := []struct {
-		name         string
-		config       *Config
-		errorMessage string
-	}{
-		{
-			name: "empty_endpoint",
-			config: &Config{
-				ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-				Token:            "token",
-			},
-			errorMessage: "failed to process \"splunk_hec\" config: requires a non-empty \"endpoint\"",
-		},
-		{
-			name: "empty_token",
-			config: &Config{
-				ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-				Endpoint:         "https://example.com:8000",
-			},
-			errorMessage: "failed to process \"splunk_hec\" config: requires a non-empty \"token\"",
-		},
+func TestFactory_EnabledBatchingMakesExporterMutable(t *testing.T) {
+	clientConfig := confighttp.NewDefaultClientConfig()
+	clientConfig.Endpoint = "https://example.com:8000"
+
+	config := &Config{
+		Token:        "testToken",
+		ClientConfig: clientConfig,
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-			te, err := createMetricsExporter(context.Background(), params, tt.config)
-			assert.EqualError(t, err, tt.errorMessage)
-			assert.Nil(t, te)
+
+	me, err := createMetricsExporter(t.Context(), exportertest.NewNopSettings(metadata.Type), config)
+	require.NoError(t, err)
+	assert.False(t, me.Capabilities().MutatesData)
+	te, err := createTracesExporter(t.Context(), exportertest.NewNopSettings(metadata.Type), config)
+	require.NoError(t, err)
+	assert.False(t, te.Capabilities().MutatesData)
+	le, err := createLogsExporter(t.Context(), exportertest.NewNopSettings(metadata.Type), config)
+	require.NoError(t, err)
+	assert.False(t, le.Capabilities().MutatesData)
+
+	config.QueueSettings = configoptional.Some(exporterhelper.NewDefaultQueueConfig())
+	config.QueueSettings.Get().Sizer = exporterhelper.RequestSizerTypeItems
+	batch := config.QueueSettings.Get().Batch.GetOrInsertDefault()
+	batch.FlushTimeout = 200 * time.Millisecond
+	batch.MinSize = 8192
+
+	me, err = createMetricsExporter(t.Context(), exportertest.NewNopSettings(metadata.Type), config)
+	require.NoError(t, err)
+	assert.True(t, me.Capabilities().MutatesData)
+	te, err = createTracesExporter(t.Context(), exportertest.NewNopSettings(metadata.Type), config)
+	require.NoError(t, err)
+	assert.True(t, te.Capabilities().MutatesData)
+	le, err = createLogsExporter(t.Context(), exportertest.NewNopSettings(metadata.Type), config)
+	require.NoError(t, err)
+	assert.True(t, le.Capabilities().MutatesData)
+}
+
+func TestHecQueueSettings(t *testing.T) {
+	t.Run("no queue settings returned unchanged", func(t *testing.T) {
+		out := hecQueueSettings(configoptional.None[exporterhelper.QueueBatchConfig]())
+		assert.False(t, out.HasValue())
+	})
+
+	t.Run("queue without batch returned unchanged", func(t *testing.T) {
+		qs := configoptional.Some(exporterhelper.QueueBatchConfig{NumConsumers: 2, QueueSize: 100})
+		out := hecQueueSettings(qs)
+		require.True(t, out.HasValue())
+		assert.False(t, out.Get().Batch.HasValue())
+	})
+
+	someBatch := func(keys []string) exporterhelper.QueueBatchConfig {
+		cfg := exporterhelper.NewDefaultQueueConfig()
+		batch := cfg.Batch.GetOrInsertDefault()
+		batch.FlushTimeout = 200 * time.Millisecond
+		batch.Sizer = exporterhelper.RequestSizerTypeItems
+		batch.MinSize = 8192
+		batch.Partition.MetadataKeys = keys
+		return cfg
+	}
+
+	t.Run("required keys added when missing", func(t *testing.T) {
+		out := hecQueueSettings(configoptional.Some(someBatch(nil)))
+		keys := out.Get().Batch.Get().Partition.MetadataKeys
+		assert.Contains(t, keys, splunk.HecTokenLabel)
+		assert.Contains(t, keys, splunk.DefaultIndexLabel)
+	})
+
+	t.Run("user keys preserved and required keys appended", func(t *testing.T) {
+		out := hecQueueSettings(configoptional.Some(someBatch([]string{"custom_key"})))
+		keys := out.Get().Batch.Get().Partition.MetadataKeys
+		assert.Contains(t, keys, "custom_key")
+		assert.Contains(t, keys, splunk.HecTokenLabel)
+		assert.Contains(t, keys, splunk.DefaultIndexLabel)
+	})
+
+	t.Run("no duplicates when required keys already present", func(t *testing.T) {
+		out := hecQueueSettings(configoptional.Some(someBatch([]string{splunk.HecTokenLabel, splunk.DefaultIndexLabel})))
+		keys := out.Get().Batch.Get().Partition.MetadataKeys
+		count := 0
+		for _, k := range keys {
+			if k == splunk.HecTokenLabel || k == splunk.DefaultIndexLabel {
+				count++
+			}
+		}
+		assert.Equal(t, 2, count)
+	})
+
+	t.Run("case-insensitive deduplication", func(t *testing.T) {
+		out := hecQueueSettings(configoptional.Some(someBatch([]string{"Com.Splunk.Hec.Access_Token", "COM.SPLUNK.INDEX"})))
+		keys := out.Get().Batch.Get().Partition.MetadataKeys
+		assert.Len(t, keys, 2)
+	})
+
+	t.Run("original config not mutated", func(t *testing.T) {
+		orig := someBatch(nil)
+		origKeys := orig.Batch.Get().Partition.MetadataKeys
+		_ = hecQueueSettings(configoptional.Some(orig))
+		assert.Equal(t, origKeys, orig.Batch.Get().Partition.MetadataKeys)
+	})
+}
+
+func TestFactory_ExporterHelperBatchingEnabled(t *testing.T) {
+	factory := NewFactory().(xexporter.Factory)
+	set := exportertest.NewNopSettings(metadata.Type)
+	create := map[string]func(*Config) (component.Component, error){
+		"traces":   func(cfg *Config) (component.Component, error) { return factory.CreateTraces(t.Context(), set, cfg) },
+		"metrics":  func(cfg *Config) (component.Component, error) { return factory.CreateMetrics(t.Context(), set, cfg) },
+		"logs":     func(cfg *Config) (component.Component, error) { return factory.CreateLogs(t.Context(), set, cfg) },
+		"profiles": func(cfg *Config) (component.Component, error) { return factory.CreateProfiles(t.Context(), set, cfg) },
+	}
+
+	for signal, fn := range create {
+		t.Run(signal, func(t *testing.T) {
+			for _, enabled := range []bool{true, false} {
+				cfg := factory.CreateDefaultConfig().(*Config)
+				cfg.ClientConfig.Endpoint = "https://example.com:8088/services/collector"
+				cfg.Token = "1234-1234"
+				if enabled {
+					cfg.QueueSettings.Get().Batch.GetOrInsertDefault()
+				} else {
+					cfg.QueueSettings.Get().Batch = configoptional.None[exporterhelper.BatchConfig]()
+				}
+
+				exp, err := fn(cfg)
+				require.NoError(t, err)
+				b, ok := exp.(interface{ ExporterHelperBatchingEnabled() bool })
+				require.True(t, ok)
+				assert.Equal(t, enabled, b.ExporterHelperBatchingEnabled())
+			}
 		})
 	}
 }

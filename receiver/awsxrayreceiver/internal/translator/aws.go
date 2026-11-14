@@ -1,72 +1,67 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package translator
+package translator // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awsxrayreceiver/internal/translator"
 
 import (
 	"strconv"
 
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/conventions"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	conventions "go.opentelemetry.io/otel/semconv/v1.43.0"
 
 	awsxray "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/xray"
 )
 
-func addAWSToResource(aws *awsxray.AWSData, attrs *pdata.AttributeMap) {
+func addAWSToResource(aws *awsxray.AWSData, attrs pcommon.Map) {
 	if aws == nil {
 		// https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/c615d2db351929b99e46f7b427f39c12afe15b54/exporter/awsxrayexporter/translator/aws.go#L121
 		// this implies that the current segment being processed is not generated
 		// by an AWS entity.
-		attrs.UpsertString(conventions.AttributeCloudProvider, "unknown")
+		attrs.PutStr(string(conventions.CloudProviderKey), "unknown")
 		return
 	}
 
-	attrs.UpsertString(conventions.AttributeCloudProvider, conventions.AttributeCloudProviderAWS)
-	addString(aws.AccountID, conventions.AttributeCloudAccount, attrs)
+	attrs.PutStr(string(conventions.CloudProviderKey), conventions.CloudProviderAWS.Value.AsString())
+	addString(aws.AccountID, string(conventions.CloudAccountIDKey), attrs)
 
 	// based on https://docs.aws.amazon.com/xray/latest/devguide/xray-api-segmentdocuments.html#api-segmentdocuments-aws
-	// it's possible to have all ec2, ecs and beanstalk fields at the same time.
+	// it's possible to have all cloudwatch_logs, ec2, ecs and beanstalk fields at the same time.
+	if cwl := aws.CWLogs; cwl != nil {
+		for _, logGroupMetaData := range cwl {
+			addStringSlice(logGroupMetaData.Arn, string(conventions.AWSLogGroupARNsKey), attrs)
+			addStringSlice(logGroupMetaData.LogGroup, string(conventions.AWSLogGroupNamesKey), attrs)
+		}
+	}
+
 	if ec2 := aws.EC2; ec2 != nil {
-		addString(ec2.AvailabilityZone, conventions.AttributeCloudAvailabilityZone, attrs)
-		addString(ec2.InstanceID, conventions.AttributeHostID, attrs)
-		addString(ec2.InstanceSize, conventions.AttributeHostType, attrs)
-		addString(ec2.AmiID, conventions.AttributeHostImageID, attrs)
+		addString(ec2.AvailabilityZone, string(conventions.CloudAvailabilityZoneKey), attrs)
+		addString(ec2.InstanceID, string(conventions.HostIDKey), attrs)
+		addString(ec2.InstanceSize, string(conventions.HostTypeKey), attrs)
+		addString(ec2.AmiID, string(conventions.HostImageIDKey), attrs)
 	}
 
 	if ecs := aws.ECS; ecs != nil {
-		addString(ecs.ContainerName, conventions.AttributeContainerName, attrs)
-		addString(ecs.AvailabilityZone, conventions.AttributeCloudAvailabilityZone, attrs)
-		addString(ecs.ContainerID, conventions.AttributeContainerID, attrs)
+		addString(ecs.ContainerName, string(conventions.ContainerNameKey), attrs)
+		addString(ecs.AvailabilityZone, string(conventions.CloudAvailabilityZoneKey), attrs)
+		addString(ecs.ContainerID, string(conventions.ContainerIDKey), attrs)
 	}
 
 	if bs := aws.Beanstalk; bs != nil {
-		addString(bs.Environment, conventions.AttributeServiceNamespace, attrs)
+		addString(bs.Environment, string(conventions.ServiceNamespaceKey), attrs)
 		if bs.DeploymentID != nil {
-			attrs.UpsertString(conventions.AttributeServiceInstance, strconv.FormatInt(*bs.DeploymentID, 10))
+			attrs.PutStr(string(conventions.ServiceInstanceIDKey), strconv.FormatInt(*bs.DeploymentID, 10))
 		}
-		addString(bs.VersionLabel, conventions.AttributeServiceVersion, attrs)
+		addString(bs.VersionLabel, string(conventions.ServiceVersionKey), attrs)
 	}
 
 	if eks := aws.EKS; eks != nil {
-		addString(eks.ContainerID, conventions.AttributeContainerID, attrs)
-		addString(eks.ClusterName, conventions.AttributeK8sCluster, attrs)
-		addString(eks.Pod, conventions.AttributeK8sPod, attrs)
-
+		addString(eks.ContainerID, string(conventions.ContainerIDKey), attrs)
+		addString(eks.ClusterName, string(conventions.K8SClusterNameKey), attrs)
+		addString(eks.Pod, string(conventions.K8SPodNameKey), attrs)
 	}
 }
 
-func addAWSToSpan(aws *awsxray.AWSData, attrs *pdata.AttributeMap) {
+func addAWSToSpan(aws *awsxray.AWSData, attrs pcommon.Map) {
 	if aws != nil {
 		addString(aws.AccountID, awsxray.AWSAccountAttribute, attrs)
 		addString(aws.Operation, awsxray.AWSOperationAttribute, attrs)

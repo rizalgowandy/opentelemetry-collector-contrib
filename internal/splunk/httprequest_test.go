@@ -1,22 +1,12 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package splunk
 
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"testing"
 	"time"
@@ -34,6 +24,7 @@ func TestConsumeMetrics(t *testing.T) {
 		wantErr          bool
 		wantPermanentErr bool
 		wantThrottleErr  bool
+		wantRetryableErr bool
 	}{
 		{
 			name:             "response_forbidden",
@@ -60,10 +51,27 @@ func TestConsumeMetrics(t *testing.T) {
 			name:             "large_batch",
 			httpResponseCode: http.StatusAccepted,
 		},
+		// 4xx that retrying can't fix: permanent.
+		{name: "not_found", httpResponseCode: http.StatusNotFound, wantPermanentErr: true},
+		{name: "method_not_allowed", httpResponseCode: http.StatusMethodNotAllowed, wantPermanentErr: true},
+		{name: "gone", httpResponseCode: http.StatusGone, wantPermanentErr: true},
+		{name: "request_entity_too_large", httpResponseCode: http.StatusRequestEntityTooLarge, wantPermanentErr: true},
+		{name: "request_uri_too_long", httpResponseCode: http.StatusRequestURITooLong, wantPermanentErr: true},
+		{name: "unsupported_media_type", httpResponseCode: http.StatusUnsupportedMediaType, wantPermanentErr: true},
+		{name: "unprocessable_entity", httpResponseCode: http.StatusUnprocessableEntity, wantPermanentErr: true},
+		// Transient failures must stay retryable.
+		{name: "request_timeout", httpResponseCode: http.StatusRequestTimeout, wantRetryableErr: true},
+		{name: "conflict", httpResponseCode: http.StatusConflict, wantRetryableErr: true},
+		{name: "internal_server_error", httpResponseCode: http.StatusInternalServerError, wantRetryableErr: true},
+		{name: "bad_gateway", httpResponseCode: http.StatusBadGateway, wantRetryableErr: true},
+		{name: "gateway_timeout", httpResponseCode: http.StatusGatewayTimeout, wantRetryableErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			resp := &http.Response{
+				Request: &http.Request{
+					URL: &url.URL{Scheme: "http", Host: "splunk.com", Path: "/endpoint"},
+				},
 				StatusCode: tt.httpResponseCode,
 			}
 			if tt.retryAfter != 0 {
@@ -85,9 +93,15 @@ func TestConsumeMetrics(t *testing.T) {
 			}
 
 			if tt.wantThrottleErr {
-				expected := fmt.Errorf("HTTP %d %q", tt.httpResponseCode, http.StatusText(tt.httpResponseCode))
+				expected := fmt.Errorf("HTTP \"/endpoint\" %d %q", tt.httpResponseCode, http.StatusText(tt.httpResponseCode))
 				expected = exporterhelper.NewThrottleRetry(expected, time.Duration(tt.retryAfter)*time.Second)
-				assert.EqualValues(t, expected, err)
+				assert.Equal(t, expected, err)
+				return
+			}
+
+			if tt.wantRetryableErr {
+				assert.Error(t, err)
+				assert.False(t, consumererror.IsPermanent(err), "expected a retryable (non-permanent) error")
 				return
 			}
 

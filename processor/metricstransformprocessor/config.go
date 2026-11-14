@@ -1,78 +1,65 @@
-// Copyright 2020 OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package metricstransformprocessor
+package metricstransformprocessor // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/metricstransformprocessor"
 
 import (
-	"go.opentelemetry.io/collector/config"
+	"slices"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/aggregateutil"
 )
 
 const (
-	// IncludeFieldName is the mapstructure field name for Include field
-	IncludeFieldName = "include"
+	// includeFieldName is the mapstructure field name for Include field
+	includeFieldName = "include"
 
-	// MatchTypeFieldName is the mapstructure field name for MatchType field
-	MatchTypeFieldName = "match_type"
+	// matchTypeFieldName is the mapstructure field name for matchType field
+	matchTypeFieldName = "match_type"
 
-	// MetricNameFieldName is the mapstructure field name for MetricName field
-	MetricNameFieldName = "metric_name"
+	// actionFieldName is the mapstructure field name for Action field
+	actionFieldName = "action"
 
-	// ActionFieldName is the mapstructure field name for Action field
-	ActionFieldName = "action"
+	// newNameFieldName is the mapstructure field name for NewName field
+	newNameFieldName = "new_name"
 
-	// NewNameFieldName is the mapstructure field name for NewName field
-	NewNameFieldName = "new_name"
+	// groupResourceLabelsFieldName is the mapstructure field name for GroupResourceLabels field
+	groupResourceLabelsFieldName = "group_resource_labels"
 
-	// GroupResourceLabelsFieldName is the mapstructure field name for GroupResouceLabels field
-	GroupResourceLabelsFieldName = "group_resource_labels"
+	// aggregationTypeFieldName is the mapstructure field name for aggregationType field
+	aggregationTypeFieldName = "aggregation_type"
 
-	// AggregationTypeFieldName is the mapstructure field name for AggregationType field
-	AggregationTypeFieldName = "aggregation_type"
+	// labelFieldName is the mapstructure field name for Label field
+	labelFieldName = "label"
 
-	// LabelFieldName is the mapstructure field name for Label field
-	LabelFieldName = "label"
+	// newLabelFieldName is the mapstructure field name for NewLabel field
+	newLabelFieldName = "new_label"
 
-	// NewLabelFieldName is the mapstructure field name for NewLabel field
-	NewLabelFieldName = "new_label"
+	// newValueFieldName is the mapstructure field name for NewValue field
+	newValueFieldName = "new_value"
 
-	// NewValueFieldName is the mapstructure field name for NewValue field
-	NewValueFieldName = "new_value"
+	// scaleFieldName is the mapstructure field name for Scale field
+	scaleFieldName = "experimental_scale"
 
-	// SubmatchCaseFieldName is the mapstructure field name for SubmatchCase field
-	SubmatchCaseFieldName = "submatch_case"
+	// submatchCaseFieldName is the mapstructure field name for submatchCase field
+	submatchCaseFieldName = "submatch_case"
 )
 
 // Config defines configuration for Resource processor.
 type Config struct {
-	config.ProcessorSettings `mapstructure:",squash"` // squash ensures fields are correctly decoded in embedded struct
+	// transform specifies a list of transforms on metrics with each transform focusing on one metric.
+	Transforms []transform `mapstructure:"transforms"`
 
-	// Transform specifies a list of transforms on metrics with each transform focusing on one metric.
-	Transforms []Transform `mapstructure:"transforms"`
+	// prevent unkeyed literal initialization
+	_ struct{}
 }
 
-// Transform defines the transformation applied to the specific metric
-type Transform struct {
-
+// transform defines the transformation applied to the specific metric
+type transform struct {
 	// --- SPECIFY WHICH METRIC(S) TO MATCH ---
 
 	// MetricIncludeFilter is used to select the metric(s) to operate on.
 	// REQUIRED
-	MetricIncludeFilter FilterConfig `mapstructure:",squash"`
-
-	// MetricName is used to select the metric to operate on.
-	// DEPRECATED. Use MetricIncludeFilter instead.
-	MetricName string `mapstructure:"metric_name"`
+	MetricIncludeFilter filterConfig `mapstructure:",squash"`
 
 	// --- SPECIFY THE ACTION TO TAKE ON THE MATCHED METRIC(S) ---
 
@@ -89,38 +76,41 @@ type Transform struct {
 	// REQUIRED only if Action is INSERT.
 	NewName string `mapstructure:"new_name"`
 
-	// GroupResourceLabels specifes resource labels that will be appended to this group's new ResourceMetrics message
+	// GroupResourceLabels specifies resource labels that will be appended to this group's new ResourceMetrics message
 	// REQUIRED only if Action is GROUP
 	GroupResourceLabels map[string]string `mapstructure:"group_resource_labels"`
 
 	// AggregationType specifies how to aggregate.
 	// REQUIRED only if Action is COMBINE.
-	AggregationType AggregationType `mapstructure:"aggregation_type"`
+	AggregationType aggregateutil.AggregationType `mapstructure:"aggregation_type"`
 
 	// SubmatchCase specifies what case to use for label values created from regexp submatches.
-	SubmatchCase SubmatchCase `mapstructure:"submatch_case"`
+	SubmatchCase submatchCase `mapstructure:"submatch_case"`
 
 	// Operations contains a list of operations that will be performed on the resulting metric(s).
-	Operations []Operation `mapstructure:"operations"`
+	Operations []operation `mapstructure:"operations"`
 }
 
-type FilterConfig struct {
+type filterConfig struct {
 	// Include specifies the metric(s) to operate on.
 	Include string `mapstructure:"include"`
 
 	// MatchType determines how the Include string is matched: <strict|regexp>.
-	MatchType MatchType `mapstructure:"match_type"`
+	MatchType matchType `mapstructure:"match_type"`
 
 	// MatchLabels specifies the label set against which the metric filter will work.
 	// This field is optional.
 	MatchLabels map[string]string `mapstructure:"experimental_match_labels"`
+
+	// prevent unkeyed literal initialization
+	_ struct{}
 }
 
-// Operation defines the specific operation performed on the selected metrics.
-type Operation struct {
+// operation defines the specific operation performed on the selected metrics.
+type operation struct {
 	// Action specifies the action performed for this operation.
 	// REQUIRED
-	Action OperationAction `mapstructure:"action"`
+	Action operationAction `mapstructure:"action"`
 
 	// Label identifies the exact label to operate on.
 	Label string `mapstructure:"label"`
@@ -132,28 +122,34 @@ type Operation struct {
 	LabelSet []string `mapstructure:"label_set"`
 
 	// AggregationType specifies how to aggregate.
-	AggregationType AggregationType `mapstructure:"aggregation_type"`
+	AggregationType aggregateutil.AggregationType `mapstructure:"aggregation_type"`
 
 	// AggregatedValues is a list of label values to aggregate away.
 	AggregatedValues []string `mapstructure:"aggregated_values"`
 
-	// NewValue is used to set a new label value either when the operation is `AggregatedValues` or `AddLabel`.
+	// NewValue is used to set a new label value either when the operation is `AggregatedValues` or `addLabel`.
 	NewValue string `mapstructure:"new_value"`
 
 	// ValueActions is a list of renaming actions for label values.
-	ValueActions []ValueAction `mapstructure:"value_actions"`
+	ValueActions []valueAction `mapstructure:"value_actions"`
+
+	// Scale is a scalar to multiply the values with.
+	Scale float64 `mapstructure:"experimental_scale"`
 
 	// LabelValue identifies the exact label value to operate on
 	LabelValue string `mapstructure:"label_value"`
 }
 
-// ValueAction renames label values.
-type ValueAction struct {
+// valueAction renames label values.
+type valueAction struct {
 	// Value specifies the current label value.
 	Value string `mapstructure:"value"`
 
 	// NewValue specifies the label value to rename to.
 	NewValue string `mapstructure:"new_value"`
+
+	// prevent unkeyed literal initialization
+	_ struct{}
 }
 
 // ConfigAction is the enum to capture the type of action to perform on a metric.
@@ -169,130 +165,88 @@ const (
 	// Combine combines multiple metrics into a single metric.
 	Combine ConfigAction = "combine"
 
-	// Group groups mutiple metrics matching the predicate into multiple ResourceMetrics messages
+	// Group groups multiple metrics matching the predicate into multiple ResourceMetrics messages
 	Group ConfigAction = "group"
 )
 
 var actions = []ConfigAction{Insert, Update, Combine, Group}
 
 func (ca ConfigAction) isValid() bool {
-	for _, configAction := range actions {
-		if ca == configAction {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(actions, ca)
 }
 
-// OperationAction is the enum to capture the thress types of actions to perform for an operation.
-type OperationAction string
+// operationAction is the enum to capture the types of actions to perform for an operation.
+type operationAction string
 
 const (
-	// AddLabel adds a new label to an existing metric.
-	AddLabel OperationAction = "add_label"
+	// addLabel adds a new label to an existing metric.
+	// Metric has to match the filterConfig with all its data points if used with Update ConfigAction,
+	// otherwise the operation will be ignored.
+	addLabel operationAction = "add_label"
 
-	// UpdateLabel applies name changes to label and/or label values.
-	UpdateLabel OperationAction = "update_label"
+	// updateLabel applies name changes to label and/or label values.
+	updateLabel operationAction = "update_label"
 
-	// DeleteLabelValue deletes a label value by also removing all the points associated with this label value
-	DeleteLabelValue OperationAction = "delete_label_value"
+	// deleteLabelValue deletes a label value by also removing all the points associated with this label value
+	// Metric has to match the filterConfig with all its data points if used with Update ConfigAction,
+	// otherwise the operation will be ignored.
+	deleteLabelValue operationAction = "delete_label_value"
 
-	// ToggleScalarDataType changes the data type from int64 to double, or vice-versa
-	ToggleScalarDataType OperationAction = "toggle_scalar_data_type"
+	// toggleScalarDataType changes the data type from int64 to double, or vice-versa
+	toggleScalarDataType operationAction = "toggle_scalar_data_type"
 
-	// AggregateLabels aggregates away all labels other than the ones in Operation.LabelSet
+	// scaleValue multiplies the value by a constant scalar
+	scaleValue operationAction = "experimental_scale_value"
+
+	// aggregateLabels aggregates away all labels other than the ones in Operation.LabelSet
 	// by the method indicated by Operation.AggregationType.
-	AggregateLabels OperationAction = "aggregate_labels"
+	// Metric has to match the filterConfig with all its data points if used with Update ConfigAction,
+	// otherwise the operation will be ignored.
+	aggregateLabels operationAction = "aggregate_labels"
 
-	// AggregateLabelValues aggregates away the values in Operation.AggregatedValues
+	// aggregateLabelValues aggregates away the values in Operation.AggregatedValues
 	// by the method indicated by Operation.AggregationType.
-	AggregateLabelValues OperationAction = "aggregate_label_values"
+	// Metric has to match the filterConfig with all its data points if used with Update ConfigAction,
+	// otherwise the operation will be ignored.
+	aggregateLabelValues operationAction = "aggregate_label_values"
 )
 
-var operationActions = []OperationAction{AddLabel, UpdateLabel, DeleteLabelValue, ToggleScalarDataType, AggregateLabels, AggregateLabelValues}
+var operationActions = []operationAction{addLabel, updateLabel, deleteLabelValue, toggleScalarDataType, scaleValue, aggregateLabels, aggregateLabelValues}
 
-func (oa OperationAction) isValid() bool {
-	for _, operationAction := range operationActions {
-		if oa == operationAction {
-			return true
-		}
-	}
-
-	return false
+func (oa operationAction) isValid() bool {
+	return slices.Contains(operationActions, oa)
 }
 
-// AggregationType is the enum to capture the three types of aggregation for the aggregation operation.
-type AggregationType string
+// matchType is the enum to capture the two types of matching metric(s) that should have operations applied to them.
+type matchType string
 
 const (
-	// Sum indicates taking the sum of the aggregated data.
-	Sum AggregationType = "sum"
+	// strictMatchType is the FilterType for filtering by exact string matches.
+	strictMatchType matchType = "strict"
 
-	// Mean indicates taking the mean of the aggregated data.
-	Mean AggregationType = "mean"
-
-	// Min indicates taking the minimum of the aggregated data.
-	Min AggregationType = "min"
-
-	// Max indicates taking the max of the aggregated data.
-	Max AggregationType = "max"
+	// regexpMatchType is the FilterType for filtering by regexp string matches.
+	regexpMatchType matchType = "regexp"
 )
 
-var aggregationTypes = []AggregationType{Sum, Mean, Min, Max}
+var matchTypes = []matchType{strictMatchType, regexpMatchType}
 
-func (at AggregationType) isValid() bool {
-	for _, aggregationType := range aggregationTypes {
-		if at == aggregationType {
-			return true
-		}
-	}
-
-	return false
+func (mt matchType) isValid() bool {
+	return slices.Contains(matchTypes, mt)
 }
 
-// MatchType is the enum to capture the two types of matching metric(s) that should have operations applied to them.
-type MatchType string
+// submatchCase is the enum to capture the two types of case changes to apply to submatches.
+type submatchCase string
 
 const (
-	// StrictMatchType is the FilterType for filtering by exact string matches.
-	StrictMatchType MatchType = "strict"
+	// lower is the submatchCase for lower casing the submatch.
+	lower submatchCase = "lower"
 
-	// RegexpMatchType is the FilterType for filtering by regexp string matches.
-	RegexpMatchType MatchType = "regexp"
+	// upper is the submatchCase for upper casing the submatch.
+	upper submatchCase = "upper"
 )
 
-var matchTypes = []MatchType{StrictMatchType, RegexpMatchType}
+var submatchCases = []submatchCase{lower, upper}
 
-func (mt MatchType) isValid() bool {
-	for _, matchType := range matchTypes {
-		if mt == matchType {
-			return true
-		}
-	}
-
-	return false
-}
-
-// SubmatchCase is the enum to capture the two types of case changes to apply to submatches.
-type SubmatchCase string
-
-const (
-	// Lower is the SubmatchCase for lower casing the submatch.
-	Lower SubmatchCase = "lower"
-
-	// Upper is the SubmatchCase for upper casing the submatch.
-	Upper SubmatchCase = "upper"
-)
-
-var submatchCases = []SubmatchCase{Lower, Upper}
-
-func (sc SubmatchCase) isValid() bool {
-	for _, submatchCase := range submatchCases {
-		if sc == submatchCase {
-			return true
-		}
-	}
-
-	return false
+func (sc submatchCase) isValid() bool {
+	return slices.Contains(submatchCases, sc)
 }

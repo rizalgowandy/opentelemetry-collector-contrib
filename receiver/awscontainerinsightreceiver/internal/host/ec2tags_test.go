@@ -1,89 +1,105 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package host
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/awstesting/mock"
-	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
+
+	ci "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/containerinsight"
 )
 
-type mockEC2TagsClient struct {
-	count int
+type mockEC2TagsClient func(ctx context.Context, input *ec2.DescribeTagsInput, optFns ...func(options *ec2.Options)) (*ec2.DescribeTagsOutput, error)
+
+func (m mockEC2TagsClient) DescribeTags(ctx context.Context, input *ec2.DescribeTagsInput, optFns ...func(options *ec2.Options)) (*ec2.DescribeTagsOutput, error) {
+	return m(ctx, input, optFns...)
 }
 
-var tokenString = "tokenString"
-var clusterKey = clusterNameTagKeyPrefix + "cluster-name"
-var clusterValue = "owned"
-var asgKey = autoScalingGroupNameTag
-var asgValue = "asg"
-
-func (m *mockEC2TagsClient) DescribeTagsWithContext(ctx context.Context, input *ec2.DescribeTagsInput,
-	opts ...request.Option) (*ec2.DescribeTagsOutput, error) {
-	m.count++
-	if m.count == 1 {
-		return &ec2.DescribeTagsOutput{}, errors.New("error")
-	}
-
-	if m.count == 2 {
-		return &ec2.DescribeTagsOutput{
-			NextToken: &tokenString,
-			Tags: []*ec2.TagDescription{
-				{
-					Key:   &asgKey,
-					Value: &asgValue,
-				},
-			},
-		}, nil
-	}
-
-	return &ec2.DescribeTagsOutput{
-		Tags: []*ec2.TagDescription{
-			{
-				Key:   &clusterKey,
-				Value: &clusterValue,
+func TestEC2TagsForEKS(t *testing.T) {
+	tests := []struct {
+		name   string
+		client func(t *testing.T) ec2TagsClient
+	}{
+		{
+			name: "EKS",
+			client: func(t *testing.T) ec2TagsClient {
+				return mockEC2TagsClient(func(_ context.Context, _ *ec2.DescribeTagsInput, _ ...func(*ec2.Options)) (*ec2.DescribeTagsOutput, error) {
+					t.Helper()
+					return &ec2.DescribeTagsOutput{
+						Tags: []ec2types.TagDescription{
+							{
+								Key:   aws.String(clusterNameTagKeyPrefix + "cluster-name"),
+								Value: aws.String("owned"),
+							},
+							{
+								Key:   aws.String(autoScalingGroupNameTag),
+								Value: aws.String("asg"),
+							},
+						},
+					}, nil
+				})
 			},
 		},
-	}, nil
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			et := ec2Tags{
+				containerOrchestrator: ci.EKS,
+				client:                test.client(t),
+				instanceID:            "instanceId",
+				refreshInterval:       time.Millisecond,
+				logger:                zap.NewNop(),
+			}
+			et.refresh(t.Context())
+			assert.Equal(t, "cluster-name", et.getClusterName())
+			assert.Equal(t, "asg", et.getAutoScalingGroupName())
+		})
+	}
 }
 
-func TestEC2Tags(t *testing.T) {
-	ctx := context.Background()
-	sess := mock.Session
-	clientOption := func(e *ec2Tags) {
-		e.client = &mockEC2TagsClient{}
+func TestEC2TagsForECS(t *testing.T) {
+	tests := []struct {
+		name   string
+		client func(t *testing.T) ec2TagsClient
+	}{
+		{
+			name: "ECS",
+			client: func(t *testing.T) ec2TagsClient {
+				return mockEC2TagsClient(func(_ context.Context, _ *ec2.DescribeTagsInput, _ ...func(*ec2.Options)) (*ec2.DescribeTagsOutput, error) {
+					t.Helper()
+					return &ec2.DescribeTagsOutput{
+						Tags: []ec2types.TagDescription{
+							{
+								Key:   aws.String(autoScalingGroupNameTag),
+								Value: aws.String("asg"),
+							},
+						},
+					}, nil
+				})
+			},
+		},
 	}
-	maxJitterOption := func(e *ec2Tags) {
-		e.maxJitterTime = 0
-	}
-	isSucessOption := func(e *ec2Tags) {
-		e.isSucess = make(chan bool)
-	}
-	et := newEC2Tags(ctx, sess, "instanceId", time.Millisecond, zap.NewNop(), clientOption,
-		maxJitterOption, isSucessOption)
 
-	// wait for ec2 tags are fetched
-	e := et.(*ec2Tags)
-	<-e.isSucess
-	assert.Equal(t, "cluster-name", et.getClusterName())
-	assert.Equal(t, "asg", et.getAutoScalingGroupName())
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			et := ec2Tags{
+				containerOrchestrator: ci.ECS,
+				client:                test.client(t),
+				instanceID:            "instanceId",
+				refreshInterval:       time.Millisecond,
+				logger:                zap.NewNop(),
+			}
+			et.refresh(t.Context())
+			assert.Equal(t, "asg", et.getAutoScalingGroupName())
+		})
+	}
 }

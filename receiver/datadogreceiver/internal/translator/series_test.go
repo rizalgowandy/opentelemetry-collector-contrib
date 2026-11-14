@@ -1,0 +1,755 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package translator
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/DataDog/agent-payload/v5/gogen"
+	"github.com/DataDog/datadog-api-client-go/v2/api/datadog"
+	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV1"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+)
+
+type testPoint struct {
+	Ts    int64
+	Value float64
+}
+
+func testPointsToDatadogPoints(points []testPoint) [][]*float64 {
+	datadogPoints := make([][]*float64, len(points))
+	for i, point := range points {
+		datadogPoints[i] = []*float64{new(float64(point.Ts)), new(point.Value)}
+	}
+	return datadogPoints
+}
+
+func TestHandleMetricsPayloadV2(t *testing.T) {
+	tests := []struct {
+		name                 string
+		metricsPayload       gogen.MetricPayload
+		expectedSeriesCount  int
+		expectedPointsCounts []int
+	}{
+		{
+			name: "v2",
+			metricsPayload: gogen.MetricPayload{
+				Series: []*gogen.MetricPayload_MetricSeries{
+					{
+						Resources: []*gogen.MetricPayload_Resource{
+							{
+								Type: "host",
+								Name: "Host1",
+							},
+						},
+						Metric: "system.load.1",
+						Tags:   []string{"env:test"},
+						Points: []*gogen.MetricPayload_MetricPoint{
+							{
+								Timestamp: 1636629071,
+								Value:     1.5,
+							},
+							{
+								Timestamp: 1636629081,
+								Value:     2.0,
+							},
+						},
+						Type: gogen.MetricPayload_COUNT,
+					},
+				},
+			},
+			expectedSeriesCount:  1,
+			expectedPointsCounts: []int{2},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pb, err := tt.metricsPayload.Marshal()
+			require.NoError(t, err)
+
+			req, err := http.NewRequest(http.MethodPost, "/api/v2/series", io.NopCloser(bytes.NewReader(pb)))
+			require.NoError(t, err)
+			mt := createMetricsTranslator()
+			series, err := mt.HandleSeriesV2Payload(req)
+			require.NoError(t, err)
+			require.NoError(t, err, "Failed to parse metrics payload")
+			require.Len(t, series, tt.expectedSeriesCount)
+			for i, s := range series {
+				require.Len(t, s.Points, tt.expectedPointsCounts[i])
+			}
+		})
+	}
+}
+
+func TestTranslateSeriesV1(t *testing.T) {
+	tests := []struct {
+		name string
+
+		series SeriesList
+		expect func(t *testing.T, result pmetric.Metrics)
+	}{
+		{
+			name: "Count metric",
+			series: SeriesList{
+				Series: []datadogV1.Series{
+					{
+						Metric: "TestCount",
+						Host:   new("Host1"),
+						Type:   new(TypeCount),
+						Tags:   []string{"env:tag1", "version:tag2"},
+						Points: testPointsToDatadogPoints([]testPoint{
+							{
+								1636629071, 0.5,
+							},
+							{
+								1636629081, 1.0,
+							},
+						}),
+					},
+				},
+			},
+			expect: func(t *testing.T, result pmetric.Metrics) {
+				requireMetricAndDataPointCounts(t, result, 1, 2)
+
+				expectedAttrs := tagsToAttributes([]string{"env:tag1", "version:tag2"}, "Host1", newStringPool())
+				require.Equal(t, 1, result.ResourceMetrics().Len())
+				requireResourceAttributes(t, result.ResourceMetrics().At(0).Resource().Attributes(), expectedAttrs.resource)
+				requireScopeMetrics(t, result, 1, 1)
+				requireScope(t, result, expectedAttrs.scope, component.NewDefaultBuildInfo().Version)
+
+				metric := result.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
+				requireSum(t, metric, "TestCount", 2)
+
+				dp := metric.Sum().DataPoints().At(0)
+				requireDp(t, dp, expectedAttrs.dp, 1636629071, 0.5)
+				requireNoAsType(t, dp)
+
+				dp = metric.Sum().DataPoints().At(1)
+				requireDp(t, dp, expectedAttrs.dp, 1636629081, 1.0)
+				requireNoAsType(t, dp)
+			},
+		},
+		{
+			name: "Gauge metric",
+			series: SeriesList{
+				Series: []datadogV1.Series{
+					{
+						Metric: "TestGauge",
+						Host:   new("Host1"),
+						Type:   new(TypeGauge),
+						Tags:   []string{"env:tag1", "version:tag2"},
+						Points: testPointsToDatadogPoints([]testPoint{
+							{
+								Ts:    1636629071,
+								Value: 2,
+							},
+							{
+								Ts:    1636629081,
+								Value: 3,
+							},
+						}),
+					},
+				},
+			},
+			expect: func(t *testing.T, result pmetric.Metrics) {
+				requireMetricAndDataPointCounts(t, result, 1, 2)
+
+				expectedAttrs := tagsToAttributes([]string{"env:tag1", "version:tag2"}, "Host1", newStringPool())
+				require.Equal(t, 1, result.ResourceMetrics().Len())
+				requireResourceAttributes(t, result.ResourceMetrics().At(0).Resource().Attributes(), expectedAttrs.resource)
+				requireScopeMetrics(t, result, 1, 1)
+				requireScope(t, result, expectedAttrs.scope, component.NewDefaultBuildInfo().Version)
+
+				metric := result.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
+				requireGauge(t, metric, "TestGauge", 2)
+
+				dp := metric.Gauge().DataPoints().At(0)
+				requireDp(t, dp, expectedAttrs.dp, 1636629071, 2)
+				requireNoAsType(t, dp)
+
+				dp = metric.Gauge().DataPoints().At(1)
+				requireDp(t, dp, expectedAttrs.dp, 1636629081, 3)
+				requireNoAsType(t, dp)
+			},
+		},
+		{
+			name: "Rate metric",
+			series: SeriesList{
+				Series: []datadogV1.Series{
+					{
+						Metric: "TestRate",
+						Host:   new("Host1"),
+						Type:   new(TypeRate),
+						Tags:   []string{"env:tag1", "version:tag2"},
+						Points: testPointsToDatadogPoints([]testPoint{
+							{
+								Ts:    1636629071,
+								Value: 2,
+							},
+							{
+								Ts:    1636629081,
+								Value: 3,
+							},
+						}),
+					},
+				},
+			},
+			expect: func(t *testing.T, result pmetric.Metrics) {
+				requireMetricAndDataPointCounts(t, result, 1, 2)
+
+				expectedAttrs := tagsToAttributes([]string{"env:tag1", "version:tag2"}, "Host1", newStringPool())
+				expectedAttrs.dp.PutStr(datadogMetricAsTypeKey, TypeRate)
+				require.Equal(t, 1, result.ResourceMetrics().Len())
+				requireResourceAttributes(t, result.ResourceMetrics().At(0).Resource().Attributes(), expectedAttrs.resource)
+				requireScopeMetrics(t, result, 1, 1)
+				requireScope(t, result, expectedAttrs.scope, component.NewDefaultBuildInfo().Version)
+
+				metric := result.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
+				requireSum(t, metric, "TestRate", 2)
+
+				dp := metric.Sum().DataPoints().At(0)
+				requireDp(t, dp, expectedAttrs.dp, 1636629071, 2)
+				requireAsTypeRate(t, dp)
+
+				dp = metric.Sum().DataPoints().At(1)
+				requireDp(t, dp, expectedAttrs.dp, 1636629081, 3)
+				requireAsTypeRate(t, dp)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mt := createMetricsTranslator()
+			result := mt.TranslateSeriesV1(tt.series)
+
+			tt.expect(t, result)
+		})
+	}
+}
+
+func TestTranslateSeriesV2(t *testing.T) {
+	tests := []struct {
+		name   string
+		series []*gogen.MetricPayload_MetricSeries
+		expect func(t *testing.T, result pmetric.Metrics)
+	}{
+		{
+			name: "Count metric",
+			series: []*gogen.MetricPayload_MetricSeries{
+				{
+					Resources: []*gogen.MetricPayload_Resource{
+						{
+							Type: "host",
+							Name: "Host1",
+						},
+					},
+					Metric: "TestCount",
+					Tags:   []string{"env:tag1", "version:tag2"},
+					Points: []*gogen.MetricPayload_MetricPoint{
+						{
+							Timestamp: 1636629071,
+							Value:     0.5,
+						},
+						{
+							Timestamp: 1636629081,
+							Value:     1.0,
+						},
+					},
+					Type: gogen.MetricPayload_COUNT,
+				},
+			},
+			expect: func(t *testing.T, result pmetric.Metrics) {
+				requireMetricAndDataPointCounts(t, result, 1, 2)
+
+				expectedAttrs := tagsToAttributes([]string{"env:tag1", "version:tag2"}, "Host1", newStringPool())
+				expectedAttrs.resource.PutStr("source", "")
+				require.Equal(t, 1, result.ResourceMetrics().Len())
+				requireResourceAttributes(t, result.ResourceMetrics().At(0).Resource().Attributes(), expectedAttrs.resource)
+				requireScopeMetrics(t, result, 1, 1)
+				requireScope(t, result, expectedAttrs.scope, component.NewDefaultBuildInfo().Version)
+
+				metric := result.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
+				requireSum(t, metric, "TestCount", 2)
+
+				dp := metric.Sum().DataPoints().At(0)
+				requireDp(t, dp, expectedAttrs.dp, 1636629071, 0.5)
+				requireNoAsType(t, dp)
+
+				dp = metric.Sum().DataPoints().At(1)
+				requireDp(t, dp, expectedAttrs.dp, 1636629081, 1.0)
+				requireNoAsType(t, dp)
+			},
+		},
+		{
+			name: "Gauge metric",
+			series: []*gogen.MetricPayload_MetricSeries{
+				{
+					Resources: []*gogen.MetricPayload_Resource{
+						{
+							Type: "host",
+							Name: "Host1",
+						},
+					},
+					Metric: "TestGauge",
+					Tags:   []string{"env:tag1", "version:tag2"},
+					Points: []*gogen.MetricPayload_MetricPoint{
+						{
+							Timestamp: 1636629071,
+							Value:     2,
+						},
+						{
+							Timestamp: 1636629081,
+							Value:     3,
+						},
+					},
+					Type: gogen.MetricPayload_GAUGE,
+				},
+			},
+			expect: func(t *testing.T, result pmetric.Metrics) {
+				requireMetricAndDataPointCounts(t, result, 1, 2)
+
+				expectedAttrs := tagsToAttributes([]string{"env:tag1", "version:tag2"}, "Host1", newStringPool())
+				expectedAttrs.resource.PutStr("source", "")
+				require.Equal(t, 1, result.ResourceMetrics().Len())
+				requireResourceAttributes(t, result.ResourceMetrics().At(0).Resource().Attributes(), expectedAttrs.resource)
+				requireScopeMetrics(t, result, 1, 1)
+				requireScope(t, result, expectedAttrs.scope, component.NewDefaultBuildInfo().Version)
+
+				metric := result.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
+				requireGauge(t, metric, "TestGauge", 2)
+
+				dp := metric.Gauge().DataPoints().At(0)
+				requireDp(t, dp, expectedAttrs.dp, 1636629071, 2)
+				requireNoAsType(t, dp)
+
+				dp = metric.Gauge().DataPoints().At(1)
+				requireDp(t, dp, expectedAttrs.dp, 1636629081, 3)
+				requireNoAsType(t, dp)
+			},
+		},
+		{
+			name: "Rate metric",
+			series: []*gogen.MetricPayload_MetricSeries{
+				{
+					Resources: []*gogen.MetricPayload_Resource{
+						{
+							Type: "host",
+							Name: "Host1",
+						},
+					},
+					Metric: "TestRate",
+					Tags:   []string{"env:tag1", "version:tag2"},
+					Points: []*gogen.MetricPayload_MetricPoint{
+						{
+							Timestamp: 1636629071,
+							Value:     2,
+						},
+						{
+							Timestamp: 1636629081,
+							Value:     3,
+						},
+					},
+					Type: gogen.MetricPayload_RATE,
+				},
+			},
+			expect: func(t *testing.T, result pmetric.Metrics) {
+				requireMetricAndDataPointCounts(t, result, 1, 2)
+
+				expectedAttrs := tagsToAttributes([]string{"env:tag1", "version:tag2"}, "Host1", newStringPool())
+				expectedAttrs.resource.PutStr("source", "")
+				expectedAttrs.dp.PutStr(datadogMetricAsTypeKey, TypeRate)
+				require.Equal(t, 1, result.ResourceMetrics().Len())
+				requireResourceAttributes(t, result.ResourceMetrics().At(0).Resource().Attributes(), expectedAttrs.resource)
+				requireScopeMetrics(t, result, 1, 1)
+				requireScope(t, result, expectedAttrs.scope, component.NewDefaultBuildInfo().Version)
+
+				metric := result.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
+				requireSum(t, metric, "TestRate", 2)
+
+				dp := metric.Sum().DataPoints().At(0)
+				requireDp(t, dp, expectedAttrs.dp, 1636629071, 2)
+				requireAsTypeRate(t, dp)
+
+				dp = metric.Sum().DataPoints().At(1)
+				requireDp(t, dp, expectedAttrs.dp, 1636629081, 3)
+				requireAsTypeRate(t, dp)
+			},
+		},
+		{
+			name: "Unspecified metric type",
+			series: []*gogen.MetricPayload_MetricSeries{
+				{
+					Resources: []*gogen.MetricPayload_Resource{
+						{
+							Type: "host",
+							Name: "Host1",
+						},
+					},
+					Metric: "TestUnspecified",
+					Tags:   []string{"env:tag1", "version:tag2"},
+					Points: []*gogen.MetricPayload_MetricPoint{
+						{
+							Timestamp: 1636629071,
+							Value:     2,
+						},
+						{
+							Timestamp: 1636629081,
+							Value:     3,
+						},
+					},
+					Type: gogen.MetricPayload_UNSPECIFIED,
+				},
+			},
+			expect: func(t *testing.T, result pmetric.Metrics) {
+				requireMetricAndDataPointCounts(t, result, 1, 0)
+
+				require.Equal(t, 1, result.ResourceMetrics().Len())
+				v, exists := result.ResourceMetrics().At(0).Resource().Attributes().Get("host.name")
+				require.True(t, exists)
+				require.Equal(t, "Host1", v.AsString())
+				v, exists = result.ResourceMetrics().At(0).Resource().Attributes().Get("deployment.environment.name")
+				require.True(t, exists)
+				require.Equal(t, "tag1", v.AsString())
+				v, exists = result.ResourceMetrics().At(0).Resource().Attributes().Get("service.version")
+				require.True(t, exists)
+				require.Equal(t, "tag2", v.AsString())
+
+				require.Equal(t, 1, result.ResourceMetrics().At(0).ScopeMetrics().Len())
+				require.Equal(t, 1, result.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().Len())
+
+				require.Equal(t, "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/datadogreceiver/internal/translator", result.ResourceMetrics().At(0).ScopeMetrics().At(0).Scope().Name())
+				require.Equal(t, component.NewDefaultBuildInfo().Version, result.ResourceMetrics().At(0).ScopeMetrics().At(0).Scope().Version())
+
+				metric := result.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
+				require.Equal(t, "TestUnspecified", metric.Name())
+				require.Equal(t, pmetric.MetricTypeEmpty, metric.Type())
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mt := createMetricsTranslator()
+			result := mt.TranslateSeriesV2(tt.series)
+
+			tt.expect(t, result)
+		})
+	}
+}
+
+func TestTranslateSeriesV1StartTimestampOrdering(t *testing.T) {
+	tests := []struct {
+		name string
+		// Each element simulates a separate submission (call to TranslateSeriesV1).
+		submissions []SeriesList
+		expect      func(t *testing.T, results []pmetric.Metrics)
+	}{
+		{
+			name: "In-order submissions set StartTimestamp correctly",
+			submissions: []SeriesList{
+				{Series: []datadogV1.Series{{
+					Metric: "TestCount", Host: new("Host1"),
+					Type: new(TypeCount), Tags: []string{"env:test"},
+					Points: testPointsToDatadogPoints([]testPoint{{Ts: 1000, Value: 1.0}}),
+				}}},
+				{Series: []datadogV1.Series{{
+					Metric: "TestCount", Host: new("Host1"),
+					Type: new(TypeCount), Tags: []string{"env:test"},
+					Points: testPointsToDatadogPoints([]testPoint{{Ts: 1010, Value: 2.0}}),
+				}}},
+				{Series: []datadogV1.Series{{
+					Metric: "TestCount", Host: new("Host1"),
+					Type: new(TypeCount), Tags: []string{"env:test"},
+					Points: testPointsToDatadogPoints([]testPoint{{Ts: 1020, Value: 3.0}}),
+				}}},
+			},
+			expect: func(t *testing.T, results []pmetric.Metrics) {
+				// First submission: no previous timestamp, StartTimestamp should be 0
+				dp0 := results[0].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+				require.Equal(t, int64(0), dp0.StartTimestamp().AsTime().Unix())
+				require.Equal(t, int64(1000), dp0.Timestamp().AsTime().Unix())
+
+				// Second submission: StartTimestamp should be the previous Timestamp
+				dp1 := results[1].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+				require.Equal(t, int64(1000), dp1.StartTimestamp().AsTime().Unix())
+				require.Equal(t, int64(1010), dp1.Timestamp().AsTime().Unix())
+
+				// Third submission: StartTimestamp should chain from the second
+				dp2 := results[2].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+				require.Equal(t, int64(1010), dp2.StartTimestamp().AsTime().Unix())
+				require.Equal(t, int64(1020), dp2.Timestamp().AsTime().Unix())
+			},
+		},
+		{
+			name: "Out-of-order submission does not set StartTimestamp exceeding Timestamp",
+			submissions: []SeriesList{
+				{Series: []datadogV1.Series{{
+					Metric: "TestCount", Host: new("Host1"),
+					Type: new(TypeCount), Tags: []string{"env:test"},
+					Points: testPointsToDatadogPoints([]testPoint{{Ts: 1010, Value: 1.0}}),
+				}}},
+				{Series: []datadogV1.Series{{
+					Metric: "TestCount", Host: new("Host1"),
+					Type: new(TypeCount), Tags: []string{"env:test"},
+					Points: testPointsToDatadogPoints([]testPoint{{Ts: 1020, Value: 2.0}}),
+				}}},
+				// Late/reordered arrival with an older timestamp
+				{Series: []datadogV1.Series{{
+					Metric: "TestCount", Host: new("Host1"),
+					Type: new(TypeCount), Tags: []string{"env:test"},
+					Points: testPointsToDatadogPoints([]testPoint{{Ts: 1010, Value: 1.5}}),
+				}}},
+			},
+			expect: func(t *testing.T, results []pmetric.Metrics) {
+				// Third submission (late): StartTimestamp must NOT exceed Timestamp.
+				// lastTs is 1020, incoming Timestamp is 1010 → StartTimestamp should NOT be set.
+				dp2 := results[2].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+				require.Equal(t, int64(0), dp2.StartTimestamp().AsTime().Unix(),
+					"StartTimestamp should not be set when it would exceed Timestamp")
+				require.Equal(t, int64(1010), dp2.Timestamp().AsTime().Unix())
+			},
+		},
+		{
+			name: "Recovery after out-of-order: lastTs is not poisoned",
+			submissions: []SeriesList{
+				{Series: []datadogV1.Series{{
+					Metric: "TestCount", Host: new("Host1"),
+					Type: new(TypeCount), Tags: []string{"env:test"},
+					Points: testPointsToDatadogPoints([]testPoint{{Ts: 1010, Value: 1.0}}),
+				}}},
+				{Series: []datadogV1.Series{{
+					Metric: "TestCount", Host: new("Host1"),
+					Type: new(TypeCount), Tags: []string{"env:test"},
+					Points: testPointsToDatadogPoints([]testPoint{{Ts: 1020, Value: 2.0}}),
+				}}},
+				// Late arrival
+				{Series: []datadogV1.Series{{
+					Metric: "TestCount", Host: new("Host1"),
+					Type: new(TypeCount), Tags: []string{"env:test"},
+					Points: testPointsToDatadogPoints([]testPoint{{Ts: 1010, Value: 1.5}}),
+				}}},
+				// Normal next submission: should still chain from 1020, not 1010
+				{Series: []datadogV1.Series{{
+					Metric: "TestCount", Host: new("Host1"),
+					Type: new(TypeCount), Tags: []string{"env:test"},
+					Points: testPointsToDatadogPoints([]testPoint{{Ts: 1030, Value: 3.0}}),
+				}}},
+			},
+			expect: func(t *testing.T, results []pmetric.Metrics) {
+				// Fourth submission: StartTimestamp should be 1020 (from second submission),
+				// NOT 1010 (the late third submission must not have overwritten lastTs).
+				dp3 := results[3].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+				require.Equal(t, int64(1020), dp3.StartTimestamp().AsTime().Unix(),
+					"lastTs should not be poisoned by a late-arriving out-of-order data point")
+				require.Equal(t, int64(1030), dp3.Timestamp().AsTime().Unix())
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mt := createMetricsTranslator()
+			var results []pmetric.Metrics
+			for _, submission := range tt.submissions {
+				results = append(results, mt.TranslateSeriesV1(submission))
+			}
+			tt.expect(t, results)
+		})
+	}
+}
+
+func TestTranslateSeriesV2StartTimestampOrdering(t *testing.T) {
+	tests := []struct {
+		name        string
+		submissions [][]*gogen.MetricPayload_MetricSeries
+		expect      func(t *testing.T, results []pmetric.Metrics)
+	}{
+		{
+			name: "In-order submissions set StartTimestamp correctly",
+			submissions: [][]*gogen.MetricPayload_MetricSeries{
+				{{
+					Resources: []*gogen.MetricPayload_Resource{{Type: "host", Name: "Host1"}},
+					Metric:    "TestCount", Tags: []string{"env:test"},
+					Points: []*gogen.MetricPayload_MetricPoint{{Timestamp: 1000, Value: 1.0}},
+					Type:   gogen.MetricPayload_COUNT,
+				}},
+				{{
+					Resources: []*gogen.MetricPayload_Resource{{Type: "host", Name: "Host1"}},
+					Metric:    "TestCount", Tags: []string{"env:test"},
+					Points: []*gogen.MetricPayload_MetricPoint{{Timestamp: 1010, Value: 2.0}},
+					Type:   gogen.MetricPayload_COUNT,
+				}},
+				{{
+					Resources: []*gogen.MetricPayload_Resource{{Type: "host", Name: "Host1"}},
+					Metric:    "TestCount", Tags: []string{"env:test"},
+					Points: []*gogen.MetricPayload_MetricPoint{{Timestamp: 1020, Value: 3.0}},
+					Type:   gogen.MetricPayload_COUNT,
+				}},
+			},
+			expect: func(t *testing.T, results []pmetric.Metrics) {
+				dp0 := results[0].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+				require.Equal(t, int64(0), dp0.StartTimestamp().AsTime().Unix())
+				require.Equal(t, int64(1000), dp0.Timestamp().AsTime().Unix())
+
+				dp1 := results[1].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+				require.Equal(t, int64(1000), dp1.StartTimestamp().AsTime().Unix())
+				require.Equal(t, int64(1010), dp1.Timestamp().AsTime().Unix())
+
+				dp2 := results[2].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+				require.Equal(t, int64(1010), dp2.StartTimestamp().AsTime().Unix())
+				require.Equal(t, int64(1020), dp2.Timestamp().AsTime().Unix())
+			},
+		},
+		{
+			name: "Out-of-order submission does not set StartTimestamp exceeding Timestamp",
+			submissions: [][]*gogen.MetricPayload_MetricSeries{
+				{{
+					Resources: []*gogen.MetricPayload_Resource{{Type: "host", Name: "Host1"}},
+					Metric:    "TestCount", Tags: []string{"env:test"},
+					Points: []*gogen.MetricPayload_MetricPoint{{Timestamp: 1010, Value: 1.0}},
+					Type:   gogen.MetricPayload_COUNT,
+				}},
+				{{
+					Resources: []*gogen.MetricPayload_Resource{{Type: "host", Name: "Host1"}},
+					Metric:    "TestCount", Tags: []string{"env:test"},
+					Points: []*gogen.MetricPayload_MetricPoint{{Timestamp: 1020, Value: 2.0}},
+					Type:   gogen.MetricPayload_COUNT,
+				}},
+				// Late/reordered arrival
+				{{
+					Resources: []*gogen.MetricPayload_Resource{{Type: "host", Name: "Host1"}},
+					Metric:    "TestCount", Tags: []string{"env:test"},
+					Points: []*gogen.MetricPayload_MetricPoint{{Timestamp: 1010, Value: 1.5}},
+					Type:   gogen.MetricPayload_COUNT,
+				}},
+			},
+			expect: func(t *testing.T, results []pmetric.Metrics) {
+				dp2 := results[2].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+				require.Equal(t, int64(0), dp2.StartTimestamp().AsTime().Unix(),
+					"StartTimestamp should not be set when it would exceed Timestamp")
+				require.Equal(t, int64(1010), dp2.Timestamp().AsTime().Unix())
+			},
+		},
+		{
+			name: "Recovery after out-of-order: lastTs is not poisoned",
+			submissions: [][]*gogen.MetricPayload_MetricSeries{
+				{{
+					Resources: []*gogen.MetricPayload_Resource{{Type: "host", Name: "Host1"}},
+					Metric:    "TestCount", Tags: []string{"env:test"},
+					Points: []*gogen.MetricPayload_MetricPoint{{Timestamp: 1010, Value: 1.0}},
+					Type:   gogen.MetricPayload_COUNT,
+				}},
+				{{
+					Resources: []*gogen.MetricPayload_Resource{{Type: "host", Name: "Host1"}},
+					Metric:    "TestCount", Tags: []string{"env:test"},
+					Points: []*gogen.MetricPayload_MetricPoint{{Timestamp: 1020, Value: 2.0}},
+					Type:   gogen.MetricPayload_COUNT,
+				}},
+				// Late arrival
+				{{
+					Resources: []*gogen.MetricPayload_Resource{{Type: "host", Name: "Host1"}},
+					Metric:    "TestCount", Tags: []string{"env:test"},
+					Points: []*gogen.MetricPayload_MetricPoint{{Timestamp: 1010, Value: 1.5}},
+					Type:   gogen.MetricPayload_COUNT,
+				}},
+				// Normal next
+				{{
+					Resources: []*gogen.MetricPayload_Resource{{Type: "host", Name: "Host1"}},
+					Metric:    "TestCount", Tags: []string{"env:test"},
+					Points: []*gogen.MetricPayload_MetricPoint{{Timestamp: 1030, Value: 3.0}},
+					Type:   gogen.MetricPayload_COUNT,
+				}},
+			},
+			expect: func(t *testing.T, results []pmetric.Metrics) {
+				dp3 := results[3].ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+				require.Equal(t, int64(1020), dp3.StartTimestamp().AsTime().Unix(),
+					"lastTs should not be poisoned by a late-arriving out-of-order data point")
+				require.Equal(t, int64(1030), dp3.Timestamp().AsTime().Unix())
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mt := createMetricsTranslator()
+			var results []pmetric.Metrics
+			for _, submission := range tt.submissions {
+				results = append(results, mt.TranslateSeriesV2(submission))
+			}
+			tt.expect(t, results)
+		})
+	}
+}
+
+// A declared interval sets the window, including on a stream's first point.
+func TestTranslateSeriesIntervalSetsStartTimestamp(t *testing.T) {
+	const (
+		ts       = int64(1636629071)
+		interval = int64(10)
+	)
+	wantStart := pcommon.Timestamp((ts - interval) * time.Second.Nanoseconds())
+	wantTs := pcommon.Timestamp(ts * time.Second.Nanoseconds())
+
+	t.Run("v1 first point of a stream", func(t *testing.T) {
+		mt := createMetricsTranslator()
+		result := mt.TranslateSeriesV1(SeriesList{
+			Series: []datadogV1.Series{
+				{
+					Metric:   "TestRate",
+					Host:     new("Host1"),
+					Type:     new(TypeRate),
+					Interval: *datadog.NewNullableInt64(new(interval)),
+					Points:   testPointsToDatadogPoints([]testPoint{{ts, 1.0}}),
+				},
+			},
+		})
+		dp := result.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+		require.Equal(t, wantTs, dp.Timestamp())
+		// Without the declared interval this is 0 and no interval can be inferred.
+		require.Equal(t, wantStart, dp.StartTimestamp())
+		// Value scaling by the interval is unchanged.
+		require.InEpsilon(t, float64(interval), dp.DoubleValue(), 1e-9)
+	})
+
+	t.Run("v2 first point of a stream", func(t *testing.T) {
+		mt := createMetricsTranslator()
+		result := mt.TranslateSeriesV2([]*gogen.MetricPayload_MetricSeries{
+			{
+				Metric:    "TestRate",
+				Type:      gogen.MetricPayload_RATE,
+				Interval:  interval,
+				Resources: []*gogen.MetricPayload_Resource{{Type: "host", Name: "Host1"}},
+				Points:    []*gogen.MetricPayload_MetricPoint{{Timestamp: ts, Value: 1.0}},
+			},
+		})
+		dp := result.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+		require.Equal(t, wantTs, dp.Timestamp())
+		require.Equal(t, wantStart, dp.StartTimestamp())
+		require.InEpsilon(t, float64(interval), dp.DoubleValue(), 1e-9)
+	})
+
+	t.Run("no declared interval falls back to inter-arrival tracking", func(t *testing.T) {
+		mt := createMetricsTranslator()
+		mk := func(at int64) SeriesList {
+			return SeriesList{Series: []datadogV1.Series{{
+				Metric: "TestCount", Host: new("Host1"), Type: new(TypeCount),
+				Points: testPointsToDatadogPoints([]testPoint{{at, 1.0}}),
+			}}}
+		}
+		_ = mt.TranslateSeriesV1(mk(ts))
+		second := mt.TranslateSeriesV1(mk(ts + 30))
+		dp := second.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Sum().DataPoints().At(0)
+		require.Equal(t, pcommon.Timestamp(ts*time.Second.Nanoseconds()), dp.StartTimestamp(),
+			"series without a declared interval must still use the previous timestamp")
+	})
+}

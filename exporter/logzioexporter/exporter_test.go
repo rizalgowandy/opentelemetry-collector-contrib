@@ -1,41 +1,32 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package logzioexporter
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
-	"io/ioutil"
+	"bytes"
+	"compress/gzip"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
+	"time"
 
-	commonpb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/common/v1"
-	tracepb "github.com/census-instrumentation/opencensus-proto/gen-go/trace/v1"
-	"github.com/jaegertracing/jaeger/model"
-	"github.com/logzio/jaeger-logzio/store/objects"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/internaldata"
-	"go.uber.org/zap"
-	"google.golang.org/protobuf/types/known/wrapperspb"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/config/configcompression"
+	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
+	"go.opentelemetry.io/collector/pdata/testdata"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/logzioexporter/internal/metadata"
 )
 
 const (
@@ -44,143 +35,279 @@ const (
 	testOperation = "testOperation"
 )
 
-var testSpans = []*tracepb.Span{
-	{
-		TraceId:                 []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
-		SpanId:                  []byte{0, 0, 0, 0, 0, 0, 0, 2},
-		Name:                    &tracepb.TruncatableString{Value: testOperation},
-		Kind:                    tracepb.Span_SERVER,
-		SameProcessAsParentSpan: &wrapperspb.BoolValue{Value: true},
-	},
+var (
+	TestLogTime          = time.Now()
+	TestLogTimeUnixMilli = TestLogTime.UnixMilli()
+	TestLogTimestamp     = pcommon.NewTimestampFromTime(TestLogTime)
+)
+
+// Logs
+
+func fillLogOne(log plog.LogRecord) {
+	log.SetTimestamp(TestLogTimestamp)
+	log.SetDroppedAttributesCount(1)
+	log.SetSeverityNumber(plog.SeverityNumberInfo)
+	log.SetSeverityText("Info")
+	log.SetSpanID([8]byte{0x01, 0x02, 0x04, 0x08})
+	log.SetTraceID([16]byte{0x08, 0x04, 0x02, 0x01})
+	attrs := log.Attributes()
+	attrs.PutStr("app", "server")
+	attrs.PutDouble("instance_num", 1)
+	// nested body map
+	attMap := log.Body().SetEmptyMap()
+	attMap.PutDouble("23", 45)
+	attMap.PutStr("foo", "bar")
+	attMap.PutStr("message", "hello there")
+	attNestedMap := attMap.PutEmptyMap("nested")
+	attNestedMap.PutStr("string", "v1")
+	attNestedMap.PutDouble("number", 499)
 }
 
-func testTracesExporter(td pdata.Traces, t *testing.T, cfg *Config) {
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	exporter, err := createTracesExporter(context.Background(), params, cfg)
-	require.NoError(t, err)
+func fillLogNoTimestamp(log plog.LogRecord) {
+	log.SetDroppedAttributesCount(1)
+	log.SetSeverityNumber(plog.SeverityNumberInfo)
+	log.SetSeverityText("Info")
+	attrs := log.Attributes()
+	attrs.PutStr("customer", "acme")
+	attrs.PutDouble("number", 64)
+	attrs.PutBool("bool", true)
+	attrs.PutStr("env", "dev")
+	log.Body().SetStr("something happened")
+}
 
-	ctx := context.Background()
-	err = exporter.ConsumeTraces(ctx, td)
+func generateLogsOneEmptyTimestamp() plog.Logs {
+	ld := testdata.GenerateLogs(1)
+	logs := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+	ld.ResourceLogs().At(0).ScopeLogs().At(0).Scope().SetName("logScopeName")
+	fillLogOne(logs.At(0))
+	fillLogNoTimestamp(logs.AppendEmpty())
+	return ld
+}
+
+func testLogsExporter(t *testing.T, ld plog.Logs, cfg *Config) error {
+	var err error
+	params := exportertest.NewNopSettings(metadata.Type)
+	exporter, err := createLogsExporter(t.Context(), params, cfg)
+	if err != nil {
+		return err
+	}
+	err = exporter.Start(t.Context(), componenttest.NewNopHost())
+	if err != nil {
+		return err
+	}
+	require.NoError(t, err)
+	ctx := t.Context()
+	err = exporter.ConsumeLogs(ctx, ld)
+	if err != nil {
+		return err
+	}
 	require.NoError(t, err)
 	err = exporter.Shutdown(ctx)
 	require.NoError(t, err)
+	return nil
+}
+
+// Traces
+func newTestTracesWithAttributes() ptrace.Traces {
+	td := ptrace.NewTraces()
+	for i := range 10 {
+		s := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+		s.SetName(fmt.Sprintf("%s-%d", testOperation, i))
+		s.SetTraceID(pcommon.TraceID([16]byte{byte(i), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}))
+		s.SetSpanID(pcommon.SpanID([8]byte{byte(i), 0, 0, 0, 0, 0, 0, 2}))
+		for j := range 5 {
+			s.Attributes().PutStr(fmt.Sprintf("k%d", j), fmt.Sprintf("v%d", j))
+		}
+		s.SetKind(ptrace.SpanKindServer)
+	}
+	return td
+}
+
+func newTestTraces() ptrace.Traces {
+	td := ptrace.NewTraces()
+	s := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	s.SetName(testOperation)
+	s.SetTraceID([16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})
+	s.SetSpanID([8]byte{0, 0, 0, 0, 0, 0, 0, 2})
+	s.SetKind(ptrace.SpanKindServer)
+	return td
+}
+
+func testTracesExporter(t *testing.T, td ptrace.Traces, cfg *Config) error {
+	params := exportertest.NewNopSettings(metadata.Type)
+	exporter, err := createTracesExporter(t.Context(), params, cfg)
+	if err != nil {
+		return err
+	}
+	err = exporter.Start(t.Context(), componenttest.NewNopHost())
+	if err != nil {
+		return err
+	}
+	require.NoError(t, err)
+	ctx := t.Context()
+	err = exporter.ConsumeTraces(ctx, td)
+	if err != nil {
+		return err
+	}
+	require.NoError(t, err)
+	err = exporter.Shutdown(ctx)
+	require.NoError(t, err)
+	return nil
+}
+
+// Tests
+func TestExportErrors(tester *testing.T) {
+	type ExportErrorsTest struct {
+		status int
+	}
+	ExportErrorsTests := []ExportErrorsTest{
+		{http.StatusUnauthorized},
+		{http.StatusBadGateway},
+		{http.StatusInternalServerError},
+		{http.StatusForbidden},
+		{http.StatusMethodNotAllowed},
+		{http.StatusNotFound},
+		{http.StatusBadRequest},
+	}
+	for _, test := range ExportErrorsTests {
+		server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+			rw.WriteHeader(test.status)
+		}))
+		clientConfig := confighttp.NewDefaultClientConfig()
+		clientConfig.Endpoint = server.URL
+
+		cfg := &Config{
+			Region:       "",
+			Token:        "token",
+			ClientConfig: clientConfig,
+		}
+		td := newTestTracesWithAttributes()
+		ld := testdata.GenerateLogs(10)
+		err := testTracesExporter(tester, td, cfg)
+		fmt.Println(err.Error())
+		require.Error(tester, err)
+		err = testLogsExporter(tester, ld, cfg)
+		fmt.Println(err.Error())
+		server.Close()
+		require.Error(tester, err)
+	}
 }
 
 func TestNullTracesExporterConfig(tester *testing.T) {
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
+	params := exportertest.NewNopSettings(metadata.Type)
 	_, err := newLogzioTracesExporter(nil, params)
 	assert.Error(tester, err, "Null exporter config should produce error")
 }
 
-func testMetricsExporter(md pdata.Metrics, t *testing.T, cfg *Config) {
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	exporter, err := createMetricsExporter(context.Background(), params, cfg)
-	require.NoError(t, err)
-	err = exporter.ConsumeMetrics(context.Background(), md)
-	assert.NoError(t, err)
-}
-
 func TestNullExporterConfig(tester *testing.T) {
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
+	params := exportertest.NewNopSettings(metadata.Type)
 	_, err := newLogzioExporter(nil, params)
 	assert.Error(tester, err, "Null exporter config should produce error")
 }
 
-func TestNullTokenConfig(tester *testing.T) {
-	cfg := Config{
-		Region: "eu",
+func gUnzipData(data []byte) (resData []byte, err error) {
+	b := bytes.NewBuffer(data)
+	var r io.Reader
+	r, err = gzip.NewReader(b)
+	if err != nil {
+		return resData, err
 	}
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	_, err := createTracesExporter(context.Background(), params, &cfg)
-	assert.Error(tester, err, "Empty token should produce error")
-}
-
-func TestEmptyNode(tester *testing.T) {
-	cfg := Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-		TracesToken:      "test",
-		Region:           "eu",
+	var resB bytes.Buffer
+	_, err = resB.ReadFrom(r)
+	if err != nil {
+		return resData, err
 	}
-	testTracesExporter(internaldata.OCToTraces(nil, nil, nil), tester, &cfg)
-}
-
-func TestWriteSpanError(tester *testing.T) {
-	cfg := Config{
-		TracesToken: "test",
-		Region:      "eu",
-	}
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	exporter, _ := newLogzioExporter(&cfg, params)
-	oldFunc := exporter.WriteSpanFunc
-	defer func() { exporter.WriteSpanFunc = oldFunc }()
-	exporter.WriteSpanFunc = func(context.Context, *model.Span) error {
-		return errors.New("fail")
-	}
-	err := exporter.pushTraceData(context.Background(), internaldata.OCToTraces(nil, nil, testSpans))
-	assert.NoError(tester, err)
-}
-
-func TestConversionTraceError(tester *testing.T) {
-	cfg := Config{
-		TracesToken: "test",
-		Region:      "eu",
-	}
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	exporter, _ := newLogzioExporter(&cfg, params)
-	oldFunc := exporter.InternalTracesToJaegerTraces
-	defer func() { exporter.InternalTracesToJaegerTraces = oldFunc }()
-	exporter.InternalTracesToJaegerTraces = func(td pdata.Traces) ([]*model.Batch, error) {
-		return nil, errors.New("fail")
-	}
-	err := exporter.pushTraceData(context.Background(), internaldata.OCToTraces(nil, nil, testSpans))
-	assert.Error(tester, err)
+	resData = resB.Bytes()
+	return resData, err
 }
 
 func TestPushTraceData(tester *testing.T) {
 	var recordedRequests []byte
 	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		recordedRequests, _ = ioutil.ReadAll(req.Body)
+		recordedRequests, _ = io.ReadAll(req.Body)
 		rw.WriteHeader(http.StatusOK)
 	}))
+	clientConfig := confighttp.NewDefaultClientConfig()
+	clientConfig.Endpoint = server.URL
+	clientConfig.Compression = configcompression.TypeGzip
 	cfg := Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-		TracesToken:      "test",
-		Region:           "eu",
-		CustomEndpoint:   server.URL,
+		Token:        "token",
+		Region:       "",
+		ClientConfig: clientConfig,
 	}
 	defer server.Close()
-
-	node := &commonpb.Node{
-		ServiceInfo: &commonpb.ServiceInfo{
-			Name: testService,
-		},
-		Identifier: &commonpb.ProcessIdentifier{
-			HostName: testHost,
-		},
-	}
-	testTracesExporter(internaldata.OCToTraces(node, nil, testSpans), tester, &cfg)
-	requests := strings.Split(string(recordedRequests), "\n")
-	var logzioSpan objects.LogzioSpan
-	assert.NoError(tester, json.Unmarshal([]byte(requests[0]), &logzioSpan))
-	assert.Equal(tester, testOperation, logzioSpan.OperationName)
-	assert.Equal(tester, testService, logzioSpan.Process.ServiceName)
-
-	var logzioService objects.LogzioService
-	assert.NoError(tester, json.Unmarshal([]byte(requests[1]), &logzioService))
-
-	assert.Equal(tester, testOperation, logzioService.OperationName)
-	assert.Equal(tester, testService, logzioService.ServiceName)
-
+	td := newTestTraces()
+	res := td.ResourceSpans().At(0).Resource()
+	res.Attributes().PutStr("service.name", testService)
+	res.Attributes().PutStr("host.name", testHost)
+	err := testTracesExporter(tester, td, &cfg)
+	require.NoError(tester, err)
+	requests := ptraceotlp.NewExportRequest()
+	decoded, _ := gUnzipData(recordedRequests)
+	err = requests.UnmarshalProto(decoded)
+	require.NoError(tester, err)
+	resultSpans := requests.Traces()
+	assert.Equal(tester, td.SpanCount(), requests.Traces().SpanCount())
+	assert.Equal(tester, td.ResourceSpans().At(0).Resource().Attributes().AsRaw(), resultSpans.ResourceSpans().At(0).Resource().Attributes().AsRaw())
+	assert.Equal(tester, td.ResourceSpans(), resultSpans.ResourceSpans())
 }
 
-func TestPushMetricsData(tester *testing.T) {
+func TestPushLogsData(tester *testing.T) {
+	var recordedRequests []byte
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		recordedRequests, _ = io.ReadAll(req.Body)
+		rw.WriteHeader(http.StatusOK)
+	}))
+	clientConfig := confighttp.NewDefaultClientConfig()
+	clientConfig.Endpoint = server.URL
+	clientConfig.Compression = configcompression.TypeGzip
 	cfg := Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-		MetricsToken:     "test",
-		Region:           "eu",
-		CustomEndpoint:   "url",
+		Token:        "token",
+		Region:       "",
+		ClientConfig: clientConfig,
 	}
-	md := pdata.NewMetrics()
+	defer server.Close()
+	ld := generateLogsOneEmptyTimestamp()
+	res := ld.ResourceLogs().At(0).Resource()
+	res.Attributes().PutStr("service.name", testService)
+	res.Attributes().PutStr("host.name", testHost)
+	err := testLogsExporter(tester, ld, &cfg)
+	require.NoError(tester, err)
+	requests := plogotlp.NewExportRequest()
+	decoded, _ := gUnzipData(recordedRequests)
+	err = requests.UnmarshalProto(decoded)
+	require.NoError(tester, err)
+	resultLogs := requests.Logs()
+	assert.Equal(tester, ld.LogRecordCount(), resultLogs.LogRecordCount())
+	assert.Equal(tester, ld.ResourceLogs().At(0).Resource().Attributes().AsRaw(), resultLogs.ResourceLogs().At(0).Resource().Attributes().AsRaw())
+	assert.Equal(tester, ld.ResourceLogs(), resultLogs.ResourceLogs())
+}
 
-	testMetricsExporter(md, tester, &cfg)
+func TestMergeMapEntries(tester *testing.T) {
+	firstMap := pcommon.NewMap()
+	secondMap := pcommon.NewMap()
+	expectedMap := pcommon.NewMap()
+	firstMap.PutStr("name", "exporter")
+	firstMap.PutStr("host", "localhost")
+	firstMap.PutStr("instanceNum", "1")
+	firstMap.PutInt("id", 4)
+	secondMap.PutStr("tag", "test")
+	secondMap.PutStr("host", "ec2")
+	secondMap.PutInt("instanceNum", 3)
+	secondMap.PutEmptyMap("id").PutInt("instance_a", 1)
+	expectedMap.PutStr("name", "exporter")
+	expectedMap.PutStr("tag", "test")
+	slice := expectedMap.PutEmptySlice("host")
+	slice.AppendEmpty().SetStr("localhost")
+	slice.AppendEmpty().SetStr("ec2")
+	slice = expectedMap.PutEmptySlice("instanceNum")
+	val := slice.AppendEmpty()
+	val.SetStr("1")
+	val = slice.AppendEmpty()
+	val.SetInt(3)
+	slice = expectedMap.PutEmptySlice("id")
+	slice.AppendEmpty().SetInt(4)
+	slice.AppendEmpty().SetEmptyMap().PutInt("instance_a", 1)
+	mergedMap := mergeMapEntries(firstMap, secondMap)
+	assert.Equal(tester, expectedMap.AsRaw(), mergedMap.AsRaw())
 }

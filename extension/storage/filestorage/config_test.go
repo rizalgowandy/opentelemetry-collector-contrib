@@ -1,53 +1,380 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package filestorage
 
 import (
-	"path"
+	"math"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configtest"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/extension"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage/internal/metadata"
 )
 
 func TestLoadConfig(t *testing.T) {
-	factories, err := componenttest.NopFactories()
-	assert.NoError(t, err)
+	t.Parallel()
 
-	factory := NewFactory()
-	factories.Extensions[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
-
-	require.Nil(t, err)
-	require.NotNil(t, cfg)
-
-	require.Len(t, cfg.Extensions, 2)
-
-	ext0 := cfg.Extensions[config.NewID(typeStr)]
-	assert.Equal(t, factory.CreateDefaultConfig(), ext0)
-
-	ext1 := cfg.Extensions[config.NewIDWithName(typeStr, "all_settings")]
-	assert.Equal(t,
-		&Config{
-			ExtensionSettings: config.NewExtensionSettings(config.NewIDWithName(typeStr, "all_settings")),
-			Directory:         "/var/lib/otelcol/mydir",
-			Timeout:           2 * time.Second,
+	tests := []struct {
+		id       component.ID
+		expected component.Config
+	}{
+		{
+			id: component.NewID(metadata.Type),
+			expected: func() component.Config {
+				ret := NewFactory().CreateDefaultConfig()
+				ret.(*Config).Directory = "."
+				return ret
+			}(),
 		},
-		ext1)
+		{
+			id: component.NewIDWithName(metadata.Type, "all_settings"),
+			expected: &Config{
+				Directory: ".",
+				Compaction: &CompactionConfig{
+					Directory:                  ".",
+					OnStart:                    true,
+					OnRebound:                  true,
+					MaxTransactionSize:         2048,
+					ReboundTriggerThresholdMiB: 16,
+					ReboundNeededThresholdMiB:  128,
+					CheckInterval:              time.Second * 5,
+					CleanupOnStart:             true,
+				},
+				Timeout:              2 * time.Second,
+				MaxSize:              256 * oneMiB,
+				FSync:                true,
+				CreateDirectory:      false,
+				DirectoryPermissions: "0750",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
+			require.NoError(t, err)
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			assert.NoError(t, confmap.Validate(cfg))
+			assert.Equal(t, tt.expected, cfg)
+		})
+	}
+}
+
+func TestHandleNonExistingDirectoryWithAnError(t *testing.T) {
+	f := NewFactory()
+	cfg := f.CreateDefaultConfig().(*Config)
+	cfg.Directory = "/not/a/dir"
+
+	err := confmap.Validate(cfg)
+	require.Error(t, err)
+	require.True(t, strings.HasPrefix(err.Error(), "directory must exist: "))
+}
+
+func TestHandleProvidingFilePathAsDirWithAnError(t *testing.T) {
+	f := NewFactory()
+	cfg := f.CreateDefaultConfig().(*Config)
+
+	file, err := os.CreateTemp(t.TempDir(), "")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, file.Close())
+		require.NoError(t, os.Remove(file.Name()))
+	})
+
+	cfg.Directory = file.Name()
+
+	err = confmap.Validate(cfg)
+	require.Error(t, err)
+	require.EqualError(t, err, file.Name()+" is not a directory")
+}
+
+func TestDirectoryCreateConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		config func(*testing.T, extension.Factory) *Config
+		err    error
+		errMsg string
+	}{
+		{
+			name: "create directory true - no error",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				storageDir := filepath.Join(t.TempDir(), uuid.NewString())
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = storageDir
+				cfg.CreateDirectory = true
+				return cfg
+			},
+			err: nil,
+		},
+		{
+			name: "create directory true - no error - 0700 permissions",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				storageDir := filepath.Join(t.TempDir(), uuid.NewString())
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = storageDir
+				cfg.CreateDirectory = true
+				cfg.DirectoryPermissions = "0700"
+				return cfg
+			},
+			err: nil,
+		},
+		{
+			name: "create directory false - error",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				storageDir := filepath.Join(t.TempDir(), uuid.NewString())
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = storageDir
+				cfg.CreateDirectory = false
+				return cfg
+			},
+			err: os.ErrNotExist,
+		},
+		{
+			name: "create directory true - invalid permissions",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				storageDir := filepath.Join(t.TempDir(), uuid.NewString())
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = storageDir
+				cfg.CreateDirectory = true
+				cfg.DirectoryPermissions = "invalid string"
+				return cfg
+			},
+			err: errInvalidOctal,
+		},
+		{
+			name: "create directory true - rwxr--r-- (should be octal string)",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				storageDir := filepath.Join(t.TempDir(), uuid.NewString())
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = storageDir
+				cfg.CreateDirectory = true
+				cfg.DirectoryPermissions = "rwxr--r--"
+				return cfg
+			},
+			err: errInvalidOctal,
+		},
+		{
+			name: "create directory true - 0778 (invalid octal)",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				storageDir := filepath.Join(t.TempDir(), uuid.NewString())
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = storageDir
+				cfg.CreateDirectory = true
+				cfg.DirectoryPermissions = "0778"
+				return cfg
+			},
+			err: errInvalidOctal,
+		},
+		{
+			name: "create directory true - 07771 (invalid permission bits)",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				storageDir := filepath.Join(t.TempDir(), uuid.NewString())
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = storageDir
+				cfg.CreateDirectory = true
+				cfg.DirectoryPermissions = "07771"
+				return cfg
+			},
+			err: errInvalidPermissionBits,
+		},
+		{
+			name: "create directory false - 07771 (invalid string) - no error",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = t.TempDir()
+				cfg.CreateDirectory = false
+				cfg.DirectoryPermissions = "07771"
+				return cfg
+			},
+			err: nil,
+		},
+		{
+			name: "max transaction size below zero - error",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = t.TempDir()
+				cfg.Compaction.MaxTransactionSize = -1
+				return cfg
+			},
+			errMsg: "max transaction size for compaction cannot be less than 0",
+		},
+		{
+			name: "max size below zero - error",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = t.TempDir()
+				cfg.MaxSize = -1
+				return cfg
+			},
+			errMsg: "max size cannot be less than 0",
+		},
+		{
+			name: "max size above int max - error",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				if strconv.IntSize == 64 {
+					t.Skip("int64 max matches native int max on this platform")
+				}
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = t.TempDir()
+				cfg.MaxSize = int64(math.MaxInt32) + 1
+				return cfg
+			},
+			errMsg: "max size is too large",
+		},
+		{
+			name: "rebound needed threshold above max size - error",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = t.TempDir()
+				cfg.MaxSize = 32 * oneMiB
+				cfg.Compaction.OnRebound = true
+				cfg.Compaction.Directory = t.TempDir()
+				cfg.Compaction.ReboundNeededThresholdMiB = 64
+				return cfg
+			},
+			errMsg: "compaction rebound needed threshold cannot be greater than max size",
+		},
+		{
+			name: "rebound trigger threshold above max size - error",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = t.TempDir()
+				cfg.MaxSize = 32 * oneMiB
+				cfg.Compaction.OnRebound = true
+				cfg.Compaction.Directory = t.TempDir()
+				cfg.Compaction.ReboundNeededThresholdMiB = 16
+				cfg.Compaction.ReboundTriggerThresholdMiB = 64
+				return cfg
+			},
+			errMsg: "compaction rebound trigger threshold cannot be greater than max size",
+		},
+		{
+			name: "rebound thresholds above max size allowed when rebound compaction disabled",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = t.TempDir()
+				cfg.MaxSize = 1 * oneMiB
+				cfg.Compaction.OnRebound = false
+				return cfg
+			},
+			err: nil,
+		},
+		{
+			name: "rebound check interval not positive - error",
+			config: func(t *testing.T, f extension.Factory) *Config {
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = t.TempDir()
+				cfg.Compaction.Directory = t.TempDir()
+				cfg.Compaction.OnRebound = true
+				cfg.Compaction.CheckInterval = 0
+				return cfg
+			},
+			errMsg: "compaction check interval must be positive when rebound compaction is set",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := NewFactory()
+			config := tt.config(t, f)
+			err := config.Validate()
+			if tt.err != nil {
+				require.ErrorIs(t, err, tt.err)
+				return
+			}
+			if tt.errMsg != "" {
+				require.EqualError(t, err, tt.errMsg)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestValidateReturnsAccessProblem(t *testing.T) {
+	f := NewFactory()
+	cfg := f.CreateDefaultConfig().(*Config)
+	cfg.Directory = "\x00"
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	require.Contains(t, strings.ToLower(err.Error()), "problem accessing configured directory: \x00, err: stat \x00")
+}
+
+func TestCompactionDirectory(t *testing.T) {
+	f := NewFactory()
+	tests := []struct {
+		name   string
+		config func(*testing.T) *Config
+		err    error
+	}{
+		{
+			name: "directory-must-exists-error",
+			config: func(t *testing.T) *Config {
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = t.TempDir()             // actual directory
+				cfg.Compaction.Directory = "/not/a/dir" // not a directory
+				cfg.Compaction.OnRebound = true
+				cfg.Compaction.OnStart = true
+				return cfg
+			},
+			err: os.ErrNotExist,
+		},
+		{
+			name: "directory-must-exists-error-on-start",
+			config: func(t *testing.T) *Config {
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = t.TempDir()             // actual directory
+				cfg.Compaction.Directory = "/not/a/dir" // not a directory
+				cfg.Compaction.OnRebound = false
+				cfg.Compaction.OnStart = true
+				return cfg
+			},
+			err: os.ErrNotExist,
+		},
+		{
+			name: "directory-must-exists-error-on-rebound",
+			config: func(t *testing.T) *Config {
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = t.TempDir()             // actual directory
+				cfg.Compaction.Directory = "/not/a/dir" // not a directory
+				cfg.Compaction.OnRebound = true
+				cfg.Compaction.OnStart = false
+				return cfg
+			},
+			err: os.ErrNotExist,
+		},
+		{
+			name: "compaction-disabled-no-error",
+			config: func(t *testing.T) *Config {
+				cfg := f.CreateDefaultConfig().(*Config)
+				cfg.Directory = t.TempDir()             // actual directory
+				cfg.Compaction.Directory = "/not/a/dir" // not a directory
+				cfg.Compaction.OnRebound = false
+				cfg.Compaction.OnStart = false
+				return cfg
+			},
+			err: nil,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.ErrorIs(t, confmap.Validate(test.config(t)), test.err)
+		})
+	}
 }

@@ -1,0 +1,4 @@
+status:
+  codeowners:
+    active: [rakesh-garimella, jinja2]
+    emeritus: [dmitryax]

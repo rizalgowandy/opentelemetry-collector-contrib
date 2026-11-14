@@ -1,0 +1,18 @@
+type: stef
+display_name: STEF Exporter
+
+status:
+  class: exporter
+  stability:
+    alpha: [metrics]
+  distributions: [contrib]
+  codeowners:
+    active: [tigrannajaryan]
+    emeritus: [dmitryax]
+sending_queue:
+  support: default
+
+tests:
+  config:
+    endpoint: "http://localhost:0"
+  expect_consumer_error: true

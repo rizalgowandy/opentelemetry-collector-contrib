@@ -1,0 +1,139 @@
+name: scoped-test
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# Do not cancel this workflow on main. See https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/16616
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  changedfiles:
+    runs-on: ubuntu-slim
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    outputs:
+      go_sources: ${{ steps.limit.outputs.go_sources }}
+      go_tests: ${{ steps.limit.outputs.go_tests }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Get changed files
+        id: changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          list-files: shell
+          predicate-quantifier: some-with-excludes
+          filters: |
+            go_sources:
+              - '**/*.go'
+              - '!**/*_test.go'
+            go_tests:
+              - '**/*_test.go'
+
+      - name: Apply file-count limit
+        shell: bash
+        id: limit
+        env:
+          GO_SOURCES: ${{ steps.changes.outputs.go_sources_files }}
+          GO_TESTS: ${{ steps.changes.outputs.go_tests_files }}
+        # Skip scoped tests if too many files are changed
+        run: |
+          LIMIT=50
+
+          echo go_sources
+          echo "$GO_SOURCES"
+          if [[ -n "$GO_SOURCES" ]]; then
+            count=$(echo "$GO_SOURCES" | wc -w)
+            if [ "$count" -gt "$LIMIT" ]; then
+              echo "Skipping scoped go_sources: This PR modified $count .go files which is over the $LIMIT files threshold."
+            else
+              echo "go_sources=$GO_SOURCES" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          echo go_tests
+          echo "$GO_TESTS"
+          if [[ -n "$GO_TESTS" ]]; then
+            count=$(echo "$GO_TESTS" | wc -w)
+            if [ "$count" -gt "$LIMIT" ]; then
+              echo "Skipping scoped go_tests: This PR modified $count test files which is over the $LIMIT files threshold."
+            else
+              echo "go_tests=$GO_TESTS" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  scoped-tests-matrix:
+    needs: changedfiles
+    if: needs.changedfiles.outputs.go_sources != '' || needs.changedfiles.outputs.go_tests != ''
+    strategy:
+      matrix:
+        runner: [windows-2022, windows-2025, windows-11-vs2026-arm, ubuntu-latest]
+    runs-on: ${{ matrix.runner }}
+    env:
+      # The gcc installed on the Windows arm64 runner doesn't ship native ARM libraries so we need to disable CGO.
+      CGO_ENABLED: ${{ matrix.runner == 'windows-11-vs2026-arm' && '0' || '' }}
+      # On the disk-constrained Windows runners, free the Go caches between
+      # components once free space drops below this many MiB so a large affected
+      # set does not exhaust the disk. Left empty on Linux, which has plenty of
+      # disk after free-disk-space.sh runs in setup-go-tools.
+      FREE_DISK_THRESHOLD_MIB: ${{ startsWith(matrix.runner, 'windows') && '4096' || '' }}
+    steps:
+      - name: Echo changed files
+        shell: bash
+        env:
+          CHANGED_GOLANG_SOURCES: ${{ needs.changedfiles.outputs.go_sources }}
+          CHANGED_GOLANG_TESTS: ${{ needs.changedfiles.outputs.go_tests }}
+        run: |
+          echo "go_sources: ${CHANGED_GOLANG_SOURCES}"
+          echo "go_tests: ${CHANGED_GOLANG_TESTS}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup-go-tools
+        with:
+          go-version: oldstable
+          gomoddownload: "false"
+
+      - name: Run changed tests
+        if: needs.changedfiles.outputs.go_tests
+        env:
+          CHANGED_GOLANG_TESTS: ${{ needs.changedfiles.outputs.go_tests }}
+        run: |
+          make run-changed-tests
+
+      - name: Run tests on dependent components
+        if: needs.changedfiles.outputs.go_sources
+        env:
+          CHANGED_GOLANG_SOURCES: ${{ needs.changedfiles.outputs.go_sources }}
+        shell: bash
+        run: |
+            make for-affected-components CMD="make test-twice"
+
+      - run: ./.github/workflows/scripts/check-disk-space.sh
+
+  scoped-tests:
+    # Keeps the name of the job required for merging in the GH configuration, make it
+    # wait for all runners completion
+    runs-on: ubuntu-slim
+    needs: [scoped-tests-matrix]
+    steps:
+      - name: Print result
+        run: echo ${{ needs.scoped-tests-matrix.result }}
+      - name: Interpret result
+        run: |
+          if [[ success == ${{ needs.scoped-tests-matrix.result }} ]]
+          then
+            echo "All matrix jobs passed!"
+          else
+            echo "One or more matrix jobs failed."
+            false
+          fi

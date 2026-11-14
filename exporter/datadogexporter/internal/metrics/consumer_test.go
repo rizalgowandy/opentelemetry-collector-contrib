@@ -1,0 +1,240 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package metrics
+
+import (
+	"context"
+	"testing"
+
+	"github.com/DataDog/datadog-agent/comp/otelcol/otlp/testutil"
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes"
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/attributes/source"
+	"github.com/DataDog/datadog-agent/pkg/opentelemetry-mapping-go/otlp/metrics"
+	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.uber.org/zap"
+)
+
+type testProvider string
+
+func (t testProvider) Source(context.Context) (source.Source, error) {
+	return source.Source{Kind: source.HostnameKind, Identifier: string(t), SourceIdentifier: source.SourceIdentifier{Primary: string(t)}}, nil //nolint:staticcheck // SA1019: dual-write during Source.Identifier migration (datadog-agent#51116) so not-yet-migrated readers (e.g. otlp/metrics fallback hostname) still see a value
+}
+
+func newTranslator(t *testing.T, logger *zap.Logger, opts ...metrics.TranslatorOption) metrics.Provider {
+	set := componenttest.NewNopTelemetrySettings()
+	set.Logger = logger
+	attributesTranslator, err := attributes.NewTranslator(set)
+	require.NoError(t, err)
+	tr, err := metrics.NewDefaultTranslator(set, attributesTranslator, append([]metrics.TranslatorOption{
+		metrics.WithHistogramMode(metrics.HistogramModeDistributions),
+		metrics.WithNumberMode(metrics.NumberModeCumulativeToDelta),
+		metrics.WithFallbackSourceProvider(testProvider("fallbackHostname")),
+	}, opts...)...)
+	require.NoError(t, err)
+	return tr
+}
+
+func addTestMetric(_ *testing.T, rm pmetric.ResourceMetrics) {
+	met := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	met.SetEmptyGauge()
+	met.SetName("test.metric")
+	met.Gauge().DataPoints().AppendEmpty().SetDoubleValue(1.0)
+}
+
+func TestRunningMetrics(t *testing.T) {
+	ms := pmetric.NewMetrics()
+	rms := ms.ResourceMetrics()
+
+	rm := rms.AppendEmpty()
+	resAttrs := rm.Resource().Attributes()
+	resAttrs.PutStr(attributes.AttributeDatadogHostname, "resource-hostname-1")
+	addTestMetric(t, rm)
+
+	rm = rms.AppendEmpty()
+	resAttrs = rm.Resource().Attributes()
+	resAttrs.PutStr(attributes.AttributeDatadogHostname, "resource-hostname-1")
+	addTestMetric(t, rm)
+
+	rm = rms.AppendEmpty()
+	resAttrs = rm.Resource().Attributes()
+	resAttrs.PutStr(attributes.AttributeDatadogHostname, "resource-hostname-2")
+	addTestMetric(t, rm)
+
+	rm = rms.AppendEmpty()
+	addTestMetric(t, rm)
+
+	logger, _ := zap.NewProduction()
+	tr := newTranslator(t, logger)
+
+	ctx := t.Context()
+	consumer := NewConsumer(nil)
+	metadata, err := tr.MapMetrics(ctx, ms, consumer, nil)
+	assert.NoError(t, err)
+
+	var runningHostnames []string
+	for _, metric := range consumer.runningMetrics(0, component.BuildInfo{}, metadata) {
+		for _, res := range metric.Resources {
+			runningHostnames = append(runningHostnames, *res.Name)
+		}
+	}
+
+	assert.ElementsMatch(t,
+		runningHostnames,
+		[]string{"fallbackHostname", "resource-hostname-1", "resource-hostname-2"},
+	)
+}
+
+func TestTagsMetrics(t *testing.T) {
+	ms := pmetric.NewMetrics()
+	rms := ms.ResourceMetrics()
+
+	rm := rms.AppendEmpty()
+	baseAttrs := testutil.NewAttributeMap(map[string]string{
+		"cloud.provider":        "aws",
+		"cloud.platform":        "aws_ecs",
+		"aws.ecs.task.family":   "example-task-family",
+		"aws.ecs.task.revision": "example-task-revision",
+		"aws.ecs.launchtype":    "fargate",
+	})
+	baseAttrs.CopyTo(rm.Resource().Attributes())
+	rm.Resource().Attributes().PutStr("aws.ecs.task.arn", "task-arn-1")
+	addTestMetric(t, rm)
+
+	rm = rms.AppendEmpty()
+	baseAttrs.CopyTo(rm.Resource().Attributes())
+	rm.Resource().Attributes().PutStr("aws.ecs.task.arn", "task-arn-2")
+	addTestMetric(t, rm)
+
+	rm = rms.AppendEmpty()
+	baseAttrs.CopyTo(rm.Resource().Attributes())
+	rm.Resource().Attributes().PutStr("aws.ecs.task.arn", "task-arn-3")
+	addTestMetric(t, rm)
+
+	logger, _ := zap.NewProduction()
+	tr := newTranslator(t, logger)
+
+	ctx := t.Context()
+	consumer := NewConsumer(nil)
+	metadata, err := tr.MapMetrics(ctx, ms, consumer, nil)
+	assert.NoError(t, err)
+
+	runningMetrics := consumer.runningMetrics(0, component.BuildInfo{}, metadata)
+	var runningTags []string
+	var runningHostnames []string
+	for _, metric := range runningMetrics {
+		runningTags = append(runningTags, metric.Tags...)
+		for _, res := range metric.Resources {
+			runningHostnames = append(runningHostnames, *res.Name)
+		}
+	}
+
+	assert.ElementsMatch(t, runningHostnames, []string{"", "", ""})
+	assert.Len(t, runningMetrics, 3)
+	assert.ElementsMatch(t, runningTags, []string{"task_arn:task-arn-1", "task_arn:task-arn-2", "task_arn:task-arn-3"})
+
+	var runningMetricNames []string
+	for _, metric := range runningMetrics {
+		runningMetricNames = append(runningMetricNames, metric.Metric)
+	}
+	assert.ElementsMatch(t,
+		runningMetricNames,
+		[]string{
+			"otel.datadog_exporter.metrics.running.fargate",
+			"otel.datadog_exporter.metrics.running.fargate",
+			"otel.datadog_exporter.metrics.running.fargate",
+		},
+	)
+}
+
+func addTestMetricWithUnit(_ *testing.T, rm pmetric.ResourceMetrics, name, unit string) {
+	met := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	met.SetEmptyGauge()
+	met.SetName(name)
+	met.SetUnit(unit)
+	met.Gauge().DataPoints().AppendEmpty().SetDoubleValue(1.0)
+}
+
+func TestConsumeTimeSeriesUnits(t *testing.T) {
+	ms := pmetric.NewMetrics()
+	rm := ms.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr(attributes.AttributeDatadogHostname, "test-host")
+	addTestMetricWithUnit(t, rm, "bytes.metric", "By")
+	addTestMetricWithUnit(t, rm, "rate.metric", "By/s")
+	addTestMetricWithUnit(t, rm, "dimensionless.metric", "1")
+	addTestMetricWithUnit(t, rm, "unmappable.metric", "not-a-ucum-unit")
+
+	// With units enabled
+	tr := newTranslator(t, zap.NewNop(), metrics.WithUnits())
+	consumer := NewConsumer(nil)
+	_, err := tr.MapMetrics(t.Context(), ms, consumer, nil)
+	require.NoError(t, err)
+
+	require.Len(t, consumer.ms, 4)
+	assert.Equal(t, "byte", *consumer.ms[0].Unit)
+	assert.Equal(t, "byte/second", *consumer.ms[1].Unit)
+	assert.Nil(t, consumer.ms[2].Unit)
+	assert.Nil(t, consumer.ms[3].Unit)
+
+	// With units disabled
+	tr = newTranslator(t, zap.NewNop())
+	consumer = NewConsumer(nil)
+	_, err = tr.MapMetrics(t.Context(), ms, consumer, nil)
+	require.NoError(t, err)
+	require.Len(t, consumer.ms, 4)
+	for _, m := range consumer.ms {
+		assert.Nil(t, m.Unit)
+	}
+}
+
+func TestToDataType(t *testing.T) {
+	consumer := NewConsumer(nil)
+	for _, tt := range []struct {
+		name string
+		in   metrics.DataType
+		want datadogV2.MetricIntakeType
+	}{
+		{"count", metrics.Count, datadogV2.METRICINTAKETYPE_COUNT},
+		{"gauge", metrics.Gauge, datadogV2.METRICINTAKETYPE_GAUGE},
+		// Rate is reachable when an OTLP delta-sum datapoint carries the
+		// datadog.metric.as_type=rate attribute; before this case existed it fell
+		// through to METRICINTAKETYPE_UNSPECIFIED and the metric was silently dropped.
+		{"rate", metrics.Rate, datadogV2.METRICINTAKETYPE_RATE},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, consumer.toDataType(tt.in))
+		})
+	}
+}
+
+func TestAzureContainerAppsRunningMetric(t *testing.T) {
+	consumer := NewConsumer(nil)
+	tags := []string{
+		"replica:replica-1",
+		"name:my-app",
+		"subscription_id:sub-123",
+		"resource_group:my-rg",
+	}
+	consumer.ConsumeTagSet("azurecontainerapps", tags)
+	// Same tags — should deduplicate
+	consumer.ConsumeTagSet("azurecontainerapps", tags)
+
+	series, _ := consumer.All(uint64(1e9), component.BuildInfo{}, nil, metrics.Metadata{})
+
+	var acaSeries []datadogV2.MetricSeries
+	for _, s := range series {
+		if s.GetMetric() == "otel.datadog_exporter.metrics.running.azurecontainerapps" {
+			acaSeries = append(acaSeries, s)
+		}
+	}
+	require.Len(t, acaSeries, 1, "expected exactly one ACA metric (dedup check)")
+	assert.Contains(t, acaSeries[0].Tags, "replica:replica-1")
+	assert.Contains(t, acaSeries[0].Tags, "name:my-app")
+	assert.Contains(t, acaSeries[0].Tags, "subscription_id:sub-123")
+	assert.Contains(t, acaSeries[0].Tags, "resource_group:my-rg")
+}

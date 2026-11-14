@@ -1,78 +1,151 @@
-// Copyright 2019 OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package awskinesisexporter
+package awskinesisexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awskinesisexporter"
 
 import (
 	"context"
+	"errors"
+	"net/http"
 
-	awskinesis "github.com/signalfx/opencensus-go-exporter-kinesis"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/kinesis"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/consumer/consumererror"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	jaegertranslator "go.opentelemetry.io/collector/translator/trace/jaeger"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awskinesisexporter/internal/batch"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awskinesisexporter/internal/producer"
 )
 
-// Exporter implements an OpenTelemetry trace exporter that exports all spans to AWS Kinesis
-type Exporter struct {
-	awskinesis *awskinesis.Exporter
-	logger     *zap.Logger
+// kinesisExporter implements an OpenTelemetry trace exporter that exports all spans to AWS Kinesis
+type kinesisExporter struct {
+	producer producer.Batcher
+	batcher  batch.Encoder
 }
 
-var _ component.TracesExporter = (*Exporter)(nil)
-
-// Start tells the exporter to start. The exporter may prepare for exporting
-// by connecting to the endpoint. Host parameter can be used for communicating
-// with the host after Start() has already returned. If error is returned by
-// Start() then the collector startup will be aborted.
-func (e Exporter) Start(_ context.Context, _ component.Host) error {
-	return nil
+// options is used to override the default shipped behavior
+// to allow for testing correct setup of components
+type options struct {
+	NewKinesisClient func(conf aws.Config, opts ...func(*kinesis.Options)) *kinesis.Client
 }
 
-// Capabilities implements the consumer interface.
-func (e Exporter) Capabilities() consumer.Capabilities {
-	return consumer.Capabilities{MutatesData: false}
+func createExporter(ctx context.Context, c component.Config, log *zap.Logger, opts ...func(opt *options)) (*kinesisExporter, error) {
+	options := &options{
+		NewKinesisClient: kinesis.NewFromConfig,
+	}
+
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	conf, ok := c.(*Config)
+	if !ok || conf == nil {
+		return nil, errors.New("incorrect config provided")
+	}
+
+	var configOpts []func(*awsconfig.LoadOptions) error
+	if conf.AWS.Region != "" {
+		configOpts = append(configOpts, func(lo *awsconfig.LoadOptions) error {
+			lo.Region = conf.AWS.Region
+			return nil
+		})
+	}
+
+	idleConnTimeout := conf.IdleConnTimeout
+	if idleConnTimeout == 0 {
+		idleConnTimeout = defaultIdleConnTimeout
+	}
+	httpClient := awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+		tr.IdleConnTimeout = idleConnTimeout
+	})
+	configOpts = append(configOpts, awsconfig.WithHTTPClient(httpClient))
+
+	awsconf, err := awsconfig.LoadDefaultConfig(ctx, configOpts...)
+	if err != nil {
+		return nil, err
+	}
+
+	var kinesisOpts []func(*kinesis.Options)
+	if conf.AWS.Role != "" {
+		kinesisOpts = append(kinesisOpts, func(o *kinesis.Options) {
+			roleProvider := stscreds.NewAssumeRoleProvider(
+				sts.NewFromConfig(awsconf),
+				conf.AWS.Role,
+			)
+			o.Credentials = aws.NewCredentialsCache(roleProvider)
+		})
+	}
+
+	if conf.AWS.KinesisEndpoint != "" {
+		kinesisOpts = append(kinesisOpts,
+			func(o *kinesis.Options) {
+				o.BaseEndpoint = aws.String(conf.AWS.KinesisEndpoint)
+			},
+		)
+	}
+
+	producer, err := producer.NewBatcher(
+		options.NewKinesisClient(awsconf, kinesisOpts...),
+		conf.AWS.StreamName,
+		producer.WithLogger(log),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	encoder, err := batch.NewEncoder(
+		conf.Encoding.Name,
+		batch.WithMaxRecordSize(conf.MaxRecordSize),
+		batch.WithMaxRecordsPerBatch(conf.MaxRecordsPerBatch),
+		batch.WithCompressionType(conf.Encoding.Compression),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if conf.Encoding.Name == "otlp_json" {
+		log.Info("otlp_json is considered experimental and should not be used in a production environment")
+	}
+
+	return &kinesisExporter{
+		producer: producer,
+		batcher:  encoder,
+	}, nil
 }
 
-// Shutdown is invoked during exporter shutdown.
-func (e Exporter) Shutdown(context.Context) error {
-	e.awskinesis.Flush()
-	return nil
+// start validates that the Kinesis stream is available.
+func (e kinesisExporter) start(ctx context.Context, _ component.Host) error {
+	return e.producer.Ready(ctx)
 }
 
 // ConsumeTraces receives a span batch and exports it to AWS Kinesis
-func (e Exporter) ConsumeTraces(_ context.Context, td pdata.Traces) error {
-	pBatches, err := jaegertranslator.InternalTracesToJaegerProto(td)
+func (e kinesisExporter) consumeTraces(ctx context.Context, td ptrace.Traces) error {
+	bt, err := e.batcher.Traces(td)
 	if err != nil {
-		e.logger.Error("error translating span batch", zap.Error(err))
-		return consumererror.Permanent(err)
+		return err
 	}
-	// TODO: Use a multi error type
-	var exportErr error
-	for _, pBatch := range pBatches {
-		for _, span := range pBatch.GetSpans() {
-			if span.Process == nil {
-				span.Process = pBatch.Process
-			}
-			err := e.awskinesis.ExportSpan(span)
-			if err != nil {
-				e.logger.Error("error exporting span to awskinesis", zap.Error(err))
-				exportErr = err
-			}
-		}
+	return e.producer.Put(ctx, bt)
+}
+
+func (e kinesisExporter) consumeMetrics(ctx context.Context, md pmetric.Metrics) error {
+	bt, err := e.batcher.Metrics(md)
+	if err != nil {
+		return err
 	}
-	return exportErr
+	return e.producer.Put(ctx, bt)
+}
+
+func (e kinesisExporter) consumeLogs(ctx context.Context, ld plog.Logs) error {
+	bt, err := e.batcher.Logs(ld)
+	if err != nil {
+		return err
+	}
+	return e.producer.Put(ctx, bt)
 }

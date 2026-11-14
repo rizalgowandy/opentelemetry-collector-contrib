@@ -106,6 +106,8 @@ keyspace_hits:0
 keyspace_misses:0
 pubsub_channels:0
 pubsub_patterns:0
+pubsub_shardchannels:0
+pubsub_clients:0
 latest_fork_usec:0
 migrate_cached_sockets:0
 slave_expires_tracked_keys:0
@@ -113,6 +115,7 @@ active_defrag_hits:0
 active_defrag_misses:0
 active_defrag_key_hits:0
 active_defrag_key_misses:0
+tracking_total_keys:1
 
 # Replication
 role:master
@@ -131,6 +134,8 @@ used_cpu_sys:185.649184
 used_cpu_user:46.396430
 used_cpu_sys_children:0.002354
 used_cpu_user_children:0.001619
+used_cpu_sys_main_thread:180.0
+used_cpu_user_main_thread:42.39
 
 # Cluster
 cluster_enabled:0
@@ -138,3 +143,11 @@ cluster_enabled:0
 # Keyspace
 db0:keys=1,expires=2,avg_ttl=3
 db1:keys=4,expires=5,avg_ttl=6
+db3:keys=5,expires=10,avg_ttl=85
+
+# Commandstats
+cmdstat_ssubscribe:calls=0,usec=0,usec_per_call=0.00,rejected_calls=3,failed_calls=0
+cmdstat_zrem:calls=641,usec=1884,usec_per_call=2.94,rejected_calls=0,failed_calls=0
+cmdstat_incrbyfloat:calls=50340,usec=902409,usec_per_call=17.93,rejected_calls=0,failed_calls=0
+cmdstat_lrange:calls=12495,usec=48886,usec_per_call=3.91,rejected_calls=0,failed_calls=14
+cmdstat_mset:calls=4505,usec=65693,usec_per_call=14.58,rejected_calls=0,failed_calls=3

@@ -1,65 +1,70 @@
-// Copyright 2019, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package awsxrayexporter
 
 import (
-	"path"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configtest"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsxrayexporter/internal/metadata"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/awsutil"
 )
 
 func TestLoadConfig(t *testing.T) {
-	factories, err := componenttest.NopFactories()
-	assert.Nil(t, err)
+	t.Parallel()
 
-	factory := NewFactory()
-	factories.Exporters[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
-
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
 	require.NoError(t, err)
-	require.NotNil(t, cfg)
 
-	assert.Equal(t, len(cfg.Exporters), 2)
-
-	r0 := cfg.Exporters[config.NewID(typeStr)]
-	assert.Equal(t, r0, factory.CreateDefaultConfig())
-
-	r1 := cfg.Exporters[config.NewIDWithName(typeStr, "customname")].(*Config)
-	assert.Equal(t, r1,
-		&Config{
-			ExporterSettings: config.NewExporterSettings(config.NewIDWithName(typeStr, "customname")),
-			AWSSessionSettings: awsutil.AWSSessionSettings{
-				NumberOfWorkers:       8,
-				Endpoint:              "",
-				RequestTimeoutSeconds: 30,
-				MaxRetries:            2,
-				NoVerifySSL:           false,
-				ProxyAddress:          "",
-				Region:                "eu-west-1",
-				LocalMode:             false,
-				ResourceARN:           "arn:aws:ec2:us-east1:123456789:instance/i-293hiuhe0u",
-				RoleARN:               "arn:aws:iam::123456789:role/monitoring-EKS-NodeInstanceRole",
+	tests := []struct {
+		id       component.ID
+		expected component.Config
+	}{
+		{
+			id:       component.NewIDWithName(metadata.Type, ""),
+			expected: createDefaultConfig(),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "customname"),
+			expected: &Config{
+				AWSSessionSettings: awsutil.AWSSessionSettings{
+					NumberOfWorkers:       8,
+					Endpoint:              "",
+					RequestTimeoutSeconds: 120,
+					MaxRetries:            2,
+					NoVerifySSL:           false,
+					ProxyAddress:          "",
+					Region:                "eu-west-1",
+					LocalMode:             false,
+					ResourceARN:           "arn:aws:ec2:us-east1:123456789:instance/i-293hiuhe0u",
+					RoleARN:               "arn:aws:iam::123456789:role/monitoring-EKS-NodeInstanceRole",
+				},
+				IndexedAttributes:       []string{"indexed_attr_0", "indexed_attr_1"},
+				IndexAllAttributes:      false,
+				LogGroupNames:           []string{"group1", "group2"},
+				skipTimestampValidation: false,
 			},
-			IndexedAttributes:  []string{"indexed_attr_0", "indexed_attr_1"},
-			IndexAllAttributes: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
+
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			assert.NoError(t, confmap.Validate(cfg))
+			assert.Equal(t, tt.expected, cfg)
 		})
+	}
 }

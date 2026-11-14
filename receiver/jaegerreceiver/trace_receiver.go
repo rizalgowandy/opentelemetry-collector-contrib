@@ -1,0 +1,410 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package jaegerreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/jaegerreceiver"
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"html"
+	"io"
+	"math"
+	"mime"
+	"net/http"
+	"sync"
+
+	apacheThrift "github.com/apache/thrift/lib/go/thrift"
+	"github.com/jaegertracing/jaeger-idl/model/v1"
+	"github.com/jaegertracing/jaeger-idl/proto-gen/api_v2"
+	"github.com/jaegertracing/jaeger-idl/thrift-gen/agent"
+	"github.com/jaegertracing/jaeger-idl/thrift-gen/jaeger"
+	"github.com/jaegertracing/jaeger-idl/thrift-gen/zipkincore"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componentstatus"
+	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/receiver/receiverhelper"
+	"go.uber.org/multierr"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+
+	jaegertranslator "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/jaeger"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/jaegerreceiver/internal/udpserver"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/jaegerreceiver/internal/udpserver/thriftudp"
+)
+
+// Receiver type is used to receive spans that were originally intended to be sent to Jaeger.
+// This receiver is basically a Jaeger collector.
+type jReceiver struct {
+	nextConsumer consumer.Traces
+	id           component.ID
+
+	config Protocols
+
+	grpc            *grpc.Server
+	collectorServer *http.Server
+
+	agentProcessors []*udpserver.ThriftProcessor
+
+	goroutines sync.WaitGroup
+
+	settings receiver.Settings
+
+	grpcObsrecv *receiverhelper.ObsReport
+	httpObsrecv *receiverhelper.ObsReport
+}
+
+const (
+	agentTransportBinary   = "udp_thrift_binary"
+	agentTransportCompact  = "udp_thrift_compact"
+	collectorHTTPTransport = "collector_http"
+	grpcTransport          = "grpc"
+
+	thriftFormat   = "thrift"
+	protobufFormat = "protobuf"
+)
+
+var acceptedThriftFormats = map[string]struct{}{
+	"application/x-thrift":                 {},
+	"application/vnd.apache.thrift.binary": {},
+}
+
+// newJaegerReceiver creates a TracesReceiver that receives traffic as a Jaeger collector, and
+// also as a Jaeger agent.
+func newJaegerReceiver(
+	id component.ID,
+	config Protocols,
+	nextConsumer consumer.Traces,
+	set receiver.Settings,
+) (*jReceiver, error) {
+	grpcObsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{
+		ReceiverID:             id,
+		Transport:              grpcTransport,
+		ReceiverCreateSettings: set,
+	})
+	if err != nil {
+		return nil, err
+	}
+	httpObsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{
+		ReceiverID:             id,
+		Transport:              collectorHTTPTransport,
+		ReceiverCreateSettings: set,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &jReceiver{
+		config:       config,
+		nextConsumer: nextConsumer,
+		id:           id,
+		settings:     set,
+		grpcObsrecv:  grpcObsrecv,
+		httpObsrecv:  httpObsrecv,
+	}, nil
+}
+
+func (jr *jReceiver) Start(ctx context.Context, host component.Host) error {
+	if err := jr.startAgent(); err != nil {
+		return err
+	}
+
+	return jr.startCollector(ctx, host)
+}
+
+func (jr *jReceiver) Shutdown(ctx context.Context) error {
+	var errs error
+
+	for _, processor := range jr.agentProcessors {
+		processor.Stop()
+	}
+
+	if jr.collectorServer != nil {
+		if cerr := jr.collectorServer.Shutdown(ctx); cerr != nil {
+			errs = multierr.Append(errs, cerr)
+		}
+	}
+	if jr.grpc != nil {
+		jr.grpc.GracefulStop()
+	}
+
+	jr.goroutines.Wait()
+	return errs
+}
+
+func consumeTraces(ctx context.Context, batch *jaeger.Batch, consumer consumer.Traces) (int, error) {
+	if batch == nil {
+		return 0, nil
+	}
+	td, err := jaegertranslator.ThriftToTraces(batch)
+	if err != nil {
+		return 0, err
+	}
+	return len(batch.Spans), consumer.ConsumeTraces(ctx, td)
+}
+
+var (
+	_ agent.Agent                   = (*agentHandler)(nil)
+	_ api_v2.CollectorServiceServer = (*jReceiver)(nil)
+)
+
+type agentHandler struct {
+	nextConsumer consumer.Traces
+	obsrecv      *receiverhelper.ObsReport
+}
+
+// EmitZipkinBatch is unsupported by the Jaeger receiver.
+func (*agentHandler) EmitZipkinBatch(context.Context, []*zipkincore.Span) error {
+	return errors.ErrUnsupported
+}
+
+// EmitBatch implements thrift-gen/agent/Agent and it forwards
+// Jaeger spans received by the Jaeger agent processor.
+func (h *agentHandler) EmitBatch(ctx context.Context, batch *jaeger.Batch) error {
+	ctx = h.obsrecv.StartTracesOp(ctx)
+	numSpans, err := consumeTraces(ctx, batch, h.nextConsumer)
+	h.obsrecv.EndTracesOp(ctx, thriftFormat, numSpans, err)
+	return err
+}
+
+func (jr *jReceiver) PostSpans(ctx context.Context, r *api_v2.PostSpansRequest) (*api_v2.PostSpansResponse, error) {
+	ctx = jr.grpcObsrecv.StartTracesOp(ctx)
+
+	batch := r.GetBatch()
+	td, err := jaegertranslator.ProtoToTraces([]*model.Batch{&batch})
+	if err != nil {
+		jr.grpcObsrecv.EndTracesOp(ctx, protobufFormat, len(batch.Spans), err)
+		return nil, err
+	}
+
+	err = jr.nextConsumer.ConsumeTraces(ctx, td)
+	jr.grpcObsrecv.EndTracesOp(ctx, protobufFormat, len(batch.Spans), err)
+	if err != nil {
+		return nil, err
+	}
+
+	return &api_v2.PostSpansResponse{}, nil
+}
+
+func (jr *jReceiver) startAgent() error {
+	if jr.config.ThriftBinaryUDP.HasValue() {
+		obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{
+			ReceiverID:             jr.id,
+			Transport:              agentTransportBinary,
+			ReceiverCreateSettings: jr.settings,
+		})
+		if err != nil {
+			return err
+		}
+
+		h := &agentHandler{
+			nextConsumer: jr.nextConsumer,
+			obsrecv:      obsrecv,
+		}
+		binaryUDPConfig := jr.config.ThriftBinaryUDP.Get()
+		processor, err := jr.buildProcessor(binaryUDPConfig.Endpoint, binaryUDPConfig.ServerConfigUDP, apacheThrift.NewTBinaryProtocolFactoryConf(nil), h)
+		if err != nil {
+			return err
+		}
+		jr.agentProcessors = append(jr.agentProcessors, processor)
+
+		jr.settings.Logger.Info("Starting UDP server for Binary Thrift", zap.String("endpoint", binaryUDPConfig.Endpoint))
+	}
+
+	if jr.config.ThriftCompactUDP.HasValue() {
+		obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{
+			ReceiverID:             jr.id,
+			Transport:              agentTransportCompact,
+			ReceiverCreateSettings: jr.settings,
+		})
+		if err != nil {
+			return err
+		}
+		h := &agentHandler{
+			nextConsumer: jr.nextConsumer,
+			obsrecv:      obsrecv,
+		}
+		compactUDPConfig := jr.config.ThriftCompactUDP.Get()
+		processor, err := jr.buildProcessor(compactUDPConfig.Endpoint, compactUDPConfig.ServerConfigUDP, apacheThrift.NewTCompactProtocolFactoryConf(nil), h)
+		if err != nil {
+			return err
+		}
+		jr.agentProcessors = append(jr.agentProcessors, processor)
+
+		jr.settings.Logger.Info("Starting UDP server for Compact Thrift", zap.String("endpoint", compactUDPConfig.Endpoint))
+	}
+
+	jr.goroutines.Add(len(jr.agentProcessors))
+	for _, processor := range jr.agentProcessors {
+		go func(p *udpserver.ThriftProcessor) {
+			defer jr.goroutines.Done()
+			p.Serve()
+		}(processor)
+	}
+
+	return nil
+}
+
+func (jr *jReceiver) buildProcessor(address string, cfg ServerConfigUDP, factory apacheThrift.TProtocolFactory, a agent.Agent) (*udpserver.ThriftProcessor, error) {
+	handler := agent.NewAgentProcessor(a)
+	transport, err := thriftudp.NewTUDPServerTransport(address)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.SocketBufferSize > 0 {
+		err = transport.SetSocketBufferSize(cfg.SocketBufferSize)
+		if err != nil {
+			return nil, err
+		}
+	}
+	server := udpserver.NewUDPServer(transport, cfg.QueueSize, cfg.MaxPacketSize)
+	processor, err := udpserver.NewThriftProcessor(server, cfg.Workers, factory, handler, jr.settings.Logger)
+	if err != nil {
+		return nil, err
+	}
+	return processor, nil
+}
+
+func (*jReceiver) decodeThriftHTTPBody(r *http.Request) (*jaeger.Batch, *httpError) {
+	bodyBytes, err := io.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil {
+		return nil, &httpError{
+			fmt.Sprintf("Unable to process request body: %v", err),
+			http.StatusInternalServerError,
+		}
+	}
+
+	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return nil, &httpError{
+			fmt.Sprintf("Cannot parse content type: %v", err),
+			http.StatusBadRequest,
+		}
+	}
+	if _, ok := acceptedThriftFormats[contentType]; !ok {
+		return nil, &httpError{
+			fmt.Sprintf("Unsupported content type: %v", contentType),
+			http.StatusBadRequest,
+		}
+	}
+
+	batch := &jaeger.Batch{}
+	if err = deserializeThriftBatch(r.Context(), bodyBytes, batch); err != nil {
+		return nil, &httpError{
+			fmt.Sprintf("Unable to process request body: %v", err),
+			http.StatusBadRequest,
+		}
+	}
+	return batch, nil
+}
+
+// deserializeThriftBatch decodes a Thrift-binary-encoded Jaeger batch from body.
+//
+// deserializeThriftBatch decodes a Thrift-binary-encoded Jaeger batch from body.
+//
+// The Thrift decoder pre-allocates _each collection_ to its _declared_ element
+// count, and rejects the collection only when count * size_of(element)
+// exceeds MaxMessageSize (100MB by default). A tiny payload can therefore
+// declare millions of elements and force a large allocation before the read
+// fails. Bounding MaxMessageSize to the body length rejects any collection that
+// declares more elements than the payload could hold, and never rejects a valid
+// message, whose elements are all present in the payload. Residual amplification
+// is analyzed in
+// https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/50628.
+func deserializeThriftBatch(ctx context.Context, body []byte, batch *jaeger.Batch) error {
+	cfg := &apacheThrift.TConfiguration{
+		MaxMessageSize: boundedThriftMessageSize(len(body)),
+	}
+	transport := apacheThrift.NewTMemoryBufferLen(len(body))
+	protocol := apacheThrift.NewTBinaryProtocolConf(transport, cfg)
+	tdes := &apacheThrift.TDeserializer{Transport: transport, Protocol: protocol}
+	return tdes.Read(ctx, batch, body)
+}
+
+// boundedThriftMessageSize clamps a payload length into the int32 range expected
+// by TConfiguration.MaxMessageSize. A non-positive length disables the bound (the
+// decoder then falls back to its default), and a length beyond math.MaxInt32 is
+// capped so the value never overflows.
+func boundedThriftMessageSize(bodyLen int) int32 {
+	if bodyLen > 0 && bodyLen < math.MaxInt32 {
+		return int32(bodyLen)
+	}
+	return math.MaxInt32
+}
+
+// HandleThriftHTTPBatch implements Jaeger HTTP Thrift handler.
+func (jr *jReceiver) HandleThriftHTTPBatch(w http.ResponseWriter, r *http.Request) {
+	ctx := jr.httpObsrecv.StartTracesOp(r.Context())
+
+	batch, hErr := jr.decodeThriftHTTPBody(r)
+	if hErr != nil {
+		http.Error(w, html.EscapeString(hErr.msg), hErr.statusCode)
+		jr.httpObsrecv.EndTracesOp(ctx, thriftFormat, 0, hErr)
+		return
+	}
+
+	numSpans, err := consumeTraces(ctx, batch, jr.nextConsumer)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Cannot submit Jaeger batch: %v", err), http.StatusInternalServerError)
+	} else {
+		w.WriteHeader(http.StatusAccepted)
+	}
+	jr.httpObsrecv.EndTracesOp(ctx, thriftFormat, numSpans, err)
+}
+
+func (jr *jReceiver) startCollector(ctx context.Context, host component.Host) error {
+	if jr.config.ThriftHTTP.HasValue() {
+		httpConfig := jr.config.ThriftHTTP.Get()
+		cln, err := httpConfig.ToListener(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to bind to Collector address %q: %w",
+				httpConfig.NetAddr.Endpoint, err)
+		}
+
+		nr := http.NewServeMux()
+		nr.HandleFunc("POST /api/traces", jr.HandleThriftHTTPBatch)
+		jr.collectorServer, err = httpConfig.ToServer(ctx, host.GetExtensions(), jr.settings.TelemetrySettings, nr)
+		if err != nil {
+			return err
+		}
+
+		jr.settings.Logger.Info(
+			"Starting HTTP server for Jaeger Thrift",
+			zap.String("endpoint", httpConfig.NetAddr.Endpoint),
+		)
+
+		jr.goroutines.Go(func() {
+			if errHTTP := jr.collectorServer.Serve(cln); !errors.Is(errHTTP, http.ErrServerClosed) && errHTTP != nil {
+				componentstatus.ReportStatus(host, componentstatus.NewFatalErrorEvent(errHTTP))
+			}
+		})
+	}
+
+	if jr.config.GRPC.HasValue() {
+		grpcConfig := jr.config.GRPC.Get()
+		var err error
+		jr.grpc, err = grpcConfig.ToServer(ctx, host.GetExtensions(), jr.settings.TelemetrySettings)
+		if err != nil {
+			return fmt.Errorf("failed to build the options for the Jaeger gRPC Collector: %w", err)
+		}
+
+		ln, err := grpcConfig.NetAddr.Listen(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to bind to gRPC address %q: %w", grpcConfig.NetAddr.Endpoint, err)
+		}
+
+		api_v2.RegisterCollectorServiceServer(jr.grpc, jr)
+
+		jr.settings.Logger.Info("Starting gRPC server for Jaeger Protobuf", zap.String("endpoint", grpcConfig.NetAddr.Endpoint))
+
+		jr.goroutines.Go(func() {
+			if errGrpc := jr.grpc.Serve(ln); !errors.Is(errGrpc, grpc.ErrServerStopped) && errGrpc != nil {
+				componentstatus.ReportStatus(host, componentstatus.NewFatalErrorEvent(errGrpc))
+			}
+		})
+	}
+
+	return nil
+}

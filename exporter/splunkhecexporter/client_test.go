@@ -1,44 +1,55 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 package splunkhecexporter
 
 import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"regexp"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/goccy/go-json"
+	"github.com/google/pprof/profile"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/consumer/consumererror"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/conventions"
+	"go.opentelemetry.io/collector/consumer/consumererror/xconsumererror"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pprofile"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/splunkhecexporter/internal/metadata"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/splunk"
+	translator "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/splunk"
 )
+
+var requestTimeRegex = regexp.MustCompile(`time":(\d+)`)
 
 type testRoundTripper func(req *http.Request) *http.Response
 
@@ -46,88 +57,138 @@ func (t testRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t(req), nil
 }
 
-func newTestClient(respCode int, respBody string) *http.Client {
+func newTestClient(respCode int, respBody string) (*http.Client, *[]http.Header) {
+	return newTestClientWithPresetResponses([]int{respCode}, []string{respBody}, func(_ []byte) {})
+}
+
+func newTestClientWithBodyReader(bodyReader func([]byte)) (*http.Client, *[]http.Header) {
+	return newTestClientWithPresetResponses([]int{http.StatusOK}, []string{"OK"}, bodyReader)
+}
+
+func newTestClientWithPresetResponses(codes []int, bodies []string, bodyReader func([]byte)) (*http.Client, *[]http.Header) {
+	index := 0
+	var headers []http.Header
+
 	return &http.Client{
 		Transport: testRoundTripper(func(req *http.Request) *http.Response {
+			code := codes[index%len(codes)]
+			body := bodies[index%len(bodies)]
+			index++
+
+			headers = append(headers, req.Header)
+
+			b, _ := io.ReadAll(req.Body)
+			bodyReader(b)
+
 			return &http.Response{
-				StatusCode: respCode,
-				Body:       ioutil.NopCloser(bytes.NewBufferString(respBody)),
+				StatusCode: code,
+				Request:    req,
+				Body:       io.NopCloser(bytes.NewBufferString(body)),
 				Header:     make(http.Header),
 			}
 		}),
-	}
+	}, &headers
 }
 
-func createMetricsData(numberOfDataPoints int) pdata.Metrics {
-
+func createMetricsData(resourcesNum, dataPointsNum int) pmetric.Metrics {
 	doubleVal := 1234.5678
-	metrics := pdata.NewMetrics()
-	rm := metrics.ResourceMetrics().AppendEmpty()
-	rm.Resource().Attributes().InsertString("k0", "v0")
-	rm.Resource().Attributes().InsertString("k1", "v1")
+	metrics := pmetric.NewMetrics()
 
-	for i := 0; i < numberOfDataPoints; i++ {
-		tsUnix := time.Unix(int64(i), int64(i)*time.Millisecond.Nanoseconds())
-
-		ilm := rm.InstrumentationLibraryMetrics().AppendEmpty()
-		metric := ilm.Metrics().AppendEmpty()
-		metric.SetName("gauge_double_with_dims")
-		metric.SetDataType(pdata.MetricDataTypeDoubleGauge)
-		doublePt := metric.DoubleGauge().DataPoints().AppendEmpty()
-		doublePt.SetTimestamp(pdata.TimestampFromTime(tsUnix))
-		doublePt.SetValue(doubleVal)
-		doublePt.LabelsMap().Insert("k/n0", "vn0")
-		doublePt.LabelsMap().Insert("k/n1", "vn1")
-		doublePt.LabelsMap().Insert("k/r0", "vr0")
-		doublePt.LabelsMap().Insert("k/r1", "vr1")
+	for i := range resourcesNum {
+		rm := metrics.ResourceMetrics().AppendEmpty()
+		rm.Resource().Attributes().PutStr("k0", fmt.Sprintf("v%d", i))
+		rm.Resource().Attributes().PutStr("k1", "v1")
+		for j := range dataPointsNum {
+			count := i*dataPointsNum + j
+			tsUnix := time.Unix(int64(count), int64(count)*time.Millisecond.Nanoseconds())
+			ilm := rm.ScopeMetrics().AppendEmpty()
+			metric := ilm.Metrics().AppendEmpty()
+			metric.SetName(fmt.Sprintf("gauge_double_with_dims_%d", j))
+			doublePt := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+			doublePt.SetTimestamp(pcommon.NewTimestampFromTime(tsUnix))
+			doublePt.SetDoubleValue(doubleVal)
+			doublePt.Attributes().PutStr("k/n0", "vn0")
+			doublePt.Attributes().PutStr("k/n1", "vn1")
+			doublePt.Attributes().PutStr("k/r0", "vr0")
+			doublePt.Attributes().PutStr("k/r1", "vr1")
+		}
 	}
 
 	return metrics
 }
 
-func createTraceData(numberOfTraces int) pdata.Traces {
-	traces := pdata.NewTraces()
+func createTraceData(resourcesNum, spansNum int) ptrace.Traces {
+	traces := ptrace.NewTraces()
 	rs := traces.ResourceSpans().AppendEmpty()
-	rs.Resource().Attributes().InsertString("resource", "R1")
-	ils := rs.InstrumentationLibrarySpans().AppendEmpty()
-	ils.Spans().Resize(numberOfTraces)
-	for i := 0; i < numberOfTraces; i++ {
-		span := ils.Spans().At(i)
-		span.SetName("root")
-		span.SetStartTimestamp(pdata.Timestamp((i + 1) * 1e9))
-		span.SetEndTimestamp(pdata.Timestamp((i + 2) * 1e9))
-		span.SetTraceID(pdata.NewTraceID([16]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}))
-		span.SetSpanID(pdata.NewSpanID([8]byte{0, 0, 0, 0, 0, 0, 0, 1}))
-		span.SetTraceState("foo")
-		if i%2 == 0 {
-			span.SetParentSpanID(pdata.NewSpanID([8]byte{1, 2, 3, 4, 5, 6, 7, 8}))
-			span.Status().SetCode(pdata.StatusCodeOk)
-			span.Status().SetMessage("ok")
+
+	for i := range resourcesNum {
+		rs.Resource().Attributes().PutStr("resource", fmt.Sprintf("R%d", i))
+		ils := rs.ScopeSpans().AppendEmpty()
+		ils.Spans().EnsureCapacity(spansNum)
+		for j := range spansNum {
+			span := ils.Spans().AppendEmpty()
+			span.SetName("root")
+			count := i*spansNum + j
+			span.SetStartTimestamp(pcommon.Timestamp((count + 1) * 1e9))
+			span.SetEndTimestamp(pcommon.Timestamp((count + 2) * 1e9))
+			span.SetTraceID([16]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1})
+			span.SetSpanID([8]byte{0, 0, 0, 0, 0, 0, 0, 1})
+			span.TraceState().FromRaw("foo")
+			if count%2 == 0 {
+				span.SetParentSpanID([8]byte{1, 2, 3, 4, 5, 6, 7, 8})
+				span.Status().SetCode(ptrace.StatusCodeOk)
+				span.Status().SetMessage("ok")
+			}
 		}
 	}
 
 	return traces
 }
 
-func createLogData(numResources int, numLibraries int, numRecords int) pdata.Logs {
-	logs := pdata.NewLogs()
-	logs.ResourceLogs().Resize(numResources)
-	for i := 0; i < numResources; i++ {
-		rl := logs.ResourceLogs().At(i)
-		rl.InstrumentationLibraryLogs().Resize(numLibraries)
-		for j := 0; j < numLibraries; j++ {
-			ill := rl.InstrumentationLibraryLogs().At(j)
-			ill.Logs().Resize(numRecords)
-			for k := 0; k < numRecords; k++ {
-				ts := pdata.Timestamp(int64(k) * time.Millisecond.Nanoseconds())
-				logRecord := ill.Logs().At(k)
-				logRecord.SetName(fmt.Sprintf("%d_%d_%d", i, j, k))
-				logRecord.Body().SetStringVal("mylog")
-				logRecord.Attributes().InsertString(conventions.AttributeServiceName, "myapp")
-				logRecord.Attributes().InsertString(splunk.SourcetypeLabel, "myapp-type")
-				logRecord.Attributes().InsertString(splunk.IndexLabel, "myindex")
-				logRecord.Attributes().InsertString(conventions.AttributeHostName, "myhost")
-				logRecord.Attributes().InsertString("custom", "custom")
+func createLogData(numResources, numLibraries, numRecords int) plog.Logs {
+	return createLogDataWithCustomLibraries(numResources, make([]string, numLibraries), repeat(numRecords, numLibraries))
+}
+
+func repeat(what, times int) []int {
+	result := make([]int, times)
+	for i := range result {
+		result[i] = what
+	}
+	return result
+}
+
+// these runes are used to generate long log messages that will compress down to a number of bytes we can rely on for testing.
+var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789wersgdgr43q3zvbcgv65ew 346xx$gt5/kuopo89.nytqasdfghjklpoiuy")
+
+func repeatableString(length int) string {
+	b := make([]rune, length)
+	for i := range b {
+		l := i % len(letterRunes)
+		b[i] = letterRunes[l]
+	}
+	return string(b)
+}
+
+func createLogDataWithCustomLibraries(numResources int, libraries []string, numRecords []int) plog.Logs {
+	logs := plog.NewLogs()
+	logs.ResourceLogs().EnsureCapacity(numResources)
+	for i := range numResources {
+		rl := logs.ResourceLogs().AppendEmpty()
+		rl.ScopeLogs().EnsureCapacity(len(libraries))
+		for j := range libraries {
+			sl := rl.ScopeLogs().AppendEmpty()
+			sl.Scope().SetName(libraries[j])
+			sl.LogRecords().EnsureCapacity(numRecords[j])
+			for k := 0; k < numRecords[j]; k++ {
+				ts := pcommon.Timestamp(int64(k) * time.Millisecond.Nanoseconds())
+				logRecord := sl.LogRecords().AppendEmpty()
+				logRecord.Body().SetStr("mylog")
+				logRecord.Attributes().PutStr(splunk.DefaultNameLabel, fmt.Sprintf("%d_%d_%d", i, j, k))
+				logRecord.Attributes().PutStr(splunk.DefaultSourceLabel, "myapp")
+				logRecord.Attributes().PutStr(splunk.DefaultSourceTypeLabel, "myapp-type")
+				logRecord.Attributes().PutStr(splunk.DefaultIndexLabel, "myindex")
+				logRecord.Attributes().PutStr("host.name", "myhost")
+				logRecord.Attributes().PutStr("custom", "custom")
 				logRecord.SetTimestamp(ts)
 			}
 		}
@@ -136,142 +197,203 @@ func createLogData(numResources int, numLibraries int, numRecords int) pdata.Log
 	return logs
 }
 
-type CapturingData struct {
+type receivedRequest struct {
+	body    []byte
+	headers http.Header
+}
+
+// receivedRequestChanBuffer is the capacity given to receivedRequest channels.
+// The ServeHTTP handler records requests synchronously to preserve their order,
+// so the channel must be buffered enough that the send never blocks the exporter
+// before the test's collecting loop starts reading. It comfortably exceeds the
+// number of batches any test in this package produces.
+const receivedRequestChanBuffer = 1024
+
+type capturingData struct {
 	testing          *testing.T
-	receivedRequest  chan []byte
+	receivedRequest  chan receivedRequest
 	statusCode       int
 	checkCompression bool
 }
 
-func (c *CapturingData) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	body, err := ioutil.ReadAll(r.Body)
+func (c *capturingData) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
 
 	if c.checkCompression {
-		if len(body) > minCompressionLen && r.Header.Get("Content-Encoding") != "gzip" {
-			c.testing.Fatal("No compression")
-		}
+		assert.Equal(c.testing, "gzip", r.Header.Get("Content-Encoding"), "No compression")
 	}
 
 	if err != nil {
 		panic(err)
 	}
-	go func() {
-		c.receivedRequest <- body
-	}()
+	// Record the request synchronously so that batches are captured in the exact
+	// order the client sent them. Spawning a goroutine per request here would let
+	// requests race onto the channel and be collected out of order, causing flaky
+	// assertions on per-batch contents. The channel is buffered by the callers so
+	// this send never blocks the exporter.
+	if c.receivedRequest != nil {
+		c.receivedRequest <- receivedRequest{body, r.Header}
+	}
 	w.WriteHeader(c.statusCode)
 }
 
-func runMetricsExport(disableCompression bool, numberOfDataPoints int, t *testing.T) (string, error) {
+func runMetricsExport(t *testing.T, cfg *Config, metrics pmetric.Metrics, expectedBatchesNum int, useMultiMetricsFormat bool) ([]receivedRequest, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		panic(err)
 	}
 
 	factory := NewFactory()
-	cfg := factory.CreateDefaultConfig().(*Config)
-	cfg.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
-	cfg.DisableCompression = disableCompression
+	cfg.ClientConfig.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
 	cfg.Token = "1234-1234"
+	cfg.UseMultiMetricFormat = useMultiMetricsFormat
 
-	receivedRequest := make(chan []byte)
-	capture := CapturingData{testing: t, receivedRequest: receivedRequest, statusCode: 200, checkCompression: !cfg.DisableCompression}
+	rr := make(chan receivedRequest, receivedRequestChanBuffer)
+	capture := capturingData{testing: t, receivedRequest: rr, statusCode: 200, checkCompression: !cfg.DisableCompression}
 	s := &http.Server{
-		Handler: &capture,
+		Handler:           &capture,
+		ReadHeaderTimeout: 20 * time.Second,
 	}
+	defer s.Close()
 	go func() {
-		panic(s.Serve(listener))
+		if e := s.Serve(listener); e != http.ErrServerClosed {
+			assert.NoError(t, e)
+		}
 	}()
 
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	exporter, err := factory.CreateMetricsExporter(context.Background(), params, cfg)
+	params := exportertest.NewNopSettings(metadata.Type)
+	exporter, err := factory.CreateMetrics(t.Context(), params, cfg)
 	assert.NoError(t, err)
-	assert.NoError(t, exporter.Start(context.Background(), componenttest.NewNopHost()))
-	defer exporter.Shutdown(context.Background())
-
-	md := createMetricsData(numberOfDataPoints)
-
-	err = exporter.ConsumeMetrics(context.Background(), md)
-	assert.NoError(t, err)
-	select {
-	case request := <-receivedRequest:
-		return string(request), nil
-	case <-time.After(1 * time.Second):
-		return "", errors.New("timeout")
-	}
-}
-
-func runTraceExport(disableCompression bool, numberOfTraces int, t *testing.T) (string, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		panic(err)
-	}
-
-	factory := NewFactory()
-	cfg := factory.CreateDefaultConfig().(*Config)
-	cfg.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
-	cfg.DisableCompression = disableCompression
-	cfg.Token = "1234-1234"
-
-	receivedRequest := make(chan []byte)
-	capture := CapturingData{testing: t, receivedRequest: receivedRequest, statusCode: 200, checkCompression: !cfg.DisableCompression}
-	s := &http.Server{
-		Handler: &capture,
-	}
-	go func() {
-		panic(s.Serve(listener))
+	assert.NoError(t, exporter.Start(t.Context(), componenttest.NewNopHost()))
+	defer func() {
+		assert.NoError(t, exporter.Shutdown(t.Context()))
 	}()
 
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	exporter, err := factory.CreateTracesExporter(context.Background(), params, cfg)
+	err = exporter.ConsumeMetrics(t.Context(), metrics)
 	assert.NoError(t, err)
-	assert.NoError(t, exporter.Start(context.Background(), componenttest.NewNopHost()))
-	defer exporter.Shutdown(context.Background())
-
-	td := createTraceData(numberOfTraces)
-
-	err = exporter.ConsumeTraces(context.Background(), td)
-	assert.NoError(t, err)
-	select {
-	case request := <-receivedRequest:
-		return string(request), nil
-	case <-time.After(1 * time.Second):
-		return "", errors.New("timeout")
-	}
-}
-
-func runLogExport(cfg *Config, ld pdata.Logs, t *testing.T) ([][]byte, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		panic(err)
-	}
-
-	cfg.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
-	cfg.Token = "1234-1234"
-
-	receivedRequest := make(chan []byte)
-	capture := CapturingData{testing: t, receivedRequest: receivedRequest, statusCode: 200, checkCompression: !cfg.DisableCompression}
-	s := &http.Server{
-		Handler: &capture,
-	}
-	go func() {
-		panic(s.Serve(listener))
-	}()
-
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	exporter, err := NewFactory().CreateLogsExporter(context.Background(), params, cfg)
-	assert.NoError(t, err)
-	assert.NoError(t, exporter.Start(context.Background(), componenttest.NewNopHost()))
-	defer exporter.Shutdown(context.Background())
-
-	err = exporter.ConsumeLogs(context.Background(), ld)
-	assert.NoError(t, err)
-
-	var requests [][]byte
+	var requests []receivedRequest
 	for {
 		select {
-		case request := <-receivedRequest:
+		case request := <-rr:
 			requests = append(requests, request)
-		case <-time.After(1 * time.Second):
+			if len(requests) == expectedBatchesNum {
+				return requests, nil
+			}
+		case <-time.After(5 * time.Second):
+			if len(requests) == 0 && expectedBatchesNum != 0 {
+				err = errors.New("timeout")
+			}
+			return requests, err
+		}
+	}
+}
+
+func runTraceExport(t *testing.T, testConfig *Config, traces ptrace.Traces, expectedBatchesNum int) ([]receivedRequest, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig().(*Config)
+	cfg.ClientConfig.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
+	cfg.DisableCompression = testConfig.DisableCompression
+	cfg.MaxContentLengthTraces = testConfig.MaxContentLengthTraces
+	cfg.Token = "1234-1234"
+
+	rr := make(chan receivedRequest, receivedRequestChanBuffer)
+	capture := capturingData{testing: t, receivedRequest: rr, statusCode: 200, checkCompression: !cfg.DisableCompression}
+	s := &http.Server{
+		Handler:           &capture,
+		ReadHeaderTimeout: 20 * time.Second,
+	}
+	defer s.Close()
+	go func() {
+		if e := s.Serve(listener); e != http.ErrServerClosed {
+			assert.NoError(t, e)
+		}
+	}()
+
+	params := exportertest.NewNopSettings(metadata.Type)
+	exporter, err := factory.CreateTraces(t.Context(), params, cfg)
+	assert.NoError(t, err)
+	assert.NoError(t, exporter.Start(t.Context(), componenttest.NewNopHost()))
+	defer func() {
+		assert.NoError(t, exporter.Shutdown(t.Context()))
+	}()
+
+	err = exporter.ConsumeTraces(t.Context(), traces)
+	assert.NoError(t, err)
+	var requests []receivedRequest
+	for {
+		select {
+		case request := <-rr:
+			requests = append(requests, request)
+			if len(requests) == expectedBatchesNum {
+				// sort the requests according to the traces we received, reordering them so we can assert on their size.
+				sort.Slice(requests, func(i, j int) bool {
+					imatch := requestTimeRegex.FindSubmatch(requests[i].body)
+					jmatch := requestTimeRegex.FindSubmatch(requests[j].body)
+					// no matches mean it's compressed, just leave as is
+					if len(imatch) == 0 {
+						return i < j
+					}
+					return string(imatch[1]) <= string(jmatch[1])
+				})
+				return requests, nil
+			}
+		case <-time.After(5 * time.Second):
+			if len(requests) == 0 {
+				return nil, errors.New("timeout")
+			}
+
+			return requests, err
+		}
+	}
+}
+
+func runLogExport(t *testing.T, cfg *Config, ld plog.Logs, expectedBatchesNum int) ([]receivedRequest, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+
+	cfg.ClientConfig.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
+	cfg.Token = "1234-1234"
+
+	rr := make(chan receivedRequest, receivedRequestChanBuffer)
+	capture := capturingData{testing: t, receivedRequest: rr, statusCode: 200, checkCompression: !cfg.DisableCompression}
+	s := &http.Server{
+		Handler:           &capture,
+		ReadHeaderTimeout: 20 * time.Second,
+	}
+	defer s.Close()
+	go func() {
+		if e := s.Serve(listener); e != http.ErrServerClosed {
+			assert.NoError(t, e)
+		}
+	}()
+
+	params := exportertest.NewNopSettings(metadata.Type)
+	exporter, err := NewFactory().CreateLogs(t.Context(), params, cfg)
+	assert.NoError(t, err)
+	assert.NoError(t, exporter.Start(t.Context(), componenttest.NewNopHost()))
+	defer func() {
+		assert.NoError(t, exporter.Shutdown(t.Context()))
+	}()
+
+	err = exporter.ConsumeLogs(t.Context(), ld)
+	assert.NoError(t, err)
+
+	var requests []receivedRequest
+	for {
+		select {
+		case request := <-rr:
+			requests = append(requests, request)
+			if len(requests) == expectedBatchesNum {
+				return requests, nil
+			}
+		case <-time.After(5 * time.Second):
 			if len(requests) == 0 {
 				err = errors.New("timeout")
 			}
@@ -280,33 +402,189 @@ func runLogExport(cfg *Config, ld pdata.Logs, t *testing.T) ([][]byte, error) {
 	}
 }
 
-func TestReceiveTraces(t *testing.T) {
-	actual, err := runTraceExport(true, 3, t)
-	assert.NoError(t, err)
-	expected := `{"time":1,"host":"unknown","event":{"trace_id":"01010101010101010101010101010101","span_id":"0000000000000001","parent_span_id":"0102030405060708","name":"root","end_time":2000000000,"kind":"SPAN_KIND_UNSPECIFIED","status":{"message":"ok","code":"STATUS_CODE_OK"},"start_time":1000000000},"fields":{"resource":"R1"}}`
-	expected += "\n\r\n\r\n"
-	expected += `{"time":2,"host":"unknown","event":{"trace_id":"01010101010101010101010101010101","span_id":"0000000000000001","parent_span_id":"","name":"root","end_time":3000000000,"kind":"SPAN_KIND_UNSPECIFIED","status":{"message":"","code":"STATUS_CODE_UNSET"},"start_time":2000000000},"fields":{"resource":"R1"}}`
-	expected += "\n\r\n\r\n"
-	expected += `{"time":3,"host":"unknown","event":{"trace_id":"01010101010101010101010101010101","span_id":"0000000000000001","parent_span_id":"0102030405060708","name":"root","end_time":4000000000,"kind":"SPAN_KIND_UNSPECIFIED","status":{"message":"ok","code":"STATUS_CODE_OK"},"start_time":3000000000},"fields":{"resource":"R1"}}`
-	expected += "\n\r\n\r\n"
-	assert.Equal(t, expected, actual)
+func TestReceiveTracesBatches(t *testing.T) {
+	type wantType struct {
+		batches    [][]string
+		numBatches int
+	}
+
+	tests := []struct {
+		name   string
+		conf   *Config
+		traces ptrace.Traces
+		want   wantType
+	}{
+		{
+			name:   "all trace events in payload when max content length unknown (configured max content length 0)",
+			traces: createTraceData(1, 4),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthTraces = 0
+				cfg.DisableCompression = true
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{
+						`"start_time":1`,
+						`"start_time":2`,
+						`start_time":3`,
+						`start_time":4`,
+					},
+				},
+				numBatches: 1,
+			},
+		},
+		{
+			name:   "1 trace event per payload (configured max content length is same as event size)",
+			traces: createTraceData(1, 4),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthTraces = 320
+				cfg.DisableCompression = true
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"start_time":1`},
+					{`"start_time":2`},
+					{`"start_time":3`},
+					{`"start_time":4`},
+				},
+				numBatches: 4,
+			},
+		},
+		{
+			name:   "2 trace events per payload (configured max content length is twice event size)",
+			traces: createTraceData(1, 4),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthTraces = 640
+				cfg.DisableCompression = true
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"start_time":1`, `"start_time":2`},
+					{`"start_time":3`, `"start_time":4`},
+				},
+				numBatches: 2,
+			},
+		},
+		{
+			name:   "1 compressed batch of 2037 bytes",
+			traces: createTraceData(1, 10),
+			conf: func() *Config {
+				return NewFactory().CreateDefaultConfig().(*Config)
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"start_time":1`, `"start_time":2`, `"start_time":3`, `"start_time":4`, `"start_time":7`, `"start_time":8`, `"start_time":9`},
+				},
+				numBatches: 1,
+			},
+		},
+		{
+			name:   "100 events, make sure that we produce more than one compressed batch",
+			traces: createTraceData(1, 100),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthTraces = 2000
+				return cfg
+			}(),
+			want: wantType{
+				// just test that the test has 2 batches, don't test its contents.
+				batches:    [][]string{{""}, {""}},
+				numBatches: 2,
+			},
+		},
+		{
+			name:   "100 events",
+			traces: createTraceData(1, 100),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthTraces = 0
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"start_time":1`, `"start_time":2`, `"start_time":3`, `"start_time":4`, `"start_time":7`, `"start_time":8`, `"start_time":9`, `"start_time":20`, `"start_time":40`, `"start_time":85`, `"start_time":98`, `"start_time":99`},
+				},
+				numBatches: 1,
+			},
+		},
+		{
+			name:   "10 resources, 10 spans, no compression",
+			traces: createTraceData(10, 10),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.DisableCompression = true
+				cfg.MaxContentLengthTraces = 5000
+				return cfg
+			}(),
+			want: wantType{
+				numBatches: 7,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := runTraceExport(t, test.conf, test.traces, test.want.numBatches)
+
+			require.NoError(t, err)
+			require.Len(t, got, test.want.numBatches, "expected exact number of batches")
+
+			for i, batch := range test.want.batches {
+				require.NotZero(t, got[i])
+				if test.conf.MaxContentLengthTraces != 0 {
+					require.Greater(t, int(test.conf.MaxContentLengthTraces), len(got[i].body))
+				}
+				if test.conf.DisableCompression {
+					for _, expected := range batch {
+						assert.Contains(t, string(got[i].body), expected)
+					}
+				} else {
+					validateCompressedContains(t, batch, got[i].body)
+				}
+			}
+
+			// ensure all events are sent out
+			for i := 1; i < test.traces.SpanCount(); i++ {
+				eventFound := false
+				for _, batch := range got {
+					batchBody := batch.body
+					if !test.conf.DisableCompression {
+						z, err := gzip.NewReader(bytes.NewReader(batchBody))
+						require.NoError(t, err)
+						batchBody, err = io.ReadAll(z)
+						z.Close()
+						require.NoError(t, err)
+					}
+					timeStr := fmt.Sprintf(`"time":%d}`, i+1)
+					if strings.Contains(string(batchBody), timeStr) {
+						assert.False(t, eventFound, "span event %d found in multiple batches", i)
+						eventFound = true
+					}
+				}
+				assert.Truef(t, eventFound, "span event %d not found in any batch", i)
+			}
+		})
+	}
 }
 
 func TestReceiveLogs(t *testing.T) {
 	type wantType struct {
-		batches    []string
+		batches    [][]string
 		numBatches int
-		compressed bool
+		wantErr    string
+		wantDrops  int // expected number of dropped events
 	}
-
-	// The test cases depend on the constant minCompressionLen = 1500.
-	// If the constant changed, the test cases with want.compressed=true must be updated.
-	require.Equal(t, minCompressionLen, 1500)
 
 	tests := []struct {
 		name string
 		conf *Config
-		logs pdata.Logs
+		logs plog.Logs
 		want wantType
 	}{
 		{
@@ -315,14 +593,17 @@ func TestReceiveLogs(t *testing.T) {
 			conf: func() *Config {
 				cfg := NewFactory().CreateDefaultConfig().(*Config)
 				cfg.MaxContentLengthLogs = 0
+				cfg.DisableCompression = true
 				return cfg
 			}(),
 			want: wantType{
-				batches: []string{
-					`{"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_0","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.001,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_1","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.002,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_2","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.003,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_3","service.name":"myapp"}}` + "\n\r\n\r\n",
+				batches: [][]string{
+					{
+						`"otel.log.name":"0_0_0"`,
+						`"otel.log.name":"0_0_1"`,
+						`otel.log.name":"0_0_2`,
+						`otel.log.name":"0_0_3`,
+					},
 				},
 				numBatches: 1,
 			},
@@ -333,16 +614,36 @@ func TestReceiveLogs(t *testing.T) {
 			conf: func() *Config {
 				cfg := NewFactory().CreateDefaultConfig().(*Config)
 				cfg.MaxContentLengthLogs = 300
+				cfg.DisableCompression = true
 				return cfg
 			}(),
 			want: wantType{
-				batches: []string{
-					`{"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_0","service.name":"myapp"}}` + "\n\r\n\r\n",
-					`{"time":0.001,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_1","service.name":"myapp"}}` + "\n\r\n\r\n",
-					`{"time":0.002,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_2","service.name":"myapp"}}` + "\n\r\n\r\n",
-					`{"time":0.003,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_3","service.name":"myapp"}}` + "\n\r\n\r\n",
+				batches: [][]string{
+					{`"otel.log.name":"0_0_0"`},
+					{`"otel.log.name":"0_0_1"`},
+					{`"otel.log.name":"0_0_2"`},
+					{`"otel.log.name":"0_0_3"`},
 				},
 				numBatches: 4,
+			},
+		},
+		{
+			name: "1 log long event",
+			logs: func() plog.Logs {
+				l := createLogData(1, 1, 1)
+				l.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().SetStr(strings.Repeat("a", 1800))
+				return l
+			}(),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthLogs = 1750
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"otel.log.name":"0_0_0"`},
+				},
+				numBatches: 1,
 			},
 		},
 		{
@@ -351,176 +652,791 @@ func TestReceiveLogs(t *testing.T) {
 			conf: func() *Config {
 				cfg := NewFactory().CreateDefaultConfig().(*Config)
 				cfg.MaxContentLengthLogs = 448
+				cfg.DisableCompression = true
 				return cfg
 			}(),
 			want: wantType{
-				batches: []string{
-					`{"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_0","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.001,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_1","service.name":"myapp"}}` + "\n\r\n\r\n",
-					`{"time":0.002,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_2","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.003,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_3","service.name":"myapp"}}` + "\n\r\n\r\n",
+				batches: [][]string{
+					{`"otel.log.name":"0_0_0"`, `"otel.log.name":"0_0_1"`},
+					{`"otel.log.name":"0_0_2"`, `"otel.log.name":"0_0_3"`},
 				},
 				numBatches: 2,
 			},
 		},
 		{
-			name: "1 compressed batch of 1837 bytes, make sure the event size is more than minCompressionLen=1500 to trigger compression",
+			name: "1 compressed batch of 2037 bytes",
 			logs: createLogData(1, 1, 10),
 			conf: func() *Config {
 				return NewFactory().CreateDefaultConfig().(*Config)
 			}(),
 			want: wantType{
-				batches: []string{
-					`{"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_0","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.001,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_1","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.002,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_2","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.003,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_3","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.004,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_4","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.005,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_5","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.006,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_6","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.007,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_7","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.008,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_8","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.009,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_9","service.name":"myapp"}}` + "\n\r\n\r\n",
+				batches: [][]string{
+					{`"otel.log.name":"0_0_0"`, `"otel.log.name":"0_0_1"`, `"otel.log.name":"0_0_5"`, `"otel.log.name":"0_0_6"`, `"otel.log.name":"0_0_7"`, `"otel.log.name":"0_0_8"`, `"otel.log.name":"0_0_9"`},
 				},
 				numBatches: 1,
-				compressed: true,
 			},
 		},
 		{
-			name: "2 compressed batches - 1916 bytes each, make sure the log size is more than minCompressionLen=1500 to trigger compression",
-			logs: createLogData(1, 1, 18), // comes to HEC events payload size - 1837 bytes
+			name: "150 events, make sure that we produce more than one compressed batch",
+			logs: createLogData(1, 1, 150),
 			conf: func() *Config {
 				cfg := NewFactory().CreateDefaultConfig().(*Config)
-				cfg.MaxContentLengthLogs = 1916
+				cfg.MaxContentLengthLogs = 1650
 				return cfg
 			}(),
 			want: wantType{
-				batches: []string{
-					`{"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_0","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.001,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_1","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.002,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_2","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.003,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_3","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.004,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_4","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.005,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_5","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.006,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_6","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.007,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_7","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.008,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_8","service.name":"myapp"}}` + "\n\r\n\r\n",
-					`{"time":0.009,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_9","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.01,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_10","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.011,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_11","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.012,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_12","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.013,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_13","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.014,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_14","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.015,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_15","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.016,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_16","service.name":"myapp"}}` + "\n\r\n\r\n" +
-						`{"time":0.017,"host":"myhost","source":"myapp","sourcetype":"myapp-type","index":"myindex","event":"mylog","fields":{"custom":"custom","host.name":"myhost","otlp.log.name":"0_0_17","service.name":"myapp"}}` + "\n\r\n\r\n",
+				batches: [][]string{
+					{`"otel.log.name":"0_0_0"`, `"otel.log.name":"0_0_90"`},
+					{`"otel.log.name":"0_0_110"`, `"otel.log.name":"0_0_149"`},
 				},
 				numBatches: 2,
-				compressed: true,
+			},
+		},
+		{
+			name: "150 events, make sure that we produce only one compressed batch when MaxContentLengthLogs is 0",
+			logs: createLogData(1, 1, 150),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthLogs = 0
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"otel.log.name":"0_0_0"`, `"otel.log.name":"0_0_90"`, `"otel.log.name":"0_0_110"`, `"otel.log.name":"0_0_149"`},
+				},
+				numBatches: 1,
+			},
+		},
+		{
+			name: "one event with 1340 bytes and another one bypassing the max length, moving to a separate batch",
+			logs: func() plog.Logs {
+				firstLog := createLogData(1, 1, 2)
+				firstLog.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().SetStr(repeatableString(1500))
+				firstLog.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(1).Body().SetStr(repeatableString(2800000))
+				return firstLog
+			}(),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthLogs = 10000 // small so we can reproduce without allocating big logs.
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"otel.log.name":"0_0_0"`}, {`"otel.log.name":"0_0_1"`},
+				},
+				numBatches: 2,
+			},
+		},
+		{
+			name: "one event that is so large we cannot send it",
+			logs: func() plog.Logs {
+				firstLog := createLogData(1, 1, 1)
+				firstLog.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().SetStr(repeatableString(500000))
+				return firstLog
+			}(),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthLogs = 1800 // small so we can reproduce without allocating big logs.
+				return cfg
+			}(),
+			want: wantType{
+				batches:    [][]string{},
+				numBatches: 0,
+				wantErr:    "timeout", // our server will time out waiting for the data.
+			},
+		},
+		{
+			name: "two events with 2000 bytes, one with 2000 bytes, then one with 20000 bytes",
+			logs: func() plog.Logs {
+				firstLog := createLogData(1, 1, 3)
+				firstLog.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().SetStr(repeatableString(2000))
+				firstLog.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(1).Body().SetStr(repeatableString(2000))
+				firstLog.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(2).Body().SetStr(repeatableString(20000))
+				return firstLog
+			}(),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxEventSize = 20000 // makes the third event too large to send.
+				cfg.DisableCompression = true
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"otel.log.name":"0_0_0"`, `"otel.log.name":"0_0_1"`},
+				},
+				numBatches: 1,
+				wantDrops:  1,
+			},
+		},
+		{
+			name: "two events with 2000 bytes, one with 1000 bytes, then one with 4200 bytes",
+			logs: func() plog.Logs {
+				firstLog := createLogData(1, 1, 5)
+				firstLog.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().SetStr(repeatableString(2000))
+				firstLog.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(1).Body().SetStr(repeatableString(2000))
+				firstLog.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(2).Body().SetStr(repeatableString(1000))
+				firstLog.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(3).Body().SetStr(repeatableString(4200))
+				return firstLog
+			}(),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthLogs = 5000
+				cfg.DisableCompression = true
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"otel.log.name":"0_0_0"`, `"otel.log.name":"0_0_1"`},
+					{`"otel.log.name":"0_0_2"`},
+					{`"otel.log.name":"0_0_3"`, `"otel.log.name":"0_0_4"`},
+				},
+				numBatches: 3,
+			},
+		},
+		{
+			name: "10 resource logs, 1 scope logs, 10 log records, no compression",
+			logs: createLogData(10, 1, 10),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.DisableCompression = true
+				cfg.MaxContentLengthLogs = 5000
+				return cfg
+			}(),
+			want: wantType{
+				numBatches: 4,
 			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := runLogExport(test.conf, test.logs, t)
-
+			got, err := runLogExport(t, test.conf, test.logs, test.want.numBatches)
+			if test.want.wantErr != "" {
+				require.EqualError(t, err, test.want.wantErr)
+				return
+			}
 			require.NoError(t, err)
 			require.Len(t, got, test.want.numBatches)
 
-			for i := 0; i < test.want.numBatches; i++ {
+			for i, wantBatch := range test.want.batches {
 				require.NotZero(t, got[i])
-				if test.want.compressed {
-					validateCompressedEqual(t, test.want.batches[i], got[i])
-				} else {
-					assert.Equal(t, test.want.batches[i], string(got[i]))
+				if test.conf.MaxContentLengthLogs != 0 {
+					require.Greater(t, int(test.conf.MaxContentLengthLogs), len(got[i].body))
 				}
-
+				if test.conf.DisableCompression {
+					for _, expected := range wantBatch {
+						assert.Contains(t, string(got[i].body), expected)
+					}
+				} else {
+					validateCompressedContains(t, wantBatch, got[i].body)
+				}
 			}
+
+			// ensure all events are sent out
+			droppedCount := test.logs.LogRecordCount()
+			for i := 0; i < test.logs.ResourceLogs().Len(); i++ {
+				rl := test.logs.ResourceLogs().At(i)
+				for j := 0; j < rl.ScopeLogs().Len(); j++ {
+					sl := rl.ScopeLogs().At(j)
+					for k := 0; k < sl.LogRecords().Len(); k++ {
+						lr := sl.LogRecords().At(k)
+						attrVal, ok := lr.Attributes().Get("otel.log.name")
+						require.True(t, ok)
+						eventFound := false
+						for _, batch := range got {
+							batchBody := batch.body
+							if !test.conf.DisableCompression {
+								z, err := gzip.NewReader(bytes.NewReader(batchBody))
+								require.NoError(t, err)
+								batchBody, err = io.ReadAll(z)
+								z.Close()
+								require.NoError(t, err)
+							}
+							if strings.Contains(string(batchBody), fmt.Sprintf(`%q`, attrVal.Str())) {
+								assert.False(t, eventFound, "log event %s found in multiple batches", attrVal.Str())
+								eventFound = true
+								droppedCount--
+							}
+						}
+						if test.want.wantDrops == 0 {
+							assert.Truef(t, eventFound, "log event %s not found in any batch", attrVal.Str())
+						}
+					}
+				}
+			}
+			assert.Equal(t, test.want.wantDrops, droppedCount, "expected %d dropped events, got %d", test.want.wantDrops, droppedCount)
 		})
 	}
 }
 
-func TestReceiveMetrics(t *testing.T) {
-	actual, err := runMetricsExport(true, 3, t)
-	assert.NoError(t, err)
-	expected := `{"host":"unknown","event":"metric","fields":{"k/n0":"vn0","k/n1":"vn1","k/r0":"vr0","k/r1":"vr1","k0":"v0","k1":"v1","metric_name:gauge_double_with_dims":1234.5678,"metric_type":"DoubleGauge"}}`
-	expected += "\n\r\n\r\n"
-	expected += `{"time":1.001,"host":"unknown","event":"metric","fields":{"k/n0":"vn0","k/n1":"vn1","k/r0":"vr0","k/r1":"vr1","k0":"v0","k1":"v1","metric_name:gauge_double_with_dims":1234.5678,"metric_type":"DoubleGauge"}}`
-	expected += "\n\r\n\r\n"
-	expected += `{"time":2.002,"host":"unknown","event":"metric","fields":{"k/n0":"vn0","k/n1":"vn1","k/r0":"vr0","k/r1":"vr1","k0":"v0","k1":"v1","metric_name:gauge_double_with_dims":1234.5678,"metric_type":"DoubleGauge"}}`
-	expected += "\n\r\n\r\n"
-	assert.Equal(t, expected, actual)
+func TestReceiveRaw(t *testing.T) {
+	tests := []struct {
+		name string
+		conf *Config
+		logs plog.Logs
+		text string
+	}{
+		{
+			name: "single raw event",
+			logs: createLogData(1, 1, 1),
+			conf: func() *Config {
+				conf := createDefaultConfig().(*Config)
+				conf.ExportRaw = true
+				conf.DisableCompression = true
+				return conf
+			}(),
+			text: "mylog\n",
+		},
+		{
+			name: "single raw event as bytes",
+			logs: func() plog.Logs {
+				logs := plog.NewLogs()
+				logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetEmptyBytes().FromRaw([]byte("mybytes"))
+				return logs
+			}(),
+			conf: func() *Config {
+				conf := createDefaultConfig().(*Config)
+				conf.ExportRaw = true
+				conf.DisableCompression = true
+				return conf
+			}(),
+			text: "bXlieXRlcw==\n",
+		},
+		{
+			name: "single raw event as number",
+			logs: func() plog.Logs {
+				logs := plog.NewLogs()
+				logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetDouble(64.345)
+				return logs
+			}(),
+			conf: func() *Config {
+				conf := createDefaultConfig().(*Config)
+				conf.ExportRaw = true
+				conf.DisableCompression = true
+				return conf
+			}(),
+			text: "64.345\n",
+		},
+		{
+			name: "five raw events",
+			logs: createLogData(1, 1, 5),
+			conf: func() *Config {
+				conf := createDefaultConfig().(*Config)
+				conf.ExportRaw = true
+				conf.DisableCompression = true
+				return conf
+			}(),
+			text: "mylog\nmylog\nmylog\nmylog\nmylog\n",
+		},
+		{
+			name: "log with array body",
+			logs: func() plog.Logs {
+				logs := plog.NewLogs()
+				_ = logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetEmptySlice().FromRaw([]any{1, "foo", true})
+				return logs
+			}(),
+			conf: func() *Config {
+				conf := createDefaultConfig().(*Config)
+				conf.ExportRaw = true
+				conf.DisableCompression = true
+				return conf
+			}(),
+			text: "[1,\"foo\",true]\n",
+		},
+		{
+			name: "log with map body",
+			logs: func() plog.Logs {
+				logs := plog.NewLogs()
+				logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetEmptyMap().PutStr("foo", "bar")
+				return logs
+			}(),
+			conf: func() *Config {
+				conf := createDefaultConfig().(*Config)
+				conf.ExportRaw = true
+				conf.DisableCompression = true
+				return conf
+			}(),
+			text: "{\"foo\":\"bar\"}\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := runLogExport(t, test.conf, test.logs, 1)
+			require.NoError(t, err)
+			req := got[0]
+			assert.Equal(t, test.text, string(req.body))
+		})
+	}
 }
 
-func TestReceiveTracesWithCompression(t *testing.T) {
-	request, err := runTraceExport(false, 1000, t)
+func TestReceiveLogEvent(t *testing.T) {
+	logs := createLogData(1, 1, 1)
+	cfg := NewFactory().CreateDefaultConfig().(*Config)
+	cfg.DisableCompression = true
+
+	actual, err := runLogExport(t, cfg, logs, 1)
+	assert.Len(t, actual, 1)
 	assert.NoError(t, err)
-	assert.NotEqual(t, "", request)
+
+	compareWithTestData(t, actual[0].body, "testdata/hec_log_event.json")
+}
+
+func TestLogEventTimestampMicrosecondPrecision(t *testing.T) {
+	// Verify that nanosecond timestamp precision is turned to microseconds in the HEC payload
+	logs := plog.NewLogs()
+	logRecord := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	logRecord.Body().SetStr("test log")
+	logRecord.SetTimestamp(pcommon.Timestamp(1574092046011123456))
+
+	cfg := NewFactory().CreateDefaultConfig().(*Config)
+	cfg.DisableCompression = true
+
+	actual, err := runLogExport(t, cfg, logs, 1)
+	assert.NoError(t, err)
+	assert.Len(t, actual, 1)
+
+	// time field in raw JSON should preserve microsecond precision
+	assert.Contains(t, string(actual[0].body), "1574092046.011123")
+}
+
+func TestReceiveMetricEvent(t *testing.T) {
+	metrics := createMetricsData(1, 1)
+	cfg := NewFactory().CreateDefaultConfig().(*Config)
+	cfg.DisableCompression = true
+
+	actual, err := runMetricsExport(t, cfg, metrics, 1, false)
+	assert.Len(t, actual, 1)
+	assert.NoError(t, err)
+
+	compareWithTestData(t, actual[0].body, "testdata/hec_metric_event.json")
+}
+
+func TestReceiveSpanEvent(t *testing.T) {
+	traces := createTraceData(1, 1)
+	cfg := NewFactory().CreateDefaultConfig().(*Config)
+	cfg.DisableCompression = true
+
+	actual, err := runTraceExport(t, cfg, traces, 1)
+	assert.Len(t, actual, 1)
+	assert.NoError(t, err)
+
+	compareWithTestData(t, actual[0].body, "testdata/hec_span_event.json")
+}
+
+// compareWithTestData compares hec output with a json file using maps instead of strings to avoid key ordering
+func compareWithTestData(t *testing.T, actual []byte, file string) {
+	wantStr, err := os.ReadFile(file)
+	require.NoError(t, err)
+	wantMap := map[string]any{}
+	err = json.Unmarshal(wantStr, &wantMap)
+	require.NoError(t, err)
+
+	gotMap := map[string]any{}
+	err = json.Unmarshal(actual, &gotMap)
+	require.NoError(t, err)
+	assert.Equal(t, wantMap, gotMap)
+}
+
+func TestReceiveMetrics(t *testing.T) {
+	md := createMetricsData(1, 3)
+	cfg := NewFactory().CreateDefaultConfig().(*Config)
+	cfg.DisableCompression = true
+	actual, err := runMetricsExport(t, cfg, md, 1, false)
+	assert.Len(t, actual, 1)
+	assert.NoError(t, err)
+	msg := string(actual[0].body)
+	assert.Contains(t, msg, "\"event\":\"metric\"")
+	assert.Contains(t, msg, "\"time\":1.001")
+	assert.Contains(t, msg, "\"time\":2.002")
+}
+
+func TestReceiveBatchedMetrics(t *testing.T) {
+	type wantType struct {
+		batches    [][]string
+		numBatches int
+		compressed bool
+	}
+
+	tests := []struct {
+		name    string
+		conf    *Config
+		metrics pmetric.Metrics
+		want    wantType
+	}{
+		{
+			name:    "all metrics events in payload when max content length unknown (configured max content length 0)",
+			metrics: createMetricsData(1, 4),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthMetrics = 0
+				cfg.DisableCompression = true
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"k1":"v1"`, `"time":1.001`, `"time":2.002`, `"time":3.003`},
+				},
+				numBatches: 1,
+			},
+		},
+		{
+			name: "one metric event too large to fit in a batch",
+			metrics: func() pmetric.Metrics {
+				m := pmetric.NewMetrics()
+				metric := m.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+				g := metric.SetEmptyGauge()
+				g.DataPoints().AppendEmpty().SetIntValue(32)
+				metric.SetName(repeatableString(256))
+				return m
+			}(),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthMetrics = 20
+				cfg.DisableCompression = true
+				return cfg
+			}(),
+			want: wantType{
+				batches:    [][]string{},
+				numBatches: 0,
+			},
+		},
+		{
+			name:    "1 metric event per payload (configured max content length is same as event size)",
+			metrics: createMetricsData(1, 4),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthMetrics = 300
+				cfg.DisableCompression = true
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"k1":"v1"`},
+					{`"time":1.001`},
+					{`"time":2.002`},
+					{`"time":3.003`},
+				},
+				numBatches: 4,
+			},
+		},
+		{
+			name:    "2 metric events per payload (configured max content length is twice event size)",
+			metrics: createMetricsData(1, 4),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthMetrics = 448
+				cfg.DisableCompression = true
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{``, ``},
+					{``, ``},
+				},
+				numBatches: 2,
+			},
+		},
+		{
+			name:    "1 compressed batch of 2037 bytes",
+			metrics: createMetricsData(1, 10),
+			conf: func() *Config {
+				return NewFactory().CreateDefaultConfig().(*Config)
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"k1":"v1"`, `"time":1.001`, `"time":2.002`, `"time":3.003`, `"time":4.004`, `"time":5.005`, `"time":6.006`},
+				},
+				numBatches: 1,
+				compressed: true,
+			},
+		},
+		{
+			name:    "200 events, make sure that we produce more than one compressed batch",
+			metrics: createMetricsData(1, 100),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthMetrics = 1650
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"time":1.001`, `"time":2.002`, `"time":3.003`, `"time":4.004`, `"time":5.005`, `"time":6.006`},
+					{`"time":85.085`, `"time":99.099`},
+				},
+				numBatches: 2,
+				compressed: true,
+			},
+		},
+		{
+			name:    "200 events, make sure that we produce only one compressed batch when MaxContentLengthMetrics is 0",
+			metrics: createMetricsData(1, 100),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.MaxContentLengthMetrics = 0
+				return cfg
+			}(),
+			want: wantType{
+				batches: [][]string{
+					{`"time":1.001`, `"time":2.002`, `"time":3.003`, `"time":4.004`, `"time":5.005`, `"time":6.006`, `"time":85.085`, `"time":99.099`},
+				},
+				numBatches: 1,
+				compressed: true,
+			},
+		},
+		{
+			name:    "10 resources, 10 datapoints, no compression",
+			metrics: createMetricsData(10, 10),
+			conf: func() *Config {
+				cfg := NewFactory().CreateDefaultConfig().(*Config)
+				cfg.DisableCompression = true
+				cfg.MaxContentLengthMetrics = 5000
+				return cfg
+			}(),
+			want: wantType{
+				numBatches: 5,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		testFn := func(multiMetric bool) func(*testing.T) {
+			return func(t *testing.T) {
+				got, err := runMetricsExport(t, test.conf, test.metrics, test.want.numBatches, multiMetric)
+
+				require.NoError(t, err)
+				require.Len(t, got, test.want.numBatches)
+
+				for i, batch := range test.want.batches {
+					require.NotZero(t, got[i])
+					if test.conf.MaxContentLengthMetrics != 0 {
+						require.Greater(t, int(test.conf.MaxContentLengthMetrics), len(got[i].body))
+					}
+					if test.want.compressed {
+						validateCompressedContains(t, batch, got[i].body)
+					} else {
+						found := false
+
+						for _, expected := range batch {
+							if strings.Contains(string(got[i].body), expected) {
+								found = true
+								break
+							}
+						}
+						assert.True(t, found, "%s did not match any expected batch", string(got[i].body))
+					}
+				}
+
+				if test.want.numBatches == 0 {
+					assert.Empty(t, got)
+					return
+				}
+
+				// ensure all events are sent out
+				for i := 1; i < test.metrics.MetricCount(); i++ {
+					eventFound := false
+					for _, batch := range got {
+						batchBody := batch.body
+						if test.want.compressed {
+							z, err := gzip.NewReader(bytes.NewReader(batchBody))
+							require.NoError(t, err)
+							batchBody, err = io.ReadAll(z)
+							z.Close()
+							require.NoError(t, err)
+						}
+						time := float64(i) + 0.001*float64(i)
+						if strings.Contains(string(batchBody), fmt.Sprintf(`"time":%g`, time)) {
+							assert.False(t, eventFound, "metric event %d found in multiple batches", i)
+							eventFound = true
+						}
+					}
+					assert.Truef(t, eventFound, "metric event %d not found in any batch", i)
+				}
+			}
+		}
+		t.Run(test.name, testFn(false))
+		t.Run(test.name+"_MultiMetric", testFn(true))
+	}
+}
+
+func Test_PushMetricsData_Histogram_NaN_Sum(t *testing.T) {
+	metrics := pmetric.NewMetrics()
+	rm := metrics.ResourceMetrics().AppendEmpty()
+	ilm := rm.ScopeMetrics().AppendEmpty()
+	histogram := ilm.Metrics().AppendEmpty()
+	histogram.SetName("histogram_with_empty_sum")
+	dp := histogram.SetEmptyHistogram().DataPoints().AppendEmpty()
+	dp.SetSum(math.NaN())
+
+	c := newMetricsClient(exportertest.NewNopSettings(metadata.Type), NewFactory().CreateDefaultConfig().(*Config))
+	c.hecWorker = &mockHecWorker{}
+
+	permanentErrors := c.pushMetricsDataInBatches(t.Context(), metrics, map[string]string{})
+	assert.NoError(t, permanentErrors)
+}
+
+func Test_PushMetricsData_Histogram_NaN_Sum_MultiMetric(t *testing.T) {
+	metrics := pmetric.NewMetrics()
+	rm := metrics.ResourceMetrics().AppendEmpty()
+	ilm := rm.ScopeMetrics().AppendEmpty()
+	histogram := ilm.Metrics().AppendEmpty()
+	histogram.SetName("histogram_with_empty_sum")
+	dp := histogram.SetEmptyHistogram().DataPoints().AppendEmpty()
+	dp.SetSum(math.NaN())
+	cfg := NewFactory().CreateDefaultConfig().(*Config)
+	cfg.UseMultiMetricFormat = true
+	c := newMetricsClient(exportertest.NewNopSettings(metadata.Type), cfg)
+	c.hecWorker = &mockHecWorker{}
+
+	permanentErrors := c.pushMetricsDataInBatches(t.Context(), metrics, map[string]string{})
+	assert.NoError(t, permanentErrors)
+}
+
+func Test_PushMetricsData_Summary_NaN_Sum(t *testing.T) {
+	metrics := pmetric.NewMetrics()
+	rm := metrics.ResourceMetrics().AppendEmpty()
+	ilm := rm.ScopeMetrics().AppendEmpty()
+	summary := ilm.Metrics().AppendEmpty()
+	summary.SetName("Summary_with_empty_sum")
+	dp := summary.SetEmptySummary().DataPoints().AppendEmpty()
+	dp.SetSum(math.NaN())
+
+	c := newMetricsClient(exportertest.NewNopSettings(metadata.Type), NewFactory().CreateDefaultConfig().(*Config))
+	c.hecWorker = &mockHecWorker{}
+
+	permanentErrors := c.pushMetricsDataInBatches(t.Context(), metrics, map[string]string{})
+	assert.NoError(t, permanentErrors)
 }
 
 func TestReceiveMetricsWithCompression(t *testing.T) {
-	request, err := runMetricsExport(false, 1000, t)
+	cfg := NewFactory().CreateDefaultConfig().(*Config)
+	cfg.MaxContentLengthMetrics = 1800
+	request, err := runMetricsExport(t, cfg, createMetricsData(1, 100), 2, false)
 	assert.NoError(t, err)
-	assert.NotEqual(t, "", request)
+	assert.Equal(t, "gzip", request[0].headers.Get("Content-Encoding"))
+	assert.NotEmpty(t, request)
 }
 
 func TestErrorReceived(t *testing.T) {
-	receivedRequest := make(chan []byte)
-	capture := CapturingData{receivedRequest: receivedRequest, statusCode: 500}
+	rr := make(chan receivedRequest, receivedRequestChanBuffer)
+	capture := capturingData{receivedRequest: rr, statusCode: 500}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		panic(err)
 	}
 	s := &http.Server{
-		Handler: &capture,
+		Handler:           &capture,
+		ReadHeaderTimeout: 20 * time.Second,
 	}
+	defer s.Close()
 	go func() {
-		panic(s.Serve(listener))
+		if e := s.Serve(listener); e != http.ErrServerClosed {
+			assert.NoError(t, e)
+		}
 	}()
 
 	factory := NewFactory()
 	cfg := factory.CreateDefaultConfig().(*Config)
-	cfg.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
+	cfg.ClientConfig.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
 	// Disable QueueSettings to ensure that we execute the request when calling ConsumeTraces
 	// otherwise we will not see the error.
-	cfg.QueueSettings.Enabled = false
+	cfg.QueueSettings = configoptional.Default(*cfg.QueueSettings.Get())
 	// Disable retries to not wait too much time for the return error.
-	cfg.RetrySettings.Enabled = false
+	cfg.BackOffConfig.Enabled = false
 	cfg.DisableCompression = true
 	cfg.Token = "1234-1234"
 
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	exporter, err := factory.CreateTracesExporter(context.Background(), params, cfg)
+	params := exportertest.NewNopSettings(metadata.Type)
+	exporter, err := factory.CreateTraces(t.Context(), params, cfg)
 	assert.NoError(t, err)
-	assert.NoError(t, exporter.Start(context.Background(), componenttest.NewNopHost()))
-	defer exporter.Shutdown(context.Background())
+	assert.NoError(t, exporter.Start(t.Context(), componenttest.NewNopHost()))
+	defer func() {
+		assert.NoError(t, exporter.Shutdown(t.Context()))
+	}()
 
-	td := createTraceData(3)
+	td := createTraceData(1, 3)
 
-	err = exporter.ConsumeTraces(context.Background(), td)
+	err = exporter.ConsumeTraces(t.Context(), td)
 	select {
-	case <-receivedRequest:
+	case <-rr:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Should have received request")
 	}
-	assert.EqualError(t, err, "HTTP 500 \"Internal Server Error\"")
+	errMsg := fmt.Sprintf("HTTP \"/services/collector\" %d %q",
+		http.StatusInternalServerError,
+		http.StatusText(http.StatusInternalServerError),
+	)
+	assert.EqualError(t, err, errMsg)
 }
 
-func TestInvalidTraces(t *testing.T) {
-	_, err := runTraceExport(false, 0, t)
-	assert.Error(t, err)
+func TestErrorReceivedForbidden(t *testing.T) {
+	rr := make(chan receivedRequest, receivedRequestChanBuffer)
+	capture := capturingData{receivedRequest: rr, statusCode: 403}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	s := &http.Server{
+		Handler:           &capture,
+		ReadHeaderTimeout: 20 * time.Second,
+	}
+	defer s.Close()
+	go func() {
+		if e := s.Serve(listener); e != http.ErrServerClosed {
+			assert.NoError(t, e)
+		}
+	}()
+
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig().(*Config)
+	cfg.ClientConfig.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
+	// Disable QueueSettings to ensure that we execute the request when calling ConsumeTraces
+	// otherwise we will not see the error.
+	cfg.QueueSettings = configoptional.Default(*cfg.QueueSettings.Get())
+	// Disable retries to not wait too much time for the return error.
+	cfg.BackOffConfig.Enabled = false
+	cfg.DisableCompression = true
+	cfg.Token = "1234-1234"
+
+	params := exportertest.NewNopSettings(metadata.Type)
+	exporter, err := factory.CreateTraces(t.Context(), params, cfg)
+	assert.NoError(t, err)
+	assert.NoError(t, exporter.Start(t.Context(), componenttest.NewNopHost()))
+	defer func() {
+		assert.NoError(t, exporter.Shutdown(t.Context()))
+	}()
+
+	td := createTraceData(1, 3)
+
+	err = exporter.ConsumeTraces(t.Context(), td)
+	select {
+	case <-rr:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Should have received request")
+	}
+	errMsg := fmt.Sprintf("Permanent error: HTTP \"/services/collector\" %d %q",
+		http.StatusForbidden,
+		http.StatusText(http.StatusForbidden),
+	)
+	assert.EqualError(t, err, errMsg)
+	assert.True(t, consumererror.IsPermanent(err))
 }
 
 func TestInvalidLogs(t *testing.T) {
 	config := NewFactory().CreateDefaultConfig().(*Config)
 	config.DisableCompression = false
-	_, err := runLogExport(config, createLogData(1, 1, 0), t)
+	_, err := runLogExport(t, config, createLogData(1, 1, 0), 1)
 	assert.Error(t, err)
 }
 
 func TestInvalidMetrics(t *testing.T) {
-	_, err := runMetricsExport(false, 0, t)
+	cfg := NewFactory().CreateDefaultConfig().(*Config)
+	_, err := runMetricsExport(t, cfg, pmetric.NewMetrics(), 1, false)
+	assert.Error(t, err)
+}
+
+func TestInvalidMetricsMultiMetric(t *testing.T) {
+	cfg := NewFactory().CreateDefaultConfig().(*Config)
+	_, err := runMetricsExport(t, cfg, pmetric.NewMetrics(), 1, true)
 	assert.Error(t, err)
 }
 
@@ -529,21 +1445,133 @@ func TestInvalidURL(t *testing.T) {
 	cfg := factory.CreateDefaultConfig().(*Config)
 	// Disable queuing to ensure that we execute the request when calling ConsumeTraces
 	// otherwise we will not see the error.
-	cfg.QueueSettings.Enabled = false
+	cfg.QueueSettings = configoptional.Default(*cfg.QueueSettings.Get())
 	// Disable retries to not wait too much time for the return error.
-	cfg.RetrySettings.Enabled = false
-	cfg.Endpoint = "ftp://example.com:134"
+	cfg.BackOffConfig.Enabled = false
+	cfg.ClientConfig.Endpoint = "ftp://example.com:134"
 	cfg.Token = "1234-1234"
-	params := component.ExporterCreateSettings{Logger: zap.NewNop()}
-	exporter, err := factory.CreateTracesExporter(context.Background(), params, cfg)
+	params := exportertest.NewNopSettings(metadata.Type)
+	exporter, err := factory.CreateTraces(t.Context(), params, cfg)
 	assert.NoError(t, err)
-	assert.NoError(t, exporter.Start(context.Background(), componenttest.NewNopHost()))
-	defer exporter.Shutdown(context.Background())
+	assert.NoError(t, exporter.Start(t.Context(), componenttest.NewNopHost()))
+	defer func() {
+		assert.NoError(t, exporter.Shutdown(t.Context()))
+	}()
+	td := createTraceData(1, 2)
 
-	td := createTraceData(2)
-
-	err = exporter.ConsumeTraces(context.Background(), td)
+	err = exporter.ConsumeTraces(t.Context(), td)
 	assert.EqualError(t, err, "Post \"ftp://example.com:134/services/collector\": unsupported protocol scheme \"ftp\"")
+}
+
+func TestHeartbeatStartupFailed(t *testing.T) {
+	capture := capturingData{statusCode: 403}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	s := &http.Server{
+		Handler:           &capture,
+		ReadHeaderTimeout: 20 * time.Second,
+	}
+	defer s.Close()
+	go func() {
+		if e := s.Serve(listener); e != http.ErrServerClosed {
+			assert.NoError(t, e)
+		}
+	}()
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig().(*Config)
+	cfg.ClientConfig.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
+	// Disable QueueSettings to ensure that we execute the request when calling ConsumeTraces
+	// otherwise we will not see the error.
+	cfg.QueueSettings = configoptional.Default(*cfg.QueueSettings.Get())
+	// Disable retries to not wait too much time for the return error.
+	cfg.BackOffConfig.Enabled = false
+	cfg.DisableCompression = true
+	cfg.Token = "1234-1234"
+	cfg.Heartbeat.Startup = true
+
+	params := exportertest.NewNopSettings(metadata.Type)
+	exporter, err := factory.CreateTraces(t.Context(), params, cfg)
+	assert.NoError(t, err)
+	assert.EqualError(t,
+		exporter.Start(t.Context(), componenttest.NewNopHost()),
+		fmt.Sprintf("%s: heartbeat on startup failed: Permanent error: HTTP \"/services/collector\" 403 \"Forbidden\"",
+			params.ID.String(),
+		),
+	)
+	assert.NoError(t, exporter.Shutdown(t.Context()))
+}
+
+func TestHeartbeatStartupPass_Disabled(t *testing.T) {
+	rr := make(chan receivedRequest, receivedRequestChanBuffer)
+	capture := capturingData{receivedRequest: rr, statusCode: 403}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	s := &http.Server{
+		Handler:           &capture,
+		ReadHeaderTimeout: 20 * time.Second,
+	}
+	defer s.Close()
+	go func() {
+		if e := s.Serve(listener); e != http.ErrServerClosed {
+			assert.NoError(t, e)
+		}
+	}()
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig().(*Config)
+	cfg.ClientConfig.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
+	// Disable QueueSettings to ensure that we execute the request when calling ConsumeTraces
+	// otherwise we will not see the error.
+	cfg.QueueSettings = configoptional.Default(*cfg.QueueSettings.Get())
+	// Disable retries to not wait too much time for the return error.
+	cfg.BackOffConfig.Enabled = false
+	cfg.DisableCompression = true
+	cfg.Token = "1234-1234"
+	cfg.Heartbeat.Startup = false
+
+	params := exportertest.NewNopSettings(metadata.Type)
+	exporter, err := factory.CreateTraces(t.Context(), params, cfg)
+	assert.NoError(t, err)
+	assert.NoError(t, exporter.Start(t.Context(), componenttest.NewNopHost()))
+	assert.NoError(t, exporter.Shutdown(t.Context()))
+}
+
+func TestHeartbeatStartupPass(t *testing.T) {
+	capture := capturingData{statusCode: 200}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	s := &http.Server{
+		Handler:           &capture,
+		ReadHeaderTimeout: 20 * time.Second,
+	}
+	defer s.Close()
+	go func() {
+		if e := s.Serve(listener); e != http.ErrServerClosed {
+			assert.NoError(t, e)
+		}
+	}()
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig().(*Config)
+	cfg.ClientConfig.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
+	// Disable QueueSettings to ensure that we execute the request when calling ConsumeTraces
+	// otherwise we will not see the error.
+	cfg.QueueSettings = configoptional.Default(*cfg.QueueSettings.Get())
+	// Disable retries to not wait too much time for the return error.
+	cfg.BackOffConfig.Enabled = false
+	cfg.DisableCompression = true
+	cfg.Token = "1234-1234"
+	cfg.Heartbeat.Startup = true
+
+	params := exportertest.NewNopSettings(metadata.Type)
+	exporter, err := factory.CreateTraces(t.Context(), params, cfg)
+	assert.NoError(t, err)
+	assert.NoError(t, exporter.Start(t.Context(), componenttest.NewNopHost()))
+	assert.NoError(t, exporter.Shutdown(t.Context()))
 }
 
 type badJSON struct {
@@ -554,70 +1582,22 @@ func TestInvalidJson(t *testing.T) {
 	badEvent := badJSON{
 		Foo: math.Inf(1),
 	}
-	syncPool := sync.Pool{New: func() interface{} {
-		return gzip.NewWriter(nil)
-	}}
-	evs := []*splunk.Event{
-		{
-			Event: badEvent,
-		},
-		nil,
-	}
-	reader, _, err := encodeBodyEvents(&syncPool, evs, false)
-	assert.Error(t, err, reader)
-}
-
-func TestStartAlwaysReturnsNil(t *testing.T) {
-	c := client{}
-	err := c.start(context.Background(), componenttest.NewNopHost())
-	assert.NoError(t, err)
-}
-
-func TestInvalidJsonClient(t *testing.T) {
-	badEvent := badJSON{
-		Foo: math.Inf(1),
-	}
-	evs := []*splunk.Event{
-		{
-			Event: badEvent,
-		},
-		nil,
-	}
-	c := client{
-		url: nil,
-		zippers: sync.Pool{New: func() interface{} {
-			return gzip.NewWriter(nil)
-		}},
-		config: &Config{},
-	}
-	err := c.sendSplunkEvents(context.Background(), evs)
-	assert.EqualError(t, err, "Permanent error: json: unsupported value: +Inf")
-}
-
-func TestInvalidURLClient(t *testing.T) {
-	c := client{
-		url: &url.URL{Host: "in va lid"},
-		zippers: sync.Pool{New: func() interface{} {
-			return gzip.NewWriter(nil)
-		}},
-		config: &Config{},
-	}
-	err := c.sendSplunkEvents(context.Background(), []*splunk.Event{})
-	assert.EqualError(t, err, "Permanent error: parse \"//in%20va%20lid\": invalid URL escape \"%20\"")
+	_, err := json.Marshal(badEvent)
+	assert.Error(t, err)
 }
 
 func Test_pushLogData_nil_Logs(t *testing.T) {
 	tests := []struct {
 		name     func(bool) string
-		logs     pdata.Logs
-		requires func(*testing.T, pdata.Logs)
+		logs     plog.Logs
+		requires func(*testing.T, plog.Logs)
 	}{
 		{
 			name: func(disable bool) string {
 				return "COMPRESSION " + map[bool]string{true: "DISABLED ", false: "ENABLED "}[disable] + "nil ResourceLogs"
 			},
-			logs: pdata.NewLogs(),
-			requires: func(t *testing.T, logs pdata.Logs) {
+			logs: plog.NewLogs(),
+			requires: func(t *testing.T, logs plog.Logs) {
 				require.Zero(t, logs.ResourceLogs().Len())
 			},
 		},
@@ -625,163 +1605,1254 @@ func Test_pushLogData_nil_Logs(t *testing.T) {
 			name: func(disable bool) string {
 				return "COMPRESSION " + map[bool]string{true: "DISABLED ", false: "ENABLED "}[disable] + "nil InstrumentationLogs"
 			},
-			logs: func() pdata.Logs {
-				logs := pdata.NewLogs()
+			logs: func() plog.Logs {
+				logs := plog.NewLogs()
 				logs.ResourceLogs().AppendEmpty()
 				return logs
 			}(),
-			requires: func(t *testing.T, logs pdata.Logs) {
-				require.Equal(t, logs.ResourceLogs().Len(), 1)
-				require.Zero(t, logs.ResourceLogs().At(0).InstrumentationLibraryLogs().Len())
+			requires: func(t *testing.T, logs plog.Logs) {
+				require.Equal(t, 1, logs.ResourceLogs().Len())
+				require.Zero(t, logs.ResourceLogs().At(0).ScopeLogs().Len())
 			},
 		},
 		{
 			name: func(disable bool) string {
 				return "COMPRESSION " + map[bool]string{true: "DISABLED ", false: "ENABLED "}[disable] + "nil LogRecords"
 			},
-			logs: func() pdata.Logs {
-				logs := pdata.NewLogs()
-				logs.ResourceLogs().AppendEmpty().InstrumentationLibraryLogs().AppendEmpty()
+			logs: func() plog.Logs {
+				logs := plog.NewLogs()
+				logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
 				return logs
 			}(),
-			requires: func(t *testing.T, logs pdata.Logs) {
-				require.Equal(t, logs.ResourceLogs().Len(), 1)
-				require.Equal(t, logs.ResourceLogs().At(0).InstrumentationLibraryLogs().Len(), 1)
-				require.Zero(t, logs.ResourceLogs().At(0).InstrumentationLibraryLogs().At(0).Logs().Len())
+			requires: func(t *testing.T, logs plog.Logs) {
+				require.Equal(t, 1, logs.ResourceLogs().Len())
+				require.Equal(t, 1, logs.ResourceLogs().At(0).ScopeLogs().Len())
+				require.Zero(t, logs.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().Len())
 			},
 		},
 	}
 
-	c := client{
-		zippers: sync.Pool{New: func() interface{} {
-			return gzip.NewWriter(nil)
-		}},
-		config: NewFactory().CreateDefaultConfig().(*Config),
-	}
+	c := newLogsClient(exportertest.NewNopSettings(metadata.Type), NewFactory().CreateDefaultConfig().(*Config))
 
 	for _, test := range tests {
 		for _, disabled := range []bool{true, false} {
 			t.Run(test.name(disabled), func(t *testing.T) {
 				test.requires(t, test.logs)
-				err := c.pushLogData(context.Background(), test.logs)
+				err := c.pushLogData(t.Context(), test.logs)
 				assert.NoError(t, err)
 			})
 		}
 	}
-
 }
 
 func Test_pushLogData_InvalidLog(t *testing.T) {
-	c := client{
-		zippers: sync.Pool{New: func() interface{} {
-			return gzip.NewWriter(nil)
-		}},
-		config: &Config{},
-	}
+	c := newLogsClient(exportertest.NewNopSettings(metadata.Type), NewFactory().CreateDefaultConfig().(*Config))
 
-	logs := pdata.NewLogs()
-	log := logs.ResourceLogs().AppendEmpty().InstrumentationLibraryLogs().AppendEmpty().Logs().AppendEmpty()
+	logs := plog.NewLogs()
+	log := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
 	// Invalid log value
-	log.Body().SetDoubleVal(math.Inf(1))
+	log.Body().SetDouble(math.Inf(1))
 
-	err := c.pushLogData(context.Background(), logs)
+	err := c.pushLogData(t.Context(), logs)
 
-	assert.Contains(t, err.Error(), "json: unsupported value: +Inf")
+	assert.Error(t, err, "Permanent error: unsupported value: +Inf")
+}
+
+func Test_pushLogData_LogsPermanentErrorsWhenPostFails(t *testing.T) {
+	core, observed := observer.New(zapcore.WarnLevel)
+	c := newLogsClient(exportertest.NewNopSettings(metadata.Type), NewFactory().CreateDefaultConfig().(*Config))
+	c.logger = zap.New(core)
+	c.config.MaxContentLengthLogs, c.config.DisableCompression = 0, true
+	httpClient, _ := newTestClient(http.StatusServiceUnavailable, "NOK")
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(c.config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	logs := plog.NewLogs()
+	logRecords := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
+	logRecords.AppendEmpty().Body().SetDouble(math.Inf(1))
+	logRecords.AppendEmpty().Body().SetStr("valid log")
+
+	err := c.pushLogDataInBatches(t.Context(), logs, nil)
+	require.ErrorContains(t, err, "503")
+	assert.False(t, consumererror.IsPermanent(err), "the 503 must remain retryable")
+	entries := observed.FilterMessage("Log records were dropped while sending a batch").All()
+	require.Len(t, entries, 1)
+	assert.Contains(t, entries[0].ContextMap()["error"], "unsupported value: +Inf")
 }
 
 func Test_pushLogData_PostError(t *testing.T) {
-	c := client{
-		url: &url.URL{Host: "in va lid"},
-		zippers: sync.Pool{New: func() interface{} {
-			return gzip.NewWriter(nil)
-		}},
-		config: NewFactory().CreateDefaultConfig().(*Config),
-	}
+	c := newLogsClient(exportertest.NewNopSettings(metadata.Type), NewFactory().CreateDefaultConfig().(*Config))
+	c.hecWorker = &defaultHecWorker{url: &url.URL{Host: "in va lid"}, logger: zap.NewNop()}
 
 	// 2000 log records -> ~371888 bytes when JSON encoded.
 	logs := createLogData(1, 1, 2000)
 
 	// 0 -> unlimited size batch, true -> compression disabled.
 	c.config.MaxContentLengthLogs, c.config.DisableCompression = 0, true
-	err := c.pushLogData(context.Background(), logs)
+	err := c.pushLogData(t.Context(), logs)
 	require.Error(t, err)
-	assert.IsType(t, consumererror.Logs{}, err)
-	assert.Equal(t, (err.(consumererror.Logs)).GetLogs(), logs)
+	var logsErr consumererror.Logs
+	assert.ErrorAs(t, err, &logsErr)
+	assert.Equal(t, logs, logsErr.Data())
 
 	// 0 -> unlimited size batch, false -> compression enabled.
 	c.config.MaxContentLengthLogs, c.config.DisableCompression = 0, false
-	err = c.pushLogData(context.Background(), logs)
+	err = c.pushLogData(t.Context(), logs)
 	require.Error(t, err)
-	assert.IsType(t, consumererror.Logs{}, err)
-	assert.Equal(t, (err.(consumererror.Logs)).GetLogs(), logs)
+	assert.ErrorAs(t, err, &logsErr)
+	assert.Equal(t, logs, logsErr.Data())
 
 	// 200000 < 371888 -> multiple batches, true -> compression disabled.
 	c.config.MaxContentLengthLogs, c.config.DisableCompression = 200000, true
-	err = c.pushLogData(context.Background(), logs)
+	err = c.pushLogData(t.Context(), logs)
 	require.Error(t, err)
-	assert.IsType(t, consumererror.Logs{}, err)
-	assert.Equal(t, (err.(consumererror.Logs)).GetLogs(), logs)
+	assert.ErrorAs(t, err, &logsErr)
+	assert.Equal(t, logs, logsErr.Data())
 
 	// 200000 < 371888 -> multiple batches, false -> compression enabled.
 	c.config.MaxContentLengthLogs, c.config.DisableCompression = 200000, false
-	err = c.pushLogData(context.Background(), logs)
+	err = c.pushLogData(t.Context(), logs)
 	require.Error(t, err)
-	assert.IsType(t, consumererror.Logs{}, err)
-	assert.Equal(t, (err.(consumererror.Logs)).GetLogs(), logs)
+	assert.ErrorAs(t, err, &logsErr)
+	assert.Equal(t, logs, logsErr.Data())
 }
 
 func Test_pushLogData_ShouldAddResponseTo400Error(t *testing.T) {
-	splunkClient := client{
-		url: &url.URL{Scheme: "http", Host: "splunk"},
-		zippers: sync.Pool{New: func() interface{} {
-			return gzip.NewWriter(nil)
-		}},
-		config: NewFactory().CreateDefaultConfig().(*Config),
-	}
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	url := &url.URL{Scheme: "http", Host: "splunk", Path: "/v1/endpoint"}
+	splunkClient := newLogsClient(exportertest.NewNopSettings(metadata.Type), NewFactory().CreateDefaultConfig().(*Config))
 	logs := createLogData(1, 1, 1)
 
 	responseBody := `some error occurred`
 
 	// An HTTP client that returns status code 400 and response body responseBody.
-	splunkClient.client = newTestClient(400, responseBody)
+	httpClient, _ := newTestClient(400, responseBody)
+	splunkClient.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
 	// Sending logs using the client.
-	err := splunkClient.pushLogData(context.Background(), logs)
-	// TODO: Uncomment after consumererror.Logs implements method Unwrap.
-	//require.True(t, consumererror.IsPermanent(err), "Expecting permanent error")
-	require.Contains(t, err.Error(), "HTTP/0.0 400")
+	err := splunkClient.pushLogData(t.Context(), logs)
+	require.True(t, consumererror.IsPermanent(err), "Expecting permanent error")
+	require.EqualError(t, err, "Permanent error: HTTP \"/v1/endpoint\" 400 \"Bad Request\"")
 	// The returned error should contain the response body responseBody.
-	assert.Contains(t, err.Error(), responseBody)
 
 	// An HTTP client that returns some other status code other than 400 and response body responseBody.
-	splunkClient.client = newTestClient(500, responseBody)
+	httpClient, _ = newTestClient(500, responseBody)
+	splunkClient.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
 	// Sending logs using the client.
-	err = splunkClient.pushLogData(context.Background(), logs)
-	// TODO: Uncomment after consumererror.Logs implements method Unwrap.
-	//require.False(t, consumererror.IsPermanent(err), "Expecting non-permanent error")
-	require.Contains(t, err.Error(), "HTTP 500")
+	err = splunkClient.pushLogData(t.Context(), logs)
+	require.False(t, consumererror.IsPermanent(err), "Expecting non-permanent error")
+	require.EqualError(t, err, "HTTP \"/v1/endpoint\" 500 \"Internal Server Error\"")
 	// The returned error should not contain the response body responseBody.
 	assert.NotContains(t, err.Error(), responseBody)
 }
 
-func Test_pushLogData_Small_MaxContentLength(t *testing.T) {
-	c := client{
-		zippers: sync.Pool{New: func() interface{} {
-			return gzip.NewWriter(nil)
-		}},
-		config: NewFactory().CreateDefaultConfig().(*Config),
+func Test_pushLogData_ShouldReturnUnsentLogsOnly(t *testing.T) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+
+	// Each record is about 200 bytes, so the 250-byte buffer will fit only one at a time
+	config.MaxContentLengthLogs, config.DisableCompression = 250, true
+
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c := newLogsClient(exportertest.NewNopSettings(metadata.Type), config)
+
+	// Just two records
+	logs := createLogData(2, 1, 1)
+
+	// The first record is to be sent successfully, the second one should not
+	httpClient, _ := newTestClientWithPresetResponses([]int{200, 400}, []string{"OK", "NOK"}, func(_ []byte) {})
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	err := c.pushLogData(t.Context(), logs)
+	require.Error(t, err)
+
+	// Only the record that was not successfully sent should be returned
+	var logsErr consumererror.Logs
+	require.ErrorAs(t, err, &logsErr)
+	assert.Equal(t, 1, logsErr.Data().ResourceLogs().Len())
+	assert.Equal(t, logs.ResourceLogs().At(1), logsErr.Data().ResourceLogs().At(0))
+}
+
+func Test_pushLogData_ShouldAddHeadersForProfilingData(t *testing.T) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+
+	// A 300-byte buffer only fits one record (around 200 bytes), so each record will be sent separately
+	config.MaxContentLengthLogs, config.DisableCompression = 300, true
+
+	c := newLogsClient(exportertest.NewNopSettings(metadata.Type), config)
+
+	logs := createLogDataWithCustomLibraries(1, []string{"otel.logs"}, []int{10})
+	profilingData := createLogDataWithCustomLibraries(1, []string{"otel.profiling"}, []int{20})
+	var headers *[]http.Header
+
+	httpClient, headers := newTestClient(200, "OK")
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	err := c.pushLogData(t.Context(), logs)
+	require.NoError(t, err)
+	err = c.pushLogData(t.Context(), profilingData)
+	require.NoError(t, err)
+	assert.Len(t, *headers, 30)
+
+	profilingCount, nonProfilingCount := 0, 0
+	for i := range *headers {
+		if (*headers)[i].Get(libraryHeaderName) == profilingLibraryName {
+			profilingCount++
+		} else {
+			nonProfilingCount++
+		}
 	}
-	c.config.MaxContentLengthLogs = 1
+
+	assert.Equal(t, 20, profilingCount)
+	assert.Equal(t, 10, nonProfilingCount)
+}
+
+func TestProfileData(t *testing.T) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+
+	// Allow enough room for the serialized profiling event.
+	config.MaxContentLengthLogs, config.DisableCompression = 1024, true
+
+	c := newProfilesClient(exportertest.NewNopSettings(metadata.Type), config)
+
+	done := make(chan struct{})
+	var closeOnce sync.Once
+
+	httpClient, headers := newTestClientWithBodyReader(func(bChan []byte) {
+		var hecEvent translator.Event
+		err := json.Unmarshal(bChan, &hecEvent)
+		require.NoError(t, err)
+		decoded, err := base64.StdEncoding.DecodeString(hecEvent.Event.(string))
+		require.NoError(t, err)
+		gr, err := gzip.NewReader(bytes.NewBuffer(decoded))
+		require.NoError(t, err)
+		defer gr.Close()
+		raw, _ := io.ReadAll(gr)
+		pprofProfile, err := profile.ParseData(raw)
+		require.NoError(t, err)
+
+		require.Equal(t, []int64{42}, pprofProfile.Sample[0].Value)
+		closeOnce.Do(func() { close(done) })
+	})
+
+	profiles := pprofile.NewProfiles()
+	profiles.Dictionary().StackTable().AppendEmpty()
+	profiles.Dictionary().StringTable().Append("")
+	profiles.Dictionary().StringTable().Append("cpu")
+	profiles.Dictionary().StringTable().Append("nanoseconds")
+	p := profiles.ResourceProfiles().AppendEmpty().ScopeProfiles().AppendEmpty().Profiles().AppendEmpty()
+	p.SampleType().SetTypeStrindex(1)
+	p.SampleType().SetUnitStrindex(2)
+	s := p.Samples().AppendEmpty()
+	s.Values().Append(42)
+
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	err := c.pushProfilesData(t.Context(), profiles)
+	require.NoError(t, err)
+
+	<-done
+
+	foundHeader := false
+	for _, h := range *headers {
+		if v := h.Get(libraryHeaderName); v != "" {
+			foundHeader = true
+			require.Equal(t, "otel.profiling", v)
+		}
+	}
+
+	require.True(t, foundHeader)
+}
+
+func TestProfileDataPprofSampleLabels(t *testing.T) {
+	profiles := pprofile.NewProfiles()
+	dict := profiles.Dictionary()
+	dict.StackTable().AppendEmpty()
+	dict.StringTable().Append("cpu")
+	dict.StringTable().Append("nanoseconds")
+	dict.LinkTable().AppendEmpty()
+
+	traceID := pcommon.TraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	spanID := pcommon.SpanID([8]byte{1, 2, 3, 4, 5, 6, 7, 8})
+	link := dict.LinkTable().AppendEmpty()
+	link.SetTraceID(traceID)
+	link.SetSpanID(spanID)
+
+	sp := profiles.ResourceProfiles().AppendEmpty().ScopeProfiles().AppendEmpty()
+	sp.Scope().SetName("runtime/profiler")
+	p := sp.Profiles().AppendEmpty()
+	p.SampleType().SetTypeStrindex(0)
+	p.SampleType().SetUnitStrindex(1)
+	p.PeriodType().SetTypeStrindex(0)
+	p.PeriodType().SetUnitStrindex(1)
+	p.SetPeriod(50_000_000)
+	ts := time.Date(2024, 6, 15, 12, 0, 0, 123456789, time.UTC)
+	p.SetTime(pcommon.NewTimestampFromTime(ts))
+	s := p.Samples().AppendEmpty()
+	s.Values().Append(42)
+	s.SetLinkIndex(1)
+
+	logs, errs := buildProfilesLogs(profiles)
+	require.Empty(t, errs)
+	require.Equal(t, 1, logs.LogRecordCount())
+
+	pprofProfile := decodePprofLogRecord(t, logs.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0))
+	require.Len(t, pprofProfile.Sample, 1)
+	sample := pprofProfile.Sample[0]
+	require.Equal(t, []int64{42}, sample.Value)
+	require.Equal(t, []string{"runtime/profiler"}, sample.Label["source.event.name"])
+	require.Equal(t, []int64{ts.UnixMilli()}, sample.NumLabel["source.event.time"])
+	require.Equal(t, []string{spanID.String()}, sample.Label["span_id"])
+	require.Equal(t, []string{traceID.String()}, sample.Label["trace_id"])
+	require.Equal(t, []string{"50"}, sample.Label["source.event.period"])
+	require.Equal(t, ts.UnixNano(), pprofProfile.TimeNanos)
+}
+
+func TestProfileDataTypeNormalization(t *testing.T) {
+	tests := []struct {
+		name                string
+		sampleType          string
+		sampleUnit          string
+		periodType          string
+		periodUnit          string
+		wantSupported       bool
+		wantDataType        string
+		wantPprofSampleType string
+		wantPprofUnit       string
+		wantValue           int64
+	}{
+		{
+			name:                "ebpf cpu samples",
+			sampleType:          "samples",
+			sampleUnit:          "count",
+			periodType:          "cpu",
+			periodUnit:          "nanoseconds",
+			wantSupported:       true,
+			wantDataType:        "cpu",
+			wantPprofSampleType: "samples",
+			wantPprofUnit:       "count",
+			wantValue:           3,
+		},
+		{
+			name:                "allocation bytes",
+			sampleType:          "alloc_space",
+			sampleUnit:          "bytes",
+			wantSupported:       true,
+			wantDataType:        "allocation",
+			wantPprofSampleType: "alloc_space",
+			wantPprofUnit:       "bytes",
+			wantValue:           4096,
+		},
+		{
+			name:                "allocation count",
+			sampleType:          "alloc_objects",
+			sampleUnit:          "count",
+			wantSupported:       true,
+			wantDataType:        "allocation",
+			wantPprofSampleType: "alloc_objects",
+			wantPprofUnit:       "count",
+			wantValue:           2,
+		},
+		{
+			name:       "unsupported off-cpu profile is dropped",
+			sampleType: "off_cpu",
+			sampleUnit: "nanoseconds",
+			wantValue:  100,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			profiles := pprofile.NewProfiles()
+			dict := profiles.Dictionary()
+			dict.StackTable().AppendEmpty()
+			stringTable := dict.StringTable()
+			stringTable.Append("")
+			typeIndex := stringTable.Len()
+			stringTable.Append(tt.sampleType)
+			unitIndex := stringTable.Len()
+			stringTable.Append(tt.sampleUnit)
+			periodTypeIndex := stringTable.Len()
+			stringTable.Append(tt.periodType)
+			periodUnitIndex := stringTable.Len()
+			stringTable.Append(tt.periodUnit)
+
+			profile := profiles.ResourceProfiles().AppendEmpty().ScopeProfiles().AppendEmpty().Profiles().AppendEmpty()
+			profile.SampleType().SetTypeStrindex(int32(typeIndex))
+			profile.SampleType().SetUnitStrindex(int32(unitIndex))
+			profile.PeriodType().SetTypeStrindex(int32(periodTypeIndex))
+			profile.PeriodType().SetUnitStrindex(int32(periodUnitIndex))
+			sample := profile.Samples().AppendEmpty()
+			sample.Values().Append(tt.wantValue)
+
+			logs, errs := buildProfilesLogs(profiles)
+			if !tt.wantSupported {
+				require.Len(t, errs, 1)
+				assert.True(t, consumererror.IsPermanent(errs[0]))
+				assert.Equal(t, 0, logs.LogRecordCount())
+				assert.Contains(t, errs[0].Error(), "unsupported profile sample type")
+				return
+			}
+			require.Empty(t, errs)
+			record := logs.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
+			dataType, ok := record.Attributes().Get(profilingDataTypeKey)
+			require.True(t, ok)
+			assert.Equal(t, tt.wantDataType, dataType.Str())
+
+			pprofProfile := decodePprofLogRecord(t, record)
+			require.Len(t, pprofProfile.SampleType, 1)
+			assert.Equal(t, tt.wantPprofSampleType, pprofProfile.SampleType[0].Type)
+			assert.Equal(t, tt.wantPprofUnit, pprofProfile.SampleType[0].Unit)
+			require.Len(t, pprofProfile.Sample, 1)
+			assert.Equal(t, []int64{tt.wantValue}, pprofProfile.Sample[0].Value)
+		})
+	}
+}
+
+func TestProfileDataUnsupportedProfilesAreDroppedAndCounted(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(component.TelemetrySettings{MeterProvider: meterProvider})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		telemetryBuilder.Shutdown()
+		require.NoError(t, meterProvider.Shutdown(t.Context()))
+	})
+
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	config.MaxContentLengthLogs, config.DisableCompression = 1024, true
+	c := newProfilesClient(exportertest.NewNopSettings(metadata.Type), config)
+	c.telemetryBuilder = telemetryBuilder
+
+	var exportedRecords int
+	httpClient, _ := newTestClientWithBodyReader(func(body []byte) {
+		for line := range bytes.SplitSeq(bytes.TrimSpace(body), []byte("\n")) {
+			if len(line) > 0 {
+				exportedRecords++
+			}
+		}
+	})
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	profiles := pprofile.NewProfiles()
+	dict := profiles.Dictionary()
+	dict.StackTable().AppendEmpty()
+	dict.StringTable().Append("")
+	dict.StringTable().Append("cpu")
+	dict.StringTable().Append("nanoseconds")
+	dict.StringTable().Append("off_cpu")
+	dict.StringTable().Append("inuse_space")
+	dict.StringTable().Append("bytes")
+
+	profileScope := profiles.ResourceProfiles().AppendEmpty().ScopeProfiles().AppendEmpty()
+	appendProfile := func(sampleTypeIndex, unitIndex int32) {
+		profile := profileScope.Profiles().AppendEmpty()
+		profile.SampleType().SetTypeStrindex(sampleTypeIndex)
+		profile.SampleType().SetUnitStrindex(unitIndex)
+		profile.Samples().AppendEmpty().Values().Append(1)
+	}
+	appendProfile(1, 2) // Supported on-CPU profile.
+	appendProfile(3, 2) // Unsupported off-CPU profile.
+	appendProfile(4, 5) // Unsupported retained-memory profile.
+
+	err = c.pushProfilesData(t.Context(), profiles)
+	require.Error(t, err)
+	assert.True(t, consumererror.IsPermanent(err))
+	assert.Equal(t, 1, exportedRecords, "supported profiles in the batch should still be exported")
+
+	got, err := getMetricValue(reader, "otelcol_exporter_dropped_unsupported_profile_records")
+	require.NoError(t, err)
+	assert.Equal(t, []int64{2}, got)
+}
+
+func TestProfileDataTransientSendErrorRemainsRetryableWithUnsupportedProfiles(t *testing.T) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	config.MaxContentLengthLogs, config.DisableCompression = 1024, true
+	c := newProfilesClient(exportertest.NewNopSettings(metadata.Type), config)
+
+	httpClient, _ := newTestClient(http.StatusServiceUnavailable, "NOK")
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	profiles := pprofile.NewProfiles()
+	dict := profiles.Dictionary()
+	dict.StackTable().AppendEmpty()
+	dict.StringTable().Append("")
+	dict.StringTable().Append("cpu")
+	dict.StringTable().Append("nanoseconds")
+	dict.StringTable().Append("off_cpu")
+	dict.StringTable().Append("count")
+
+	profileScope := profiles.ResourceProfiles().AppendEmpty().ScopeProfiles().AppendEmpty()
+	for _, sampleTypeIndex := range []int32{1, 4} {
+		profile := profileScope.Profiles().AppendEmpty()
+		profile.SampleType().SetTypeStrindex(sampleTypeIndex)
+		profile.SampleType().SetUnitStrindex(2)
+		profile.Samples().AppendEmpty().Values().Append(1)
+	}
+
+	err := c.pushProfilesData(t.Context(), profiles)
+	require.ErrorContains(t, err, "503")
+	assert.False(t, consumererror.IsPermanent(err), "a transient HEC failure must remain retryable")
+	assert.NotContains(t, err.Error(), "unsupported profile sample type", "the unsupported profile must not make the send failure permanent")
+}
+
+func TestProfileDataUnsupportedProfileCountIsNotRepeatedOnRetry(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(component.TelemetrySettings{MeterProvider: meterProvider})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		telemetryBuilder.Shutdown()
+		require.NoError(t, meterProvider.Shutdown(t.Context()))
+	})
+
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	config.MaxContentLengthLogs, config.DisableCompression = 1024, true
+	c := newProfilesClient(exportertest.NewNopSettings(metadata.Type), config)
+	c.telemetryBuilder = telemetryBuilder
+	httpClient, _ := newTestClientWithPresetResponses(
+		[]int{http.StatusServiceUnavailable, http.StatusOK}, []string{"NOK", "OK"}, func(_ []byte) {},
+	)
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	profiles := pprofile.NewProfiles()
+	dict := profiles.Dictionary()
+	dict.StackTable().AppendEmpty()
+	dict.StringTable().Append("")
+	dict.StringTable().Append("cpu")
+	dict.StringTable().Append("nanoseconds")
+	dict.StringTable().Append("off_cpu")
+	dict.StringTable().Append("count")
+	profileScope := profiles.ResourceProfiles().AppendEmpty().ScopeProfiles().AppendEmpty()
+	for _, sampleTypeIndex := range []int32{1, 4} {
+		profile := profileScope.Profiles().AppendEmpty()
+		profile.SampleType().SetTypeStrindex(sampleTypeIndex)
+		profile.SampleType().SetUnitStrindex(2)
+		profile.Samples().AppendEmpty().Values().Append(1)
+	}
+
+	firstErr := c.pushProfilesData(t.Context(), profiles)
+	require.ErrorContains(t, firstErr, "503")
+	retryErr, ok := errors.AsType[xconsumererror.Profiles](firstErr)
+	require.True(t, ok)
+	assert.Equal(t, 1, retryErr.Data().SampleCount(), "only the supported profile should be retried")
+	got, err := getMetricValue(reader, "otelcol_exporter_dropped_unsupported_profile_records")
+	require.NoError(t, err)
+	assert.Equal(t, []int64{1}, got)
+
+	require.NoError(t, c.pushProfilesData(t.Context(), retryErr.Data()))
+	got, err = getMetricValue(reader, "otelcol_exporter_dropped_unsupported_profile_records")
+	require.NoError(t, err)
+	assert.Equal(t, []int64{1}, got, "retrying supported profiles must not recount the dropped profile")
+}
+
+func TestProfileDataRetryPreservesResourceAttributes(t *testing.T) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	config.MaxContentLengthLogs, config.DisableCompression = 0, true
+	c := newProfilesClient(exportertest.NewNopSettings(metadata.Type), config)
+
+	var observedHosts []string
+	httpClient, _ := newTestClientWithPresetResponses([]int{http.StatusServiceUnavailable, http.StatusOK}, []string{"NOK", "OK"}, func(body []byte) {
+		for line := range bytes.SplitSeq(bytes.TrimSpace(body), []byte("\n")) {
+			if len(line) == 0 {
+				continue
+			}
+			var hecEvent translator.Event
+			require.NoError(t, json.Unmarshal(line, &hecEvent))
+			observedHosts = append(observedHosts, hecEvent.Host)
+		}
+	})
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	profiles := pprofile.NewProfiles()
+	profiles.Dictionary().StackTable().AppendEmpty()
+	profiles.Dictionary().StringTable().Append("")
+	profiles.Dictionary().StringTable().Append("cpu")
+	profiles.Dictionary().StringTable().Append("nanoseconds")
+
+	rp := profiles.ResourceProfiles().AppendEmpty()
+	rp.Resource().Attributes().PutStr("host.name", "profile-host")
+	profile := rp.ScopeProfiles().AppendEmpty().Profiles().AppendEmpty()
+	profile.SampleType().SetTypeStrindex(1)
+	profile.SampleType().SetUnitStrindex(2)
+	profile.Samples().AppendEmpty().Values().Append(1)
+
+	err := c.pushProfilesData(t.Context(), profiles)
+	require.ErrorContains(t, err, "503")
+	require.False(t, consumererror.IsPermanent(err), "the failed send must be retryable")
+
+	require.NoError(t, c.pushProfilesData(t.Context(), profiles))
+	assert.Equal(t, []string{"profile-host", "profile-host"}, observedHosts)
+	value, found := rp.Resource().Attributes().Get("host.name")
+	require.True(t, found)
+	assert.Equal(t, "profile-host", value.Str())
+}
+
+func TestProfileDataPartialSuccessRetriesOnlyUnsentProfiles(t *testing.T) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	config.MaxContentLengthLogs, config.DisableCompression = 700, true
+	c := newProfilesClient(exportertest.NewNopSettings(metadata.Type), config)
+
+	var requests [][]string
+	httpClient, _ := newTestClientWithPresetResponses(
+		[]int{http.StatusOK, http.StatusServiceUnavailable, http.StatusOK},
+		[]string{"OK", "NOK", "OK"},
+		func(body []byte) {
+			var hosts []string
+			for line := range bytes.SplitSeq(bytes.TrimSpace(body), []byte("\n")) {
+				if len(line) == 0 {
+					continue
+				}
+				var hecEvent translator.Event
+				require.NoError(t, json.Unmarshal(line, &hecEvent))
+				hosts = append(hosts, hecEvent.Host)
+			}
+			requests = append(requests, hosts)
+		},
+	)
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	profiles := pprofile.NewProfiles()
+	profiles.Dictionary().StackTable().AppendEmpty()
+	profiles.Dictionary().StringTable().Append("")
+	profiles.Dictionary().StringTable().Append("cpu")
+	profiles.Dictionary().StringTable().Append("nanoseconds")
+	for i, host := range []string{"host-a", "host-b", "host-c"} {
+		rp := profiles.ResourceProfiles().AppendEmpty()
+		rp.Resource().Attributes().PutStr("host.name", host)
+		profile := rp.ScopeProfiles().AppendEmpty().Profiles().AppendEmpty()
+		profile.SampleType().SetTypeStrindex(1)
+		profile.SampleType().SetUnitStrindex(2)
+		profile.Samples().AppendEmpty().Values().Append(int64(i + 1))
+	}
+
+	err := c.pushProfilesData(t.Context(), profiles)
+	require.ErrorContains(t, err, "503")
+	profilesErr, ok := errors.AsType[xconsumererror.Profiles](err)
+	require.True(t, ok, "retryable profile send errors must carry the unsent profile subset")
+	require.NoError(t, c.pushProfilesData(t.Context(), profilesErr.Data()))
+
+	require.GreaterOrEqual(t, len(requests), 3)
+	require.NotEmpty(t, requests[0])
+	require.NotEmpty(t, requests[1])
+	retriedHosts := map[string]int{}
+	for _, request := range requests[2:] {
+		for _, host := range request {
+			retriedHosts[host]++
+		}
+	}
+	for _, host := range requests[0] {
+		assert.Zero(t, retriedHosts[host], "profiles from the successful first request must not be resent")
+	}
+	for _, host := range requests[1] {
+		assert.Equal(t, 1, retriedHosts[host], "profiles from the failed request must be retried once")
+	}
+}
+
+// TestProfileDataMultiValueSamples verifies the OTel profiles data model: a Sample with
+// multiple values is a per-observation time series of a single sample type (paired 1:1 with
+// timestamps_unix_nano), not multiple distinct sample types. Each observation must become its
+// own pprof sample, and the profile must carry exactly one sample type.
+func TestProfileDataMultiValueSamples(t *testing.T) {
+	profiles := pprofile.NewProfiles()
+	dict := profiles.Dictionary()
+	// Index 0 of each dictionary table is the zero-value sentinel; real entries start at 1.
+	dict.StackTable().AppendEmpty()
+	dict.StringTable().Append("")
+	dict.StringTable().Append("cpu")
+	dict.StringTable().Append("nanoseconds")
+
+	sp := profiles.ResourceProfiles().AppendEmpty().ScopeProfiles().AppendEmpty()
+	sp.Scope().SetName("runtime/profiler")
+	p := sp.Profiles().AppendEmpty()
+	p.SampleType().SetTypeStrindex(1)
+	p.SampleType().SetUnitStrindex(2)
+	t0 := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
+	t1 := t0.Add(10 * time.Millisecond)
+	sample := p.Samples().AppendEmpty()
+	sample.Values().Append(1)
+	sample.Values().Append(2)
+	sample.TimestampsUnixNano().Append(uint64(t0.UnixNano()))
+	sample.TimestampsUnixNano().Append(uint64(t1.UnixNano()))
+
+	logs, errs := buildProfilesLogs(profiles)
+	require.Empty(t, errs)
+	require.Equal(t, 1, logs.LogRecordCount())
+
+	pprofProfile := decodePprofLogRecord(t, logs.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0))
+	// One sample type, one pprof sample per observation.
+	require.Len(t, pprofProfile.SampleType, 1)
+	require.Equal(t, "cpu", pprofProfile.SampleType[0].Type)
+	require.Equal(t, "nanoseconds", pprofProfile.SampleType[0].Unit)
+	require.Len(t, pprofProfile.Sample, 2)
+	require.Equal(t, []int64{1}, pprofProfile.Sample[0].Value)
+	require.Equal(t, []int64{2}, pprofProfile.Sample[1].Value)
+	// source.event.time is taken from each observation's own timestamp.
+	require.Equal(t, []int64{t0.UnixMilli()}, pprofProfile.Sample[0].NumLabel["source.event.time"])
+	require.Equal(t, []int64{t1.UnixMilli()}, pprofProfile.Sample[1].NumLabel["source.event.time"])
+}
+
+func TestProfileDataTimestampsOnlySample(t *testing.T) {
+	profiles := pprofile.NewProfiles()
+	dict := profiles.Dictionary()
+	dict.StackTable().AppendEmpty()
+	dict.StringTable().Append("")
+	dict.StringTable().Append("cpu")
+	dict.StringTable().Append("nanoseconds")
+
+	sp := profiles.ResourceProfiles().AppendEmpty().ScopeProfiles().AppendEmpty()
+	sp.Scope().SetName("runtime/profiler")
+	p := sp.Profiles().AppendEmpty()
+	p.SampleType().SetTypeStrindex(1)
+	p.SampleType().SetUnitStrindex(2)
+	t0 := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
+	t1 := t0.Add(10 * time.Millisecond)
+	sample := p.Samples().AppendEmpty()
+	sample.TimestampsUnixNano().Append(uint64(t0.UnixNano()))
+	sample.TimestampsUnixNano().Append(uint64(t1.UnixNano()))
+
+	logs, errs := buildProfilesLogs(profiles)
+	require.Empty(t, errs)
+	require.Equal(t, 1, logs.LogRecordCount())
+
+	pprofProfile := decodePprofLogRecord(t, logs.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0))
+	require.Len(t, pprofProfile.Sample, 1)
+	require.Equal(t, []int64{2}, pprofProfile.Sample[0].Value)
+	// source.event.time uses the first timestamp (only one event time survives aggregation).
+	require.Equal(t, []int64{t0.UnixMilli()}, pprofProfile.Sample[0].NumLabel["source.event.time"])
+}
+
+func decodePprofLogRecord(t *testing.T, lr plog.LogRecord) *profile.Profile {
+	t.Helper()
+	decoded, err := base64.StdEncoding.DecodeString(lr.Body().AsString())
+	require.NoError(t, err)
+	gr, err := gzip.NewReader(bytes.NewBuffer(decoded))
+	require.NoError(t, err)
+	defer gr.Close()
+	raw, err := io.ReadAll(gr)
+	require.NoError(t, err)
+	pprofProfile, err := profile.ParseData(raw)
+	require.NoError(t, err)
+	return pprofProfile
+}
+
+func TestProfileDataMultipleResources(t *testing.T) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	config.MaxContentLengthLogs, config.DisableCompression = 0, true
+
+	c := newProfilesClient(exportertest.NewNopSettings(metadata.Type), config)
+
+	var mu sync.Mutex
+	var observedHosts []string
+
+	httpClient, _ := newTestClientWithBodyReader(func(body []byte) {
+		// Each HEC batch may contain multiple newline-delimited JSON events.
+		for line := range bytes.SplitSeq(bytes.TrimSpace(body), []byte("\n")) {
+			if len(line) == 0 {
+				continue
+			}
+			var hecEvent translator.Event
+			require.NoError(t, json.Unmarshal(line, &hecEvent))
+			mu.Lock()
+			observedHosts = append(observedHosts, hecEvent.Host)
+			mu.Unlock()
+		}
+	})
+
+	profiles := pprofile.NewProfiles()
+	profiles.Dictionary().StackTable().AppendEmpty()
+	profiles.Dictionary().StringTable().Append("")
+	profiles.Dictionary().StringTable().Append("cpu")
+	profiles.Dictionary().StringTable().Append("nanoseconds")
+
+	rp1 := profiles.ResourceProfiles().AppendEmpty()
+	rp1.Resource().Attributes().PutStr("host.name", "host-a")
+	p1 := rp1.ScopeProfiles().AppendEmpty().Profiles().AppendEmpty()
+	p1.SampleType().SetTypeStrindex(1)
+	p1.SampleType().SetUnitStrindex(2)
+	p1.Samples().AppendEmpty().Values().Append(1)
+
+	rp2 := profiles.ResourceProfiles().AppendEmpty()
+	rp2.Resource().Attributes().PutStr("host.name", "host-b")
+	p2 := rp2.ScopeProfiles().AppendEmpty().Profiles().AppendEmpty()
+	p2.SampleType().SetTypeStrindex(1)
+	p2.SampleType().SetUnitStrindex(2)
+	p2.Samples().AppendEmpty().Values().Append(2)
+
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	require.NoError(t, c.pushProfilesData(t.Context(), profiles))
+
+	assert.ElementsMatch(t, []string{"host-a", "host-b"}, observedHosts,
+		"each resource's profiles must be emitted with its own host.name, not all under the first resource")
+}
+
+// TestProfileDataTotalFrameCount verifies that profiling.data.total.frame.count reflects
+// the sum of stack depths (location indices) across all samples, not the sample count.
+func TestProfileDataTotalFrameCount(t *testing.T) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	config.MaxContentLengthLogs, config.DisableCompression = 0, true
+
+	c := newProfilesClient(exportertest.NewNopSettings(metadata.Type), config)
+
+	var mu sync.Mutex
+	var observedFrameCounts []int64
+
+	httpClient, _ := newTestClientWithBodyReader(func(body []byte) {
+		for line := range bytes.SplitSeq(bytes.TrimSpace(body), []byte("\n")) {
+			if len(line) == 0 {
+				continue
+			}
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(line, &raw))
+			fields, ok := raw["fields"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if v, ok := fields[profilingDataTotalFrameCountKey]; ok {
+				mu.Lock()
+				observedFrameCounts = append(observedFrameCounts, int64(v.(float64)))
+				mu.Unlock()
+			}
+		}
+	})
+
+	profiles := pprofile.NewProfiles()
+	dict := profiles.Dictionary()
+	dict.StringTable().Append("")
+	dict.StringTable().Append("cpu")
+	dict.StringTable().Append("nanoseconds")
+
+	// Add 3 empty locations (indices 0, 1, 2) so the translator can look them up.
+	dict.LocationTable().AppendEmpty()
+	dict.LocationTable().AppendEmpty()
+	dict.LocationTable().AppendEmpty()
+
+	// Stack 0: sentinel (zero-value)
+	dict.StackTable().AppendEmpty()
+	// Stack 1: 3 location indices → 3 frames
+	stack1 := dict.StackTable().AppendEmpty()
+	stack1.LocationIndices().Append(0)
+	stack1.LocationIndices().Append(1)
+	stack1.LocationIndices().Append(2)
+	// Stack 2: 1 location index → 1 frame
+	stack2 := dict.StackTable().AppendEmpty()
+	stack2.LocationIndices().Append(0)
+
+	p := profiles.ResourceProfiles().AppendEmpty().ScopeProfiles().AppendEmpty().Profiles().AppendEmpty()
+	p.SampleType().SetTypeStrindex(1)
+	p.SampleType().SetUnitStrindex(2)
+
+	// Sample A: stack 1 → 3 frames
+	sA := p.Samples().AppendEmpty()
+	sA.Values().Append(1)
+	sA.SetStackIndex(1)
+
+	// Sample B: stack 2 → 1 frame
+	sB := p.Samples().AppendEmpty()
+	sB.Values().Append(1)
+	sB.SetStackIndex(2)
+
+	// Total frames = 3 + 1 = 4; sample count = 2 (wrong value without the fix)
+
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	require.NoError(t, c.pushProfilesData(t.Context(), profiles))
+
+	require.Len(t, observedFrameCounts, 1)
+	assert.Equal(t, int64(4), observedFrameCounts[0],
+		"profiling.data.total.frame.count must be the sum of stack depths (4), not the sample count (2)")
+}
+
+// TestProfileDataTranslationErrorIsPerProfile verifies that when one profile in a batch fails to
+// translate, the remaining valid profiles are still exported and the returned error is permanent.
+func TestProfileDataTranslationErrorIsPerProfile(t *testing.T) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	config.MaxContentLengthLogs, config.DisableCompression = 0, true
+
+	c := newProfilesClient(exportertest.NewNopSettings(metadata.Type), config)
+
+	var mu sync.Mutex
+	var observedHosts []string
+
+	httpClient, _ := newTestClientWithBodyReader(func(body []byte) {
+		for line := range bytes.SplitSeq(bytes.TrimSpace(body), []byte("\n")) {
+			if len(line) == 0 {
+				continue
+			}
+			var hecEvent translator.Event
+			require.NoError(t, json.Unmarshal(line, &hecEvent))
+			mu.Lock()
+			observedHosts = append(observedHosts, hecEvent.Host)
+			mu.Unlock()
+		}
+	})
+
+	profiles := pprofile.NewProfiles()
+	dict := profiles.Dictionary()
+	dict.StackTable().AppendEmpty()
+	dict.StringTable().Append("")
+	dict.StringTable().Append("cpu")
+	dict.StringTable().Append("nanoseconds")
+
+	// Resource 1: well-formed profile — should export successfully.
+	rp1 := profiles.ResourceProfiles().AppendEmpty()
+	rp1.Resource().Attributes().PutStr("host.name", "good-host")
+	goodProfile := rp1.ScopeProfiles().AppendEmpty().Profiles().AppendEmpty()
+	goodProfile.SampleType().SetTypeStrindex(1)
+	goodProfile.SampleType().SetUnitStrindex(2)
+	goodProfile.Samples().AppendEmpty().Values().Append(1)
+
+	// Resource 2: profile with an out-of-range sample type string index. This
+	// must be rejected without affecting the shared dictionary or good profile.
+	rp2 := profiles.ResourceProfiles().AppendEmpty()
+	rp2.Resource().Attributes().PutStr("host.name", "bad-host")
+	badProfile := rp2.ScopeProfiles().AppendEmpty().Profiles().AppendEmpty()
+	badProfile.SampleType().SetTypeStrindex(3) // The string table contains indices 0 through 2.
+	badSample := badProfile.Samples().AppendEmpty()
+	badSample.Values().Append(1)
+
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	err := c.pushProfilesData(t.Context(), profiles)
+
+	// The good profile must have been shipped.
+	assert.Contains(t, observedHosts, "good-host", "good profile must be exported despite sibling failure")
+	// The bad profile must not have been shipped.
+	assert.NotContains(t, observedHosts, "bad-host")
+	// The combined error must be non-nil and permanent.
+	require.Error(t, err)
+	assert.True(t, consumererror.IsPermanent(err))
+	assert.ErrorContains(t, err, "profile sample type string index 3 out of range")
+}
+
+// 10 resources, 10 records, 1Kb max HEC batch: 17 HEC batches
+func Benchmark_pushLogData_10_10_1024(b *testing.B) {
+	benchPushLogData(b, 10, 10, 1024, false)
+}
+
+// 10 resources, 10 records, 8Kb max HEC batch: 2 HEC batches
+func Benchmark_pushLogData_10_10_8K(b *testing.B) {
+	benchPushLogData(b, 10, 10, 8*1024, false)
+}
+
+// 10 resources, 10 records, 1Mb max HEC batch: 1 HEC batch
+func Benchmark_pushLogData_10_10_2M(b *testing.B) {
+	benchPushLogData(b, 10, 10, 2*1024*1024, false)
+}
+
+// 10 resources, 200 records, 2Mb max HEC batch: 1 HEC batch
+func Benchmark_pushLogData_10_200_2M(b *testing.B) {
+	benchPushLogData(b, 10, 200, 2*1024*1024, false)
+}
+
+// 100 resources, 200 records, 2Mb max HEC batch: 2 HEC batches
+func Benchmark_pushLogData_100_200_2M(b *testing.B) {
+	benchPushLogData(b, 100, 200, 2*1024*1024, false)
+}
+
+// 100 resources, 200 records, 5Mb max HEC batch: 1 HEC batches
+func Benchmark_pushLogData_100_200_5M(b *testing.B) {
+	benchPushLogData(b, 100, 200, 5*1024*1024, false)
+}
+
+// 10 resources, 10 records, 1Kb max HEC batch: 2 HEC batches
+func Benchmark_pushLogData_compressed_10_10_1024(b *testing.B) {
+	benchPushLogData(b, 10, 10, 1024, true)
+}
+
+// 10 resources, 10 records, 8Kb max HEC batch: 1 HEC batch
+func Benchmark_pushLogData_compressed_10_10_8K(b *testing.B) {
+	benchPushLogData(b, 10, 10, 8*1024, true)
+}
+
+// 10 resources, 10 records, 1Mb max HEC batch: 1 HEC batch
+func Benchmark_pushLogData_compressed_10_10_2M(b *testing.B) {
+	benchPushLogData(b, 10, 10, 2*1024*1024, true)
+}
+
+// 10 resources, 200 records, 2Mb max HEC batch: 1 HEC batch
+func Benchmark_pushLogData_compressed_10_200_2M(b *testing.B) {
+	benchPushLogData(b, 10, 200, 2*1024*1024, true)
+}
+
+// 100 resources, 200 records, 2Mb max HEC batch: 1 HEC batch
+func Benchmark_pushLogData_compressed_100_200_2M(b *testing.B) {
+	benchPushLogData(b, 100, 200, 2*1024*1024, true)
+}
+
+// 100 resources, 200 records, 5Mb max HEC batch: 1 HEC batches
+func Benchmark_pushLogData_compressed_100_200_5M(b *testing.B) {
+	benchPushLogData(b, 100, 200, 5*1024*1024, true)
+}
+
+func benchPushLogData(b *testing.B, numResources, numRecords int, bufSize uint, compressionEnabled bool) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	config.MaxContentLengthLogs = bufSize
+	config.DisableCompression = !compressionEnabled
+	c := newLogsClient(exportertest.NewNopSettings(metadata.Type), config)
+	c.hecWorker = &mockHecWorker{}
+	exp, err := exporterhelper.NewLogs(b.Context(), exportertest.NewNopSettings(metadata.Type), config,
+		c.pushLogData)
+	require.NoError(b, err)
+	exp = &baseLogsExporter{
+		Component: exp,
+		Logs: &perScopeBatcher{
+			logsEnabled: true,
+			logger:      zap.NewNop(),
+			next:        exp,
+		},
+	}
+
+	logs := createLogData(numResources, 1, numRecords)
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		err := exp.ConsumeLogs(b.Context(), logs)
+		require.NoError(b, err)
+	}
+}
+
+// 10 resources, 10 records, 1Kb max HEC batch: 17 HEC batches
+func Benchmark_pushMetricData_10_10_1024(b *testing.B) {
+	benchPushMetricData(b, 10, 10, 1024, false, false)
+}
+
+// 10 resources, 10 records, 8Kb max HEC batch: 2 HEC batches
+func Benchmark_pushMetricData_10_10_8K(b *testing.B) {
+	benchPushMetricData(b, 10, 10, 8*1024, false, false)
+}
+
+// 10 resources, 10 records, 1Mb max HEC batch: 1 HEC batch
+func Benchmark_pushMetricData_10_10_2M(b *testing.B) {
+	benchPushMetricData(b, 10, 10, 2*1024*1024, false, false)
+}
+
+// 10 resources, 200 records, 2Mb max HEC batch: 1 HEC batch
+func Benchmark_pushMetricData_10_200_2M(b *testing.B) {
+	benchPushMetricData(b, 10, 200, 2*1024*1024, false, false)
+}
+
+// 100 resources, 200 records, 2Mb max HEC batch: 2 HEC batches
+func Benchmark_pushMetricData_100_200_2M(b *testing.B) {
+	benchPushMetricData(b, 100, 200, 2*1024*1024, false, false)
+}
+
+// 100 resources, 200 records, 5Mb max HEC batch: 1 HEC batches
+func Benchmark_pushMetricData_100_200_5M(b *testing.B) {
+	benchPushMetricData(b, 100, 200, 5*1024*1024, false, false)
+}
+
+// 10 resources, 10 records, 1Kb max HEC batch: 2 HEC batches
+func Benchmark_pushMetricData_compressed_10_10_1024(b *testing.B) {
+	benchPushMetricData(b, 10, 10, 1024, true, false)
+}
+
+// 10 resources, 10 records, 8Kb max HEC batch: 1 HEC batch
+func Benchmark_pushMetricData_compressed_10_10_8K(b *testing.B) {
+	benchPushMetricData(b, 10, 10, 8*1024, true, false)
+}
+
+// 10 resources, 10 records, 1Mb max HEC batch: 1 HEC batch
+func Benchmark_pushMetricData_compressed_10_10_2M(b *testing.B) {
+	benchPushMetricData(b, 10, 10, 2*1024*1024, true, false)
+}
+
+// 10 resources, 200 records, 2Mb max HEC batch: 1 HEC batch
+func Benchmark_pushMetricData_compressed_10_200_2M(b *testing.B) {
+	benchPushMetricData(b, 10, 200, 2*1024*1024, true, false)
+}
+
+// 100 resources, 200 records, 2Mb max HEC batch: 1 HEC batch
+func Benchmark_pushMetricData_compressed_100_200_2M(b *testing.B) {
+	benchPushMetricData(b, 100, 200, 2*1024*1024, true, false)
+}
+
+// 100 resources, 200 records, 5Mb max HEC batch: 1 HEC batches
+func Benchmark_pushMetricData_compressed_100_200_5M(b *testing.B) {
+	benchPushMetricData(b, 100, 200, 5*1024*1024, true, false)
+}
+
+// 10 resources, 10 records, 1Kb max HEC batch: 17 HEC batches
+func Benchmark_pushMetricData_10_10_1024_MultiMetric(b *testing.B) {
+	benchPushMetricData(b, 10, 10, 1024, false, true)
+}
+
+// 10 resources, 10 records, 8Kb max HEC batch: 2 HEC batches
+func Benchmark_pushMetricData_10_10_8K_MultiMetric(b *testing.B) {
+	benchPushMetricData(b, 10, 10, 8*1024, false, true)
+}
+
+// 10 resources, 10 records, 1Mb max HEC batch: 1 HEC batch
+func Benchmark_pushMetricData_10_10_2M_MultiMetric(b *testing.B) {
+	benchPushMetricData(b, 10, 10, 2*1024*1024, false, true)
+}
+
+// 10 resources, 200 records, 2Mb max HEC batch: 1 HEC batch
+func Benchmark_pushMetricData_10_200_2M_MultiMetric(b *testing.B) {
+	benchPushMetricData(b, 10, 200, 2*1024*1024, false, true)
+}
+
+// 100 resources, 200 records, 2Mb max HEC batch: 2 HEC batches
+func Benchmark_pushMetricData_100_200_2M_MultiMetric(b *testing.B) {
+	benchPushMetricData(b, 100, 200, 2*1024*1024, false, true)
+}
+
+// 100 resources, 200 records, 5Mb max HEC batch: 1 HEC batches
+func Benchmark_pushMetricData_100_200_5M_MultiMetric(b *testing.B) {
+	benchPushMetricData(b, 100, 200, 5*1024*1024, false, true)
+}
+
+// 10 resources, 10 records, 1Kb max HEC batch: 2 HEC batches
+func Benchmark_pushMetricData_compressed_10_10_1024_MultiMetric(b *testing.B) {
+	benchPushMetricData(b, 10, 10, 1024, true, true)
+}
+
+// 10 resources, 10 records, 8Kb max HEC batch: 1 HEC batch
+func Benchmark_pushMetricData_compressed_10_10_8K_MultiMetric(b *testing.B) {
+	benchPushMetricData(b, 10, 10, 8*1024, true, true)
+}
+
+// 10 resources, 10 records, 1Mb max HEC batch: 1 HEC batch
+func Benchmark_pushMetricData_compressed_10_10_2M_MultiMetric(b *testing.B) {
+	benchPushMetricData(b, 10, 10, 2*1024*1024, true, true)
+}
+
+// 10 resources, 200 records, 2Mb max HEC batch: 1 HEC batch
+func Benchmark_pushMetricData_compressed_10_200_2M_MultiMetric(b *testing.B) {
+	benchPushMetricData(b, 10, 200, 2*1024*1024, true, true)
+}
+
+// 100 resources, 200 records, 2Mb max HEC batch: 1 HEC batch
+func Benchmark_pushMetricData_compressed_100_200_2M_MultiMetric(b *testing.B) {
+	benchPushMetricData(b, 100, 200, 2*1024*1024, true, true)
+}
+
+// 100 resources, 200 records, 5Mb max HEC batch: 1 HEC batches
+func Benchmark_pushMetricData_compressed_100_200_5M_MultiMetric(b *testing.B) {
+	benchPushMetricData(b, 100, 200, 5*1024*1024, true, true)
+}
+
+func benchPushMetricData(b *testing.B, numResources, numRecords int, bufSize uint, compressionEnabled, useMultiMetricFormat bool) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	config.MaxContentLengthMetrics = bufSize
+	config.DisableCompression = !compressionEnabled
+	config.UseMultiMetricFormat = useMultiMetricFormat
+	c := newLogsClient(exportertest.NewNopSettings(metadata.Type), config)
+	c.hecWorker = &mockHecWorker{}
+	exp, err := exporterhelper.NewMetrics(b.Context(), exportertest.NewNopSettings(metadata.Type), config,
+		c.pushMetricsData)
+	require.NoError(b, err)
+
+	metrics := createMetricsData(numResources, numRecords)
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		err := exp.ConsumeMetrics(b.Context(), metrics)
+		require.NoError(b, err)
+	}
+}
+
+func BenchmarkConsumeLogsRejected(b *testing.B) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	config.DisableCompression = true
+	c := newLogsClient(exportertest.NewNopSettings(metadata.Type), config)
+	c.hecWorker = &mockHecWorker{failSend: true}
+
+	exp, err := exporterhelper.NewLogs(b.Context(), exportertest.NewNopSettings(metadata.Type), config,
+		c.pushLogData)
+	require.NoError(b, err)
+
+	logs := createLogData(10, 1, 100)
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		err := exp.ConsumeLogs(b.Context(), logs)
+		require.Error(b, err)
+	}
+}
+
+func Test_pushLogData_Small_MaxContentLength(t *testing.T) {
+	config := NewFactory().CreateDefaultConfig().(*Config)
+	config.MaxContentLengthLogs = 1
 
 	logs := createLogData(1, 1, 2000)
 
 	for _, disable := range []bool{true, false} {
-		c.config.DisableCompression = disable
+		config.DisableCompression = disable
 
-		err := c.pushLogData(context.Background(), logs)
+		c := newLogsClient(exportertest.NewNopSettings(metadata.Type), config)
+		c.hecWorker = &defaultHecWorker{&url.URL{Scheme: "http", Host: "splunk"}, http.DefaultClient, buildHTTPHeaders(config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+		err := c.pushLogData(t.Context(), logs)
 		require.Error(t, err)
 
 		assert.True(t, consumererror.IsPermanent(err))
-		assert.Contains(t, err.Error(), "dropped log event")
+		assert.ErrorContains(t, err, "dropped log event")
+	}
+}
+
+func TestAllowedLogDataTypes(t *testing.T) {
+	tests := []struct {
+		name               string
+		allowProfilingData bool
+		allowLogData       bool
+	}{
+		{
+			name:               "both_allowed",
+			allowProfilingData: true,
+			allowLogData:       true,
+		},
+		{
+			name:               "logs_allowed",
+			allowProfilingData: false,
+			allowLogData:       true,
+		},
+		{
+			name:               "profiling_allowed",
+			allowProfilingData: true,
+			allowLogData:       false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			logs := createLogDataWithCustomLibraries(1, []string{"otel.logs", "otel.profiling"}, []int{1, 1})
+			cfg := NewFactory().CreateDefaultConfig().(*Config)
+			cfg.LogDataEnabled = test.allowLogData
+			cfg.ProfilingDataEnabled = test.allowProfilingData
+
+			numBatches := 1
+			if test.allowLogData && test.allowProfilingData {
+				numBatches = 2
+			}
+
+			requests, err := runLogExport(t, cfg, logs, numBatches)
+			assert.NoError(t, err)
+
+			seenLogs := false
+			seenProfiling := false
+			for _, r := range requests {
+				if r.headers.Get(libraryHeaderName) == profilingLibraryName {
+					seenProfiling = true
+				} else {
+					seenLogs = true
+				}
+			}
+			assert.Equal(t, test.allowLogData, seenLogs)
+			assert.Equal(t, test.allowProfilingData, seenProfiling)
+		})
 	}
 }
 
@@ -790,47 +2861,350 @@ func TestSubLogs(t *testing.T) {
 	logs := createLogData(2, 2, 3)
 
 	// Logs subset from leftmost index (resource 0, library 0, record 0).
-	_0_0_0 := &logIndex{resource: 0, library: 0, record: 0} //revive:disable-line:var-naming
-	got := subLogs(&logs, _0_0_0)
+	got := subLogs(logs, iterState{resource: 0, library: 0, record: 0})
 
 	// Number of logs in subset should equal original logs.
 	assert.Equal(t, logs.LogRecordCount(), got.LogRecordCount())
 
 	// The name of the leftmost log record should be 0_0_0.
-	assert.Equal(t, "0_0_0", got.ResourceLogs().At(0).InstrumentationLibraryLogs().At(0).Logs().At(0).Name())
+	val, _ := got.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Attributes().Get(splunk.DefaultNameLabel)
+	assert.Equal(t, "0_0_0", val.AsString())
 	// The name of the rightmost log record should be 1_1_2.
-	assert.Equal(t, "1_1_2", got.ResourceLogs().At(1).InstrumentationLibraryLogs().At(1).Logs().At(2).Name())
+	val, _ = got.ResourceLogs().At(1).ScopeLogs().At(1).LogRecords().At(2).Attributes().Get(splunk.DefaultNameLabel)
+	assert.Equal(t, "1_1_2", val.AsString())
 
 	// Logs subset from some mid index (resource 0, library 1, log 2).
-	_0_1_2 := &logIndex{resource: 0, library: 1, record: 2} //revive:disable-line:var-naming
-	got = subLogs(&logs, _0_1_2)
+	got = subLogs(logs, iterState{resource: 0, library: 1, record: 2})
 
 	assert.Equal(t, 7, got.LogRecordCount())
 
 	// The name of the leftmost log record should be 0_1_2.
-	assert.Equal(t, "0_1_2", got.ResourceLogs().At(0).InstrumentationLibraryLogs().At(0).Logs().At(0).Name())
+	val, _ = got.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Attributes().Get(splunk.DefaultNameLabel)
+	assert.Equal(t, "0_1_2", val.AsString())
 	// The name of the rightmost log record should be 1_1_2.
-	assert.Equal(t, "1_1_2", got.ResourceLogs().At(1).InstrumentationLibraryLogs().At(1).Logs().At(2).Name())
+	val, _ = got.ResourceLogs().At(1).ScopeLogs().At(1).LogRecords().At(2).Attributes().Get(splunk.DefaultNameLabel)
+	assert.Equal(t, "1_1_2", val.AsString())
 
 	// Logs subset from rightmost index (resource 1, library 1, log 2).
-	_1_1_2 := &logIndex{resource: 1, library: 1, record: 2} //revive:disable-line:var-naming
-	got = subLogs(&logs, _1_1_2)
+	got = subLogs(logs, iterState{resource: 1, library: 1, record: 2})
 
 	// Number of logs in subset should be 1.
 	assert.Equal(t, 1, got.LogRecordCount())
 
 	// The name of the sole log record should be 1_1_2.
-	assert.Equal(t, "1_1_2", got.ResourceLogs().At(0).InstrumentationLibraryLogs().At(0).Logs().At(0).Name())
+	val, _ = got.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Attributes().Get(splunk.DefaultNameLabel)
+	assert.Equal(t, "1_1_2", val.AsString())
 }
 
-// validateCompressedEqual validates that GZipped `got` contains `expected` string
-func validateCompressedEqual(t *testing.T, expected string, got []byte) {
+func TestPushLogsPartialSuccess(t *testing.T) {
+	cfg := NewFactory().CreateDefaultConfig().(*Config)
+	cfg.ExportRaw = true
+	cfg.MaxContentLengthLogs = 6
+	c := newLogsClient(exportertest.NewNopSettings(metadata.Type), cfg)
+
+	// The first request succeeds, the second fails.
+	httpClient, _ := newTestClientWithPresetResponses([]int{200, 503}, []string{"OK", "NOK"}, func(_ []byte) {})
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(cfg, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	logs := plog.NewLogs()
+	logRecords := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
+	logRecords.AppendEmpty().Body().SetStr("log-1")         // should be successfully sent
+	logRecords.AppendEmpty().Body().SetStr("log-2-too-big") // should be permanently rejected as it's too big
+	logRecords.AppendEmpty().Body().SetStr("log-3")         // should be rejected and returned to for retry
+
+	err := c.pushLogData(t.Context(), logs)
+	expectedErr := consumererror.Logs{}
+	require.ErrorContains(t, err, "503")
+	require.ErrorAs(t, err, &expectedErr)
+	require.Equal(t, 1, expectedErr.Data().LogRecordCount())
+	assert.Equal(t, "log-3", expectedErr.Data().ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().Str())
+}
+
+func TestPushLogsRetryableFailureMultipleResources(t *testing.T) {
+	c := newLogsClient(exportertest.NewNopSettings(metadata.Type), NewFactory().CreateDefaultConfig().(*Config))
+
+	httpClient, _ := newTestClientWithPresetResponses([]int{503}, []string{"NOK"}, func(_ []byte) {})
+	url := &url.URL{Scheme: "http", Host: "splunk"}
+	c.hecWorker = &defaultHecWorker{url, httpClient, buildHTTPHeaders(c.config, component.NewDefaultBuildInfo()), zap.NewNop()}
+
+	logs := plog.NewLogs()
+	logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("log-1")
+	logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("log-2")
+	logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("log-3")
+
+	err := c.pushLogData(t.Context(), logs)
+	expectedErr := consumererror.Logs{}
+	require.ErrorContains(t, err, "503")
+	require.ErrorAs(t, err, &expectedErr)
+	assert.Equal(t, logs, expectedErr.Data())
+}
+
+// runBatchedLogExport is a variant of runLogExport that enables the
+// exporterhelper batcher and collects all requests received until n have
+// arrived or a 10-second timeout.  Shutdown is used to force-flush pending
+// batcher items before waiting.
+func runBatchedLogExport(t *testing.T, cfg *Config, ld plog.Logs, expectedBatchesNum int) []receivedRequest {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	cfg.ClientConfig.Endpoint = "http://" + listener.Addr().String() + "/services/collector"
+	cfg.Token = "1234-1234"
+
+	// Buffered channel so the handler's synchronous send never blocks the exporter.
+	rr := make(chan receivedRequest, 64)
+	capture := capturingData{testing: t, receivedRequest: rr, statusCode: 200, checkCompression: !cfg.DisableCompression}
+	s := &http.Server{
+		Handler:           &capture,
+		ReadHeaderTimeout: 20 * time.Second,
+	}
+	go func() {
+		if e := s.Serve(listener); e != http.ErrServerClosed {
+			assert.NoError(t, e)
+		}
+	}()
+	defer s.Close()
+
+	params := exportertest.NewNopSettings(metadata.Type)
+	exp, err := NewFactory().CreateLogs(t.Context(), params, cfg)
+	require.NoError(t, err)
+	require.NoError(t, exp.Start(t.Context(), componenttest.NewNopHost()))
+
+	require.NoError(t, exp.ConsumeLogs(t.Context(), ld))
+
+	// Shutdown flushes all pending batcher items before returning.
+	require.NoError(t, exp.Shutdown(t.Context()))
+
+	// Collect exactly expectedBatchesNum requests, with a generous timeout to
+	// account for batcher flush scheduling.
+	var requests []receivedRequest
+	deadline := time.After(10 * time.Second)
+	for len(requests) < expectedBatchesNum {
+		select {
+		case req := <-rr:
+			requests = append(requests, req)
+		case <-deadline:
+			require.Len(t, requests, expectedBatchesNum, "timed out waiting for HTTP requests")
+			return requests
+		}
+	}
+	return requests
+}
+
+// TestBatcherPartitionsByHecToken verifies that when the exporterhelper batcher
+// is enabled, log resources with different HEC tokens are sent as separate HTTP
+// requests (different Authorization headers), while resources sharing the same
+// token are batched into a single request.
+func TestBatcherPartitionsByHecToken(t *testing.T) {
+	makeCfg := func() *Config {
+		cfg := createDefaultConfig().(*Config)
+		batch := cfg.QueueSettings.Get().Batch.GetOrInsertDefault()
+		batch.FlushTimeout = 200 * time.Millisecond
+		batch.Sizer = exporterhelper.RequestSizerTypeItems
+		batch.MinSize = 2
+		return cfg
+	}
+
+	t.Run("different tokens produce separate HTTP requests", func(t *testing.T) {
+		ld := plog.NewLogs()
+
+		rl0 := ld.ResourceLogs().AppendEmpty()
+		rl0.Resource().Attributes().PutStr(splunk.HecTokenLabel, "token-A")
+		rl0.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("log from A")
+
+		rl1 := ld.ResourceLogs().AppendEmpty()
+		rl1.Resource().Attributes().PutStr(splunk.HecTokenLabel, "token-B")
+		rl1.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("log from B")
+
+		requests := runBatchedLogExport(t, makeCfg(), ld, 2)
+
+		authHeaders := []string{
+			requests[0].headers.Get("Authorization"),
+			requests[1].headers.Get("Authorization"),
+		}
+		sort.Strings(authHeaders)
+		assert.Equal(t, []string{"Splunk token-A", "Splunk token-B"}, authHeaders)
+	})
+
+	t.Run("same token resources are batched into one request", func(t *testing.T) {
+		ld := plog.NewLogs()
+		for range 2 {
+			rl := ld.ResourceLogs().AppendEmpty()
+			rl.Resource().Attributes().PutStr(splunk.HecTokenLabel, "token-same")
+			rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr("log")
+		}
+
+		requests := runBatchedLogExport(t, makeCfg(), ld, 1)
+		assert.Equal(t, "Splunk token-same", requests[0].headers.Get("Authorization"))
+	})
+}
+
+// validateCompressedContains validates that GZipped `got` contains `expected` strings
+func validateCompressedContains(t *testing.T, expected []string, got []byte) {
 	z, err := gzip.NewReader(bytes.NewReader(got))
 	require.NoError(t, err)
 	defer z.Close()
 
-	p, err := ioutil.ReadAll(z)
+	p, err := io.ReadAll(z)
 	require.NoError(t, err)
+	for _, e := range expected {
+		assert.Contains(t, string(p), e)
+	}
+}
 
-	assert.Equal(t, expected, string(p))
+func TestBuildHTTPHeaders(t *testing.T) {
+	buildInfo := component.BuildInfo{Version: "1.2.3"}
+
+	t.Run("splunk_app_version set explicitly", func(t *testing.T) {
+		cfg := &Config{
+			Token:            "test-token",
+			SplunkAppName:    "myapp",
+			SplunkAppVersion: "9.9.9",
+		}
+		headers := buildHTTPHeaders(cfg, buildInfo)
+		assert.Equal(t, "9.9.9", headers["__splunk_app_version"])
+		assert.Equal(t, "myapp/9.9.9", headers["User-Agent"])
+	})
+
+	t.Run("splunk_app_version unset falls back to build version", func(t *testing.T) {
+		cfg := &Config{
+			Token:         "test-token",
+			SplunkAppName: "myapp",
+		}
+		headers := buildHTTPHeaders(cfg, buildInfo)
+		assert.Equal(t, "1.2.3", headers["__splunk_app_version"])
+		assert.Equal(t, "myapp/1.2.3", headers["User-Agent"])
+	})
+}
+
+type capturingHecWorker struct {
+	batches [][]byte
+}
+
+func (c *capturingHecWorker) send(_ context.Context, buf buffer, _ map[string]string) error {
+	c.batches = append(c.batches, bytes.Clone(buf.Bytes()))
+	return nil
+}
+
+type multiMetricItem struct {
+	name      string
+	timestamp pcommon.Timestamp
+	oversized bool
+}
+
+func makeMultiMetricData(items ...multiMetricItem) pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	sm := rm.ScopeMetrics().AppendEmpty()
+	for i, item := range items {
+		m := sm.Metrics().AppendEmpty()
+		m.SetName(item.name)
+		dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
+		dp.SetIntValue(int64(i + 1))
+		dp.SetTimestamp(item.timestamp)
+		if item.oversized {
+			dp.Attributes().PutStr("large_attr", strings.Repeat("x", 400))
+		}
+	}
+	return md
+}
+
+func Test_PushMetricsData_MultiMetric_DropOversizedEvents(t *testing.T) {
+	newTestClient := func() (*client, *capturingHecWorker) {
+		cfg := NewFactory().CreateDefaultConfig().(*Config)
+		cfg.UseMultiMetricFormat = true
+		cfg.DisableCompression = true
+		// 300 bytes: oversized event (~500+ bytes) exceeds capacity on empty buffer,
+		// while normal events (~150 bytes) fit within 300 bytes.
+		cfg.MaxContentLengthMetrics = 300
+
+		c := newMetricsClient(exportertest.NewNopSettings(metadata.Type), cfg)
+		worker := &capturingHecWorker{}
+		c.hecWorker = worker
+		return c, worker
+	}
+
+	t.Run("oversized event followed by valid event", func(t *testing.T) {
+		c, worker := newTestClient()
+		md := makeMultiMetricData(
+			multiMetricItem{name: "oversized_first", timestamp: pcommon.Timestamp(1_000_000_000), oversized: true},
+			multiMetricItem{name: "valid_second", timestamp: pcommon.Timestamp(2_000_000_000), oversized: false},
+		)
+
+		err := c.pushMetricsData(t.Context(), md)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "dropped metric event")
+
+		require.Len(t, worker.batches, 1, "valid_second must be exported despite preceding oversized event")
+		assert.Contains(t, string(worker.batches[0]), "valid_second")
+		assert.NotContains(t, string(worker.batches[0]), "oversized_first")
+	})
+
+	t.Run("valid event followed by oversized event", func(t *testing.T) {
+		c, worker := newTestClient()
+		md := makeMultiMetricData(
+			multiMetricItem{name: "valid_first", timestamp: pcommon.Timestamp(1_000_000_000), oversized: false},
+			multiMetricItem{name: "oversized_second", timestamp: pcommon.Timestamp(2_000_000_000), oversized: true},
+		)
+
+		err := c.pushMetricsData(t.Context(), md)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "dropped metric event")
+
+		require.Len(t, worker.batches, 1, "valid_first must be exported")
+		assert.Contains(t, string(worker.batches[0]), "valid_first")
+		assert.NotContains(t, string(worker.batches[0]), "oversized_second")
+	})
+
+	t.Run("oversized event between two valid events", func(t *testing.T) {
+		c, worker := newTestClient()
+		md := makeMultiMetricData(
+			multiMetricItem{name: "valid_first", timestamp: pcommon.Timestamp(1_000_000_000), oversized: false},
+			multiMetricItem{name: "oversized_middle", timestamp: pcommon.Timestamp(2_000_000_000), oversized: true},
+			multiMetricItem{name: "valid_last", timestamp: pcommon.Timestamp(3_000_000_000), oversized: false},
+		)
+
+		err := c.pushMetricsData(t.Context(), md)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "dropped metric event")
+
+		require.Len(t, worker.batches, 2, "both valid events must be exported across batches")
+		assert.Contains(t, string(worker.batches[0]), "valid_first")
+		assert.Contains(t, string(worker.batches[1]), "valid_last")
+		for _, b := range worker.batches {
+			assert.NotContains(t, string(b), "oversized_middle")
+		}
+	})
+
+	t.Run("consecutive oversized events", func(t *testing.T) {
+		c, worker := newTestClient()
+		md := makeMultiMetricData(
+			multiMetricItem{name: "oversized_1", timestamp: pcommon.Timestamp(1_000_000_000), oversized: true},
+			multiMetricItem{name: "oversized_2", timestamp: pcommon.Timestamp(2_000_000_000), oversized: true},
+			multiMetricItem{name: "valid_3", timestamp: pcommon.Timestamp(3_000_000_000), oversized: false},
+		)
+
+		err := c.pushMetricsData(t.Context(), md)
+		require.Error(t, err)
+		// Both oversized events should be reported in permanent errors
+		assert.Equal(t, 2, strings.Count(err.Error(), "dropped metric event"))
+
+		require.Len(t, worker.batches, 1, "valid_3 must be exported after consecutive oversized drops")
+		assert.Contains(t, string(worker.batches[0]), "valid_3")
+	})
+
+	t.Run("all oversized events", func(t *testing.T) {
+		c, worker := newTestClient()
+		md := makeMultiMetricData(
+			multiMetricItem{name: "oversized_1", timestamp: pcommon.Timestamp(1_000_000_000), oversized: true},
+			multiMetricItem{name: "oversized_2", timestamp: pcommon.Timestamp(2_000_000_000), oversized: true},
+		)
+
+		err := c.pushMetricsData(t.Context(), md)
+		require.Error(t, err)
+		assert.Equal(t, 2, strings.Count(err.Error(), "dropped metric event"))
+		assert.Empty(t, worker.batches, "no batches should be exported when all events are oversized")
+	})
 }

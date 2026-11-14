@@ -1,59 +1,64 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package simpleprometheusreceiver
+package simpleprometheusreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/simpleprometheusreceiver"
 
 import (
+	"errors"
+	"fmt"
+	"net/http"
 	"net/url"
 	"time"
 
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/confignet"
+	configutil "github.com/prometheus/common/config"
+	"github.com/prometheus/common/model"
+	promconfig "github.com/prometheus/prometheus/config"
+	"go.opentelemetry.io/collector/config/confighttp"
 )
 
 // Config defines configuration for simple prometheus receiver.
 type Config struct {
-	config.ReceiverSettings `mapstructure:",squash"`
-	httpConfig              `mapstructure:",squash"`
-	confignet.TCPAddr       `mapstructure:",squash"`
+	ClientConfig confighttp.ClientConfig `mapstructure:",squash"` // squash ensures fields are correctly decoded in embedded struct.
 	// CollectionInterval is the interval at which metrics should be collected
 	CollectionInterval time.Duration `mapstructure:"collection_interval"`
 	// MetricsPath the path to the metrics endpoint.
 	MetricsPath string `mapstructure:"metrics_path"`
 	// Params the parameters to the metrics endpoint.
 	Params url.Values `mapstructure:"params,omitempty"`
+	// Labels static labels
+	Labels map[string]string `mapstructure:"labels,omitempty"`
 	// Whether or not to use pod service account to authenticate.
 	UseServiceAccount bool `mapstructure:"use_service_account"`
+	// JobName allows users to customize the job name optionally.
+	JobName string `mapstructure:"job_name"`
 }
 
-// TODO: Move to a common package for use by other receivers and also pull
-// in other utilities from
-// https://github.com/signalfx/signalfx-agent/blob/main/pkg/core/common/httpclient/http.go.
-type httpConfig struct {
-	// Whether not TLS is enabled
-	TLSEnabled bool      `mapstructure:"tls_enabled"`
-	TLSConfig  tlsConfig `mapstructure:"tls_config"`
-}
-
-// tlsConfig holds common TLS config options
-type tlsConfig struct {
-	// Path to the CA cert that has signed the TLS cert.
-	CAFile string `mapstructure:"ca_file"`
-	// Path to the client TLS cert to use for TLS required connections.
-	CertFile string `mapstructure:"cert_file"`
-	// Path to the client TLS key to use for TLS required connections.
-	KeyFile string `mapstructure:"key_file"`
-	// Whether or not to verify the exporter's TLS cert.
-	InsecureSkipVerify bool `mapstructure:"insecure_skip_verify"`
+// Validate checks the receiver configuration is valid.
+func (cfg *Config) Validate() error {
+	if cfg.ClientConfig.Endpoint == "" {
+		return errors.New("endpoint must be specified")
+	}
+	// Apply the same check the prometheus scrape manager applies to the target
+	// address. Its error is not wrapped because it echoes the endpoint value.
+	if promconfig.CheckTargetAddress(model.LabelValue(cfg.ClientConfig.Endpoint)) != nil {
+		return errors.New("endpoint must be host:port without a scheme or path; the scheme is selected from the tls settings and the path is set with metrics_path")
+	}
+	if cfg.CollectionInterval <= 0 {
+		return fmt.Errorf("collection_interval must be positive, got %s", cfg.CollectionInterval)
+	}
+	for _, header := range cfg.ClientConfig.Headers {
+		if _, ok := configutil.ReservedHeaders[http.CanonicalHeaderKey(header.Name)]; ok {
+			return fmt.Errorf("headers: header %q is reserved and cannot be set", header.Name)
+		}
+	}
+	if cfg.ClientConfig.ProxyURL != "" {
+		proxyURL, err := url.ParseRequestURI(cfg.ClientConfig.ProxyURL)
+		if err != nil {
+			return fmt.Errorf("proxy_url is not valid: %w", err)
+		}
+		if proxyURL.User != nil {
+			return errors.New("proxy_url must not contain credentials; see https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/52081")
+		}
+	}
+	return nil
 }

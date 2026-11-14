@@ -1,78 +1,196 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package dockerstatsreceiver
 
 import (
-	"path"
+	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configtest"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/config/configtls"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/filter"
+	"go.opentelemetry.io/collector/scraper/scraperhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/docker"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/dockerstatsreceiver/internal/metadata"
 )
 
+func loadConf(tb testing.TB, path string, id component.ID) *confmap.Conf {
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", path))
+	require.NoError(tb, err)
+	sub, err := cm.Sub(id.String())
+	require.NoError(tb, err)
+	return sub
+}
+
 func TestLoadConfig(t *testing.T) {
-	factories, err := componenttest.NopFactories()
-	assert.NoError(t, err)
+	t.Parallel()
 
+	tests := []struct {
+		id       component.ID
+		expected component.Config
+	}{
+		{
+			id:       component.NewIDWithName(metadata.Type, ""),
+			expected: createDefaultConfig(),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "tls"),
+			expected: &Config{
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 10 * time.Second,
+					InitialDelay:       time.Second,
+					Timeout:            5 * time.Second,
+				},
+				Config: docker.Config{
+					Endpoint:         "https://example.com/",
+					DockerAPIVersion: "1.44",
+					Timeout:          5 * time.Second,
+					TLS: configoptional.Some(configtls.ClientConfig{
+						InsecureSkipVerify: true,
+					}),
+				},
+				MetricsBuilderConfig: metadata.NewDefaultMetricsBuilderConfig(),
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "allsettings"),
+			expected: &Config{
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 2 * time.Second,
+					InitialDelay:       time.Second,
+					Timeout:            20 * time.Second,
+				},
+				Config: docker.Config{
+					Endpoint:         "http://example.com/",
+					DockerAPIVersion: "1.40",
+
+					Timeout: 20 * time.Second,
+					ExcludedImages: []string{
+						"undesired-container",
+						"another-*-container",
+					},
+				},
+
+				ContainerLabelsToResourceAttributes: []filter.Config{
+					{Strict: "my.container.label"},
+					{Regex: "my.container.prefix.*"},
+				},
+
+				ContainerLabelsToMetricLabels: map[string]string{
+					"my.container.label":       "my-metric-label",
+					"my.other.container.label": "my-other-metric-label",
+				},
+
+				EnvVarsToMetricLabels: map[string]string{
+					"MY_ENVIRONMENT_VARIABLE":       "my-metric-label",
+					"MY_OTHER_ENVIRONMENT_VARIABLE": "my-other-metric-label",
+				},
+				MetricsBuilderConfig: func() metadata.MetricsBuilderConfig {
+					m := metadata.NewDefaultMetricsBuilderConfig()
+					m.Metrics.ContainerCPUUsageSystem.Enabled = false
+					m.Metrics.ContainerMemoryTotalRss.Enabled = true
+					m.Metrics.ContainerStateHealthStatus.Enabled = true
+					return m
+				}(),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			sub := loadConf(t, "config.yaml", tt.id)
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			assert.NoError(t, confmap.Validate(cfg))
+			if diff := cmp.Diff(tt.expected, cfg,
+				// mdatagen gives metric and resource attribute configs an unexported enabledSetByUser,
+				// set from parser.IsSet("enabled"), so it is only true on the unmarshaled side:
+				// https://github.com/open-telemetry/opentelemetry-collector/blob/e4e58cda0aa6d5d4d275ff12072ae418410e6ae7/cmd/mdatagen/internal/templates/config.go.tmpl#L42-L44
+				cmp.FilterPath(func(p cmp.Path) bool {
+					return p.Last().String() == ".enabledSetByUser"
+				}, cmp.Ignore()),
+				// Allow go-cmp to read unexported fields instead of panicking on them, so new
+				// upstream fields can't break this (https://pkg.go.dev/github.com/google/go-cmp/cmp#Exporter).
+				cmp.Exporter(func(reflect.Type) bool { return true })); diff != "" {
+				t.Errorf("Config mismatch (-expected +actual):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestValidateErrors(t *testing.T) {
+	cfg := &Config{ControllerConfig: scraperhelper.NewDefaultControllerConfig(), Config: docker.Config{
+		DockerAPIVersion: "1.25",
+	}}
+	assert.ErrorContains(t, confmap.Validate(cfg), "endpoint must be specified")
+
+	cfg = &Config{
+		Config: docker.Config{
+			DockerAPIVersion: "1.21",
+			Endpoint:         "someEndpoint",
+		},
+		ControllerConfig: scraperhelper.ControllerConfig{CollectionInterval: 1 * time.Second},
+	}
+	assert.ErrorContains(t, confmap.Validate(cfg), `"api_version" 1.21 must be at least 1.25`)
+
+	cfg = &Config{
+		Config: docker.Config{
+			Endpoint:         "someEndpoint",
+			DockerAPIVersion: "1.25",
+		},
+		ControllerConfig: scraperhelper.ControllerConfig{},
+	}
+	assert.ErrorContains(t, confmap.Validate(cfg), `"collection_interval": requires positive value`)
+}
+
+func TestApiVersionCustomError(t *testing.T) {
+	sub := loadConf(t, "api_version_float.yaml", component.NewID(metadata.Type))
 	factory := NewFactory()
-	factories.Receivers[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
+	cfg := factory.CreateDefaultConfig()
+	err := sub.Unmarshal(cfg)
+	assert.ErrorContains(t, err,
+		`Hint: You may want to wrap the 'api_version' value in quotes (api_version: "1.40")`,
+	)
 
+	sub = loadConf(t, "api_version_string.yaml", component.NewID(metadata.Type))
+	err = sub.Unmarshal(cfg)
 	require.NoError(t, err)
-	require.NotNil(t, cfg)
-	assert.Equal(t, 2, len(cfg.Receivers))
+}
 
-	defaultConfig := cfg.Receivers[config.NewID(typeStr)]
-	assert.Equal(t, factory.CreateDefaultConfig(), defaultConfig)
-
-	dcfg := defaultConfig.(*Config)
-	assert.Equal(t, "docker_stats", dcfg.ID().String())
-	assert.Equal(t, "unix:///var/run/docker.sock", dcfg.Endpoint)
-	assert.Equal(t, 10*time.Second, dcfg.CollectionInterval)
-	assert.Equal(t, 5*time.Second, dcfg.Timeout)
-
-	assert.Nil(t, dcfg.ExcludedImages)
-	assert.Nil(t, dcfg.ContainerLabelsToMetricLabels)
-	assert.Nil(t, dcfg.EnvVarsToMetricLabels)
-
-	assert.False(t, dcfg.ProvidePerCoreCPUMetrics)
-
-	ascfg := cfg.Receivers[config.NewIDWithName(typeStr, "allsettings")].(*Config)
-	assert.Equal(t, "docker_stats/allsettings", ascfg.ID().String())
-	assert.Equal(t, "http://example.com/", ascfg.Endpoint)
-	assert.Equal(t, 2*time.Second, ascfg.CollectionInterval)
-	assert.Equal(t, 20*time.Second, ascfg.Timeout)
-
-	assert.Equal(t, []string{
-		"undesired-container",
-		"another-*-container",
-	}, ascfg.ExcludedImages)
-
-	assert.Equal(t, map[string]string{
-		"my.container.label":       "my-metric-label",
-		"my.other.container.label": "my-other-metric-label",
-	}, ascfg.ContainerLabelsToMetricLabels)
-
-	assert.Equal(t, map[string]string{
-		"my_environment_variable":       "my-metric-label",
-		"my_other_environment_variable": "my-other-metric-label",
-	}, ascfg.EnvVarsToMetricLabels)
-
-	assert.True(t, ascfg.ProvidePerCoreCPUMetrics)
+func TestValidateContainerLabelsToResourceAttributes(t *testing.T) {
+	tests := []struct {
+		name    string
+		filters []filter.Config
+		wantErr string
+	}{
+		{name: "valid strict", filters: []filter.Config{{Strict: "app"}}},
+		{name: "valid regexp", filters: []filter.Config{{Regex: "^com\\.example\\."}}},
+		{name: "empty entry", filters: []filter.Config{{}}, wantErr: "must specify either strict or regex"},
+		{name: "strict and regexp", filters: []filter.Config{{Strict: "app", Regex: "app"}}, wantErr: "strict and regex cannot be used together"},
+		{name: "invalid regexp", filters: []filter.Config{{Regex: "("}}, wantErr: "error parsing regexp"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := createDefaultConfig().(*Config)
+			cfg.ContainerLabelsToResourceAttributes = tt.filters
+			err := confmap.Validate(cfg)
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			assert.ErrorContains(t, err, tt.wantErr)
+		})
+	}
 }

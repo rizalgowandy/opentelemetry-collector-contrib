@@ -1,34 +1,27 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package awsemfexporter
+package awsemfexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsemfexporter"
 
 import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strconv"
 	"time"
 
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.uber.org/multierr"
 	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/cwlogs"
+	aws "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/metrics"
 )
 
 const (
 	// OTel instrumentation lib name as dimension
-	oTellibDimensionKey          = "OTelLib"
-	defaultNamespace             = "default"
-	noInstrumentationLibraryName = "Undefined"
+	oTellibDimensionKey = "OTelLib"
+	defaultNamespace    = "default"
 
 	// DimensionRollupOptions
 	zeroAndSingleDimensionRollup = "ZeroAndSingleDimensionRollup"
@@ -37,152 +30,187 @@ const (
 	prometheusReceiver        = "prometheus"
 	attributeReceiver         = "receiver"
 	fieldPrometheusMetricType = "prom_metric_type"
+
+	// metric attributes for AWS EMF, not to be treated as metric labels
+	emfStorageResolutionAttribute = "aws.emf.storage_resolution"
 )
 
-var fieldPrometheusTypes = map[pdata.MetricDataType]string{
-	pdata.MetricDataTypeNone:         "",
-	pdata.MetricDataTypeIntGauge:     "gauge",
-	pdata.MetricDataTypeDoubleGauge:  "gauge",
-	pdata.MetricDataTypeIntSum:       "counter",
-	pdata.MetricDataTypeDoubleSum:    "counter",
-	pdata.MetricDataTypeIntHistogram: "histogram",
-	pdata.MetricDataTypeHistogram:    "histogram",
-	pdata.MetricDataTypeSummary:      "summary",
+var fieldPrometheusTypes = map[pmetric.MetricType]string{
+	pmetric.MetricTypeEmpty:     "",
+	pmetric.MetricTypeGauge:     "gauge",
+	pmetric.MetricTypeSum:       "counter",
+	pmetric.MetricTypeHistogram: "histogram",
+	pmetric.MetricTypeSummary:   "summary",
 }
 
-type CWMetrics struct {
-	Measurements []CWMeasurement
-	TimestampMs  int64
-	Fields       map[string]interface{}
+type cWMetrics struct {
+	measurements []cWMeasurement
+	timestampMs  int64
+	fields       map[string]any
 }
 
-type CWMeasurement struct {
+type cWMetricInfo struct {
+	Name              string
+	Unit              string
+	StorageResolution int
+}
+
+type cWMeasurement struct {
 	Namespace  string
 	Dimensions [][]string
-	Metrics    []map[string]string
+	Metrics    []cWMetricInfo
 }
 
-type CWMetricStats struct {
+type cWMetricStats struct {
 	Max   float64
 	Min   float64
 	Count uint64
 	Sum   float64
 }
 
-type GroupedMetricMetadata struct {
-	Namespace   string
-	TimestampMs int64
-	LogGroup    string
-	LogStream   string
+// The SampleCount of CloudWatch metrics will be calculated by the sum of the 'Counts' array.
+// The 'Count' field should be same as the sum of the 'Counts' array and will be ignored in CloudWatch.
+type cWMetricHistogram struct {
+	Values []float64
+	Counts []float64
+	Max    float64
+	Min    float64
+	Count  uint64
+	Sum    float64
 }
 
-// CWMetricMetadata represents the metadata associated with a given CloudWatch metric
-type CWMetricMetadata struct {
-	GroupedMetricMetadata
-	InstrumentationLibraryName string
+type groupedMetricMetadata struct {
+	namespace                  string
+	timestampMs                int64
+	logGroup                   string
+	logStream                  string
+	metricDataType             pmetric.MetricType
+	batchIndex                 int
+	retainInitialValueForDelta bool
+}
 
-	receiver       string
-	metricDataType pdata.MetricDataType
+// cWMetricMetadata represents the metadata associated with a given CloudWatch metric
+type cWMetricMetadata struct {
+	groupedMetricMetadata
+	instrumentationScopeName string
+	receiver                 string
 }
 
 type metricTranslator struct {
 	metricDescriptor map[string]MetricDescriptor
+	calculators      *emfCalculators
 }
 
 func newMetricTranslator(config Config) metricTranslator {
 	mt := map[string]MetricDescriptor{}
 	for _, descriptor := range config.MetricDescriptors {
-		mt[descriptor.metricName] = descriptor
+		mt[descriptor.MetricName] = descriptor
 	}
 	return metricTranslator{
 		metricDescriptor: mt,
+		calculators: &emfCalculators{
+			delta:   aws.NewFloat64DeltaCalculator(),
+			summary: aws.NewMetricCalculator(calculateSummaryDelta),
+		},
 	}
 }
 
-// translateOTelToGroupedMetric converts OT metrics to Grouped Metric format.
-func (mt metricTranslator) translateOTelToGroupedMetric(rm *pdata.ResourceMetrics, groupedMetrics map[interface{}]*GroupedMetric, config *Config) {
-	timestamp := time.Now().UnixNano() / int64(time.Millisecond)
-	var instrumentationLibName string
-	cWNamespace := getNamespace(rm, config.Namespace)
-	logGroup, logStream := getLogInfo(rm, cWNamespace, config)
+func (mt metricTranslator) Shutdown() error {
+	var errs error
+	errs = multierr.Append(errs, mt.calculators.delta.Shutdown())
+	errs = multierr.Append(errs, mt.calculators.summary.Shutdown())
+	return errs
+}
 
-	ilms := rm.InstrumentationLibraryMetrics()
+// translateOTelToGroupedMetric converts OT metrics to Grouped Metric format.
+func (mt metricTranslator) translateOTelToGroupedMetric(rm pmetric.ResourceMetrics, groupedMetrics map[any]*groupedMetric, config *Config) error {
+	timestamp := time.Now().UnixNano() / int64(time.Millisecond)
+	var instrumentationScopeName string
+	cWNamespace := getNamespace(rm, config.Namespace)
+	logGroup, logStream, patternReplaceSucceeded := getLogInfo(rm, cWNamespace, config)
+	deltaInitialValue := config.RetainInitialValueOfDeltaMetric
+
+	ilms := rm.ScopeMetrics()
 	var metricReceiver string
 	if receiver, ok := rm.Resource().Attributes().Get(attributeReceiver); ok {
-		metricReceiver = receiver.StringVal()
+		metricReceiver = receiver.Str()
 	}
 	for j := 0; j < ilms.Len(); j++ {
 		ilm := ilms.At(j)
-		if ilm.InstrumentationLibrary().Name() == "" {
-			instrumentationLibName = noInstrumentationLibraryName
-		} else {
-			instrumentationLibName = ilm.InstrumentationLibrary().Name()
+		if ilm.Scope().Name() != "" {
+			instrumentationScopeName = ilm.Scope().Name()
 		}
 
 		metrics := ilm.Metrics()
 		for k := 0; k < metrics.Len(); k++ {
 			metric := metrics.At(k)
-			metadata := CWMetricMetadata{
-				GroupedMetricMetadata: GroupedMetricMetadata{
-					Namespace:   cWNamespace,
-					TimestampMs: timestamp,
-					LogGroup:    logGroup,
-					LogStream:   logStream,
+			metadata := cWMetricMetadata{
+				groupedMetricMetadata: groupedMetricMetadata{
+					namespace:                  cWNamespace,
+					timestampMs:                timestamp,
+					logGroup:                   logGroup,
+					logStream:                  logStream,
+					metricDataType:             metric.Type(),
+					batchIndex:                 0,
+					retainInitialValueForDelta: deltaInitialValue,
 				},
-				InstrumentationLibraryName: instrumentationLibName,
-				receiver:                   metricReceiver,
-				metricDataType:             metric.DataType(),
+				instrumentationScopeName: instrumentationScopeName,
+				receiver:                 metricReceiver,
 			}
-			addToGroupedMetric(&metric, groupedMetrics, metadata, config.logger, mt.metricDescriptor)
+			err := addToGroupedMetric(metric, groupedMetrics, metadata, patternReplaceSucceeded, mt.metricDescriptor, config, mt.calculators)
+			if err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 // translateGroupedMetricToCWMetric converts Grouped Metric format to CloudWatch Metric format.
-func translateGroupedMetricToCWMetric(groupedMetric *GroupedMetric, config *Config) *CWMetrics {
-	labels := groupedMetric.Labels
-	fieldsLength := len(labels) + len(groupedMetric.Metrics)
+func translateGroupedMetricToCWMetric(groupedMetric *groupedMetric, config *Config) *cWMetrics {
+	labels := filterAWSEMFAttributes(groupedMetric.labels)
+	fieldsLength := len(labels) + len(groupedMetric.metrics)
 
-	isPrometheusMetric := groupedMetric.Metadata.receiver == prometheusReceiver
+	isPrometheusMetric := groupedMetric.metadata.receiver == prometheusReceiver
 	if isPrometheusMetric {
 		fieldsLength++
 	}
-	fields := make(map[string]interface{}, fieldsLength)
+	fields := make(map[string]any, fieldsLength)
 
 	// Add labels to fields
 	for k, v := range labels {
 		fields[k] = v
 	}
 	// Add metrics to fields
-	for metricName, metricInfo := range groupedMetric.Metrics {
-		fields[metricName] = metricInfo.Value
+	for metricName, metricInfo := range groupedMetric.metrics {
+		fields[metricName] = metricInfo.value
 	}
 	if isPrometheusMetric {
-		fields[fieldPrometheusMetricType] = fieldPrometheusTypes[groupedMetric.Metadata.metricDataType]
+		fields[fieldPrometheusMetricType] = fieldPrometheusTypes[groupedMetric.metadata.metricDataType]
 	}
 
-	var cWMeasurements []CWMeasurement
+	var cWMeasurements []cWMeasurement
 	if len(config.MetricDeclarations) == 0 {
 		// If there are no metric declarations defined, translate grouped metric
 		// into the corresponding CW Measurement
 		cwm := groupedMetricToCWMeasurement(groupedMetric, config)
-		cWMeasurements = []CWMeasurement{cwm}
+		cWMeasurements = []cWMeasurement{cwm}
 	} else {
 		// If metric declarations are defined, filter grouped metric's metrics using
 		// metric declarations and translate into the corresponding list of CW Measurements
 		cWMeasurements = groupedMetricToCWMeasurementsWithFilters(groupedMetric, config)
 	}
 
-	return &CWMetrics{
-		Measurements: cWMeasurements,
-		TimestampMs:  groupedMetric.Metadata.TimestampMs,
-		Fields:       fields,
+	return &cWMetrics{
+		measurements: cWMeasurements,
+		timestampMs:  groupedMetric.metadata.timestampMs,
+		fields:       fields,
 	}
 }
 
 // groupedMetricToCWMeasurement creates a single CW Measurement from a grouped metric.
-func groupedMetricToCWMeasurement(groupedMetric *GroupedMetric, config *Config) CWMeasurement {
-	labels := groupedMetric.Labels
+func groupedMetricToCWMeasurement(groupedMetric *groupedMetric, config *Config) cWMeasurement {
+	labels := filterAWSEMFAttributes(groupedMetric.labels)
 	dimensionRollupOption := config.DimensionRollupOption
 
 	// Create a dimension set containing list of label names
@@ -192,6 +220,7 @@ func groupedMetricToCWMeasurement(groupedMetric *GroupedMetric, config *Config) 
 		dimSet[idx] = labelName
 		idx++
 	}
+
 	dimensions := [][]string{dimSet}
 
 	// Apply single/zero dimension rollup to labels
@@ -212,20 +241,26 @@ func groupedMetricToCWMeasurement(groupedMetric *GroupedMetric, config *Config) 
 	// Add on rolled-up dimensions
 	dimensions = append(dimensions, rollupDimensionArray...)
 
-	metrics := make([]map[string]string, len(groupedMetric.Metrics))
+	metrics := make([]cWMetricInfo, len(groupedMetric.metrics))
 	idx = 0
-	for metricName, metricInfo := range groupedMetric.Metrics {
-		metrics[idx] = map[string]string{
-			"Name": metricName,
+	for metricName, metricInfo := range groupedMetric.metrics {
+		metrics[idx] = cWMetricInfo{
+			Name:              metricName,
+			StorageResolution: 60,
 		}
-		if metricInfo.Unit != "" {
-			metrics[idx]["Unit"] = metricInfo.Unit
+		if metricInfo.unit != "" {
+			metrics[idx].Unit = metricInfo.unit
+		}
+		if storRes, ok := groupedMetric.labels[emfStorageResolutionAttribute]; ok {
+			if storResInt, err := strconv.Atoi(storRes); err == nil {
+				metrics[idx].StorageResolution = storResInt
+			}
 		}
 		idx++
 	}
 
-	return CWMeasurement{
-		Namespace:  groupedMetric.Metadata.Namespace,
+	return cWMeasurement{
+		Namespace:  groupedMetric.metadata.namespace,
 		Dimensions: dimensions,
 		Metrics:    metrics,
 	}
@@ -233,8 +268,8 @@ func groupedMetricToCWMeasurement(groupedMetric *GroupedMetric, config *Config) 
 
 // groupedMetricToCWMeasurementsWithFilters filters the grouped metric using the given list of metric
 // declarations and returns the corresponding list of CW Measurements.
-func groupedMetricToCWMeasurementsWithFilters(groupedMetric *GroupedMetric, config *Config) (cWMeasurements []CWMeasurement) {
-	labels := groupedMetric.Labels
+func groupedMetricToCWMeasurementsWithFilters(groupedMetric *groupedMetric, config *Config) (cWMeasurements []cWMeasurement) {
+	labels := filterAWSEMFAttributes(groupedMetric.labels)
 
 	// Filter metric declarations by labels
 	metricDeclarations := make([]*MetricDeclaration, 0, len(config.MetricDeclarations))
@@ -247,8 +282,8 @@ func groupedMetricToCWMeasurementsWithFilters(groupedMetric *GroupedMetric, conf
 	// If the whole batch of metrics don't match any metric declarations, drop them
 	if len(metricDeclarations) == 0 {
 		labelsStr, _ := json.Marshal(labels)
-		metricNames := make([]string, 0)
-		for metricName := range groupedMetric.Metrics {
+		var metricNames []string
+		for metricName := range groupedMetric.metrics {
 			metricNames = append(metricNames, metricName)
 		}
 		config.logger.Debug(
@@ -256,17 +291,17 @@ func groupedMetricToCWMeasurementsWithFilters(groupedMetric *GroupedMetric, conf
 			zap.String("Labels", string(labelsStr)),
 			zap.Strings("Metric Names", metricNames),
 		)
-		return
+		return cWMeasurements
 	}
 
 	// Group metrics by matched metric declarations
 	type metricDeclarationGroup struct {
 		metricDeclIdxList []int
-		metrics           []map[string]string
+		metrics           []cWMetricInfo
 	}
 
 	metricDeclGroups := make(map[string]*metricDeclarationGroup)
-	for metricName, metricInfo := range groupedMetric.Metrics {
+	for metricName, metricInfo := range groupedMetric.metrics {
 		// Filter metric declarations by metric name
 		var metricDeclIdx []int
 		for i, metricDeclaration := range metricDeclarations {
@@ -283,11 +318,17 @@ func groupedMetricToCWMeasurementsWithFilters(groupedMetric *GroupedMetric, conf
 			continue
 		}
 
-		metric := map[string]string{
-			"Name": metricName,
+		metric := cWMetricInfo{
+			Name:              metricName,
+			StorageResolution: 60,
 		}
-		if metricInfo.Unit != "" {
-			metric["Unit"] = metricInfo.Unit
+		if metricInfo.unit != "" {
+			metric.Unit = metricInfo.unit
+		}
+		if storRes, ok := groupedMetric.labels[emfStorageResolutionAttribute]; ok {
+			if storResInt, err := strconv.Atoi(storRes); err == nil {
+				metric.StorageResolution = storResInt
+			}
 		}
 		metricDeclKey := fmt.Sprint(metricDeclIdx)
 		if group, ok := metricDeclGroups[metricDeclKey]; ok {
@@ -295,20 +336,20 @@ func groupedMetricToCWMeasurementsWithFilters(groupedMetric *GroupedMetric, conf
 		} else {
 			metricDeclGroups[metricDeclKey] = &metricDeclarationGroup{
 				metricDeclIdxList: metricDeclIdx,
-				metrics:           []map[string]string{metric},
+				metrics:           []cWMetricInfo{metric},
 			}
 		}
 	}
 
 	if len(metricDeclGroups) == 0 {
-		return
+		return cWMeasurements
 	}
 
 	// Apply single/zero dimension rollup to labels
 	rollupDimensionArray := dimensionRollup(config.DimensionRollupOption, labels)
 
 	// Translate each group into a CW Measurement
-	cWMeasurements = make([]CWMeasurement, 0, len(metricDeclGroups))
+	cWMeasurements = make([]cWMeasurement, 0, len(metricDeclGroups))
 	for _, group := range metricDeclGroups {
 		var dimensions [][]string
 		// Extract dimensions from matched metric declarations
@@ -323,8 +364,8 @@ func groupedMetricToCWMeasurementsWithFilters(groupedMetric *GroupedMetric, conf
 
 		// Export metrics only with non-empty dimensions list
 		if len(dimensions) > 0 {
-			cwm := CWMeasurement{
-				Namespace:  groupedMetric.Metadata.Namespace,
+			cwm := cWMeasurement{
+				Namespace:  groupedMetric.metadata.namespace,
 				Dimensions: dimensions,
 				Metrics:    group.metrics,
 			}
@@ -332,23 +373,22 @@ func groupedMetricToCWMeasurementsWithFilters(groupedMetric *GroupedMetric, conf
 		}
 	}
 
-	return
+	return cWMeasurements
 }
 
 // translateCWMetricToEMF converts CloudWatch Metric format to EMF.
-func translateCWMetricToEMF(cWMetric *CWMetrics, config *Config) *LogEvent {
+func translateCWMetricToEMF(cWMetric *cWMetrics, config *Config) (*cwlogs.Event, error) {
 	// convert CWMetric into map format for compatible with PLE input
-	cWMetricMap := make(map[string]interface{})
-	fieldMap := cWMetric.Fields
+	fieldMap := cWMetric.fields
 
-	//restore the json objects that are stored as string in attributes
+	// restore the json objects that are stored as string in attributes
 	for _, key := range config.ParseJSONEncodedAttributeValues {
 		if fieldMap[key] == nil {
 			continue
 		}
 
 		if val, ok := fieldMap[key].(string); ok {
-			var f interface{}
+			var f any
 			err := json.Unmarshal([]byte(val), &f)
 			if err != nil {
 				config.logger.Debug(
@@ -369,25 +409,95 @@ func translateCWMetricToEMF(cWMetric *CWMetrics, config *Config) *LogEvent {
 		}
 	}
 
-	// Create `_aws` section only if there are measurements
-	if len(cWMetric.Measurements) > 0 {
-		// Create `_aws` section only if there are measurements
-		cWMetricMap["CloudWatchMetrics"] = cWMetric.Measurements
-		cWMetricMap["Timestamp"] = cWMetric.TimestampMs
-		fieldMap["_aws"] = cWMetricMap
+	// Create EMF metrics if there are measurements
+	// https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html#CloudWatch_Embedded_Metric_Format_Specification_structure
+	if len(cWMetric.measurements) > 0 {
+		if config.Version == "1" {
+			/* 	EMF V1
+				"Version": "1",
+				"_aws": {
+					"CloudWatchMetrics": [
+					{
+						"Namespace": "ECS",
+						"Dimensions": [ ["ClusterName"] ],
+						"Metrics": [{"Name": "memcached_commands_total"}]
+					}
+					],
+					"Timestamp": 1668387032641
+			  	}
+			*/
+			fieldMap["Version"] = "1"
+			fieldMap["_aws"] = map[string]any{
+				"CloudWatchMetrics": cWMetric.measurements,
+				"Timestamp":         cWMetric.timestampMs,
+			}
+		}
+	}
+
+	if config.Version == "0" {
+		fieldMap["Timestamp"] = fmt.Sprint(cWMetric.timestampMs)
+		if len(cWMetric.measurements) > 0 {
+			/* 	EMF V0
+				{
+					"Version": "0",
+					"CloudWatchMetrics": [
+					{
+						"Namespace": "ECS",
+						"Dimensions": [ ["ClusterName"] ],
+						"Metrics": [{"Name": "memcached_commands_total"}]
+					}
+					],
+					"Timestamp": "1668387032641"
+			  	}
+			*/
+			fieldMap["Version"] = "0"
+			fieldMap["CloudWatchMetrics"] = cWMetric.measurements
+		}
 	}
 
 	pleMsg, err := json.Marshal(fieldMap)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
-	metricCreationTime := cWMetric.TimestampMs
-	logEvent := newLogEvent(
+	metricCreationTime := cWMetric.timestampMs
+	logEvent := cwlogs.NewEvent(
 		metricCreationTime,
 		string(pleMsg),
 	)
-	logEvent.LogGeneratedTime = time.Unix(0, metricCreationTime*int64(time.Millisecond))
+	logEvent.GeneratedTime = time.Unix(0, metricCreationTime*int64(time.Millisecond))
 
-	return logEvent
+	return logEvent, nil
+}
+
+// Utility function that converts from groupedMetric to a cloudwatch event
+func translateGroupedMetricToEmf(groupedMetric *groupedMetric, config *Config, defaultLogStream string) (*cwlogs.Event, error) {
+	cWMetric := translateGroupedMetricToCWMetric(groupedMetric, config)
+	event, err := translateCWMetricToEMF(cWMetric, config)
+	if err != nil {
+		return nil, err
+	}
+
+	logGroup := groupedMetric.metadata.logGroup
+	logStream := groupedMetric.metadata.logStream
+
+	if logStream == "" {
+		logStream = defaultLogStream
+	}
+
+	event.LogGroupName = logGroup
+	event.LogStreamName = logStream
+
+	return event, nil
+}
+
+func filterAWSEMFAttributes(labels map[string]string) map[string]string {
+	// remove any labels that are attributes specific to AWS EMF Exporter
+	filteredLabels := make(map[string]string)
+	for labelName := range labels {
+		if labelName != emfStorageResolutionAttribute {
+			filteredLabels[labelName] = labels[labelName]
+		}
+	}
+	return filteredLabels
 }

@@ -1,21 +1,11 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package alibabacloudlogserviceexporter
+package alibabacloudlogserviceexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/alibabacloudlogserviceexporter"
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
 
@@ -25,10 +15,10 @@ import (
 	"go.uber.org/zap"
 )
 
-// LogServiceClient log Service's client wrapper
-type LogServiceClient interface {
-	// SendLogs send message to LogService
-	SendLogs(logs []*sls.Log) error
+// logServiceClient log Service's client wrapper
+type logServiceClient interface {
+	// sendLogs send message to LogService
+	sendLogs(logs []*sls.Log) error
 }
 
 type logServiceClientImpl struct {
@@ -52,26 +42,23 @@ func getIPAddress() (ipAddress string, err error) {
 	return ipAddress, err
 }
 
-// NewLogServiceClient Create Log Service client
-func NewLogServiceClient(config *Config, logger *zap.Logger) (LogServiceClient, error) {
+// newLogServiceClient Create Log Service client
+func newLogServiceClient(config *Config, logger *zap.Logger) (logServiceClient, error) {
 	if config == nil || config.Endpoint == "" || config.Project == "" || config.Logstore == "" {
 		return nil, errors.New("missing logservice params: Endpoint, Project, Logstore")
 	}
 
-	producerConfig := producer.GetDefaultProducerConfig()
-	producerConfig.Endpoint = config.Endpoint
-	producerConfig.AccessKeyID = config.AccessKeyID
-	producerConfig.AccessKeySecret = config.AccessKeySecret
-	if config.ECSRamRole != "" || config.TokenFilePath != "" {
-		tokenUpdateFunc, _ := slsutil.NewTokenUpdateFunc(config.ECSRamRole, config.TokenFilePath)
-		producerConfig.UpdateStsToken = tokenUpdateFunc
-		producerConfig.StsTokenShutDown = make(chan struct{})
+	producerConfig := newProducerConfig(config)
+
+	producer, err := producer.NewProducer(producerConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Log Service producer: %w", err)
 	}
 
 	c := &logServiceClientImpl{
 		project:        config.Project,
 		logstore:       config.Logstore,
-		clientInstance: producer.InitProducer(producerConfig),
+		clientInstance: producer,
 		logger:         logger,
 	}
 	c.clientInstance.Start()
@@ -82,13 +69,35 @@ func NewLogServiceClient(config *Config, logger *zap.Logger) (LogServiceClient, 
 	return c, nil
 }
 
-// SendLogs send message to LogService
-func (c *logServiceClientImpl) SendLogs(logs []*sls.Log) error {
+func newProducerConfig(config *Config) *producer.ProducerConfig {
+	producerConfig := producer.GetDefaultProducerConfig()
+	producerConfig.Endpoint = config.Endpoint
+	producerConfig.AccessKeyID = config.AccessKeyID
+	producerConfig.AccessKeySecret = string(config.AccessKeySecret)
+	if config.ECSRamRole != "" || config.TokenFilePath != "" {
+		tokenUpdateFunc, _ := slsutil.NewTokenUpdateFunc(config.ECSRamRole, config.TokenFilePath)
+		provider := sls.NewUpdateFuncProviderAdapter(tokenUpdateFunc)
+		producerConfig.CredentialsProvider = provider
+
+		producerConfig.StsTokenShutDown = make(chan struct{})
+	} else if config.SecurityToken != "" {
+		producerConfig.CredentialsProvider = sls.NewStaticCredentialsProvider(
+			config.AccessKeyID,
+			string(config.AccessKeySecret),
+			string(config.SecurityToken),
+		)
+	}
+
+	return producerConfig
+}
+
+// sendLogs send message to LogService
+func (c *logServiceClientImpl) sendLogs(logs []*sls.Log) error {
 	return c.clientInstance.SendLogListWithCallBack(c.project, c.logstore, c.topic, c.source, logs, c)
 }
 
 // Success is impl of producer.CallBack
-func (c *logServiceClientImpl) Success(*producer.Result) {}
+func (*logServiceClientImpl) Success(*producer.Result) {}
 
 // Fail is impl of producer.CallBack
 func (c *logServiceClientImpl) Fail(result *producer.Result) {

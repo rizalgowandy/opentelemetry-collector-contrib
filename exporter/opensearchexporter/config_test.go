@@ -1,0 +1,472 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package opensearchexporter
+
+import (
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configauth"
+	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/configopaque"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/config/configretry"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/opensearchexporter/internal/metadata"
+)
+
+func TestLoadConfig(t *testing.T) {
+	t.Parallel()
+
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
+	require.NoError(t, err)
+
+	sampleEndpoint := "https://opensearch.example.com:9200"
+	sampleCfg := withDefaultConfig(func(config *Config) {
+		config.ClientConfig.Endpoint = sampleEndpoint
+		config.BulkAction = defaultBulkAction
+	})
+
+	tests := []struct {
+		id                   component.ID
+		expected             component.Config
+		configValidateAssert assert.ErrorAssertionFunc
+	}{
+		{
+			id:                   component.NewIDWithName(metadata.Type, ""),
+			expected:             sampleCfg,
+			configValidateAssert: assert.NoError,
+		},
+		{
+			id:       component.NewIDWithName(metadata.Type, "default"),
+			expected: withDefaultConfig(),
+			configValidateAssert: func(t assert.TestingT, err error, _ ...any) bool {
+				return assert.ErrorContains(t, err, "endpoint must be specified")
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "trace"),
+			expected: &Config{
+				Dataset:   "ngnix",
+				Namespace: "eu",
+				ClientConfig: withDefaultHTTPClientConfig(func(config *confighttp.ClientConfig) {
+					config.Endpoint = sampleEndpoint
+					config.Timeout = 2 * time.Minute
+					config.Headers = configopaque.MapList{
+						{Name: "myheader", Value: "test"},
+					}
+					config.Auth = configoptional.Some(configauth.Config{AuthenticatorID: component.MustNewID("sample_basic_auth")})
+				}),
+				BackOffConfig: configretry.BackOffConfig{
+					Enabled:             true,
+					InitialInterval:     100 * time.Millisecond,
+					MaxInterval:         30 * time.Second,
+					MaxElapsedTime:      5 * time.Minute,
+					Multiplier:          1.5,
+					RandomizationFactor: 0.5,
+				},
+				BulkAction: defaultBulkAction,
+				MappingsSettings: MappingsSettings{
+					Mode: "ss4o",
+				},
+				QueueConfig: configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
+			},
+			configValidateAssert: assert.NoError,
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "empty_dataset"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.Dataset = ""
+				config.Namespace = "eu"
+			}),
+			configValidateAssert: func(t assert.TestingT, err error, _ ...any) bool {
+				return assert.ErrorContains(t, err, errDatasetNoValue.Error())
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "empty_namespace"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.Dataset = "ngnix"
+				config.Namespace = ""
+			}),
+			configValidateAssert: func(t assert.TestingT, err error, _ ...any) bool {
+				return assert.ErrorContains(t, err, errNamespaceNoValue.Error())
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "invalid_bulk_action"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.BulkAction = "delete"
+			}),
+			configValidateAssert: func(t assert.TestingT, err error, _ ...any) bool {
+				return assert.ErrorContains(t, err, errBulkActionInvalid.Error())
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "otel_v1_ism"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.BulkAction = defaultBulkAction
+				config.MappingsSettings = MappingsSettings{
+					Mode:                "otel-v1",
+					ManageIndexTemplate: true,
+					IndexTemplateFile:   "/etc/otelcol/otel-v1-overlay.json",
+					ISM: ISMConfig{
+						Enabled:             true,
+						RolloverMinSize:     "25gb",
+						RolloverMinIndexAge: "12h",
+						RolloverPriority:    200,
+					},
+				}
+			}),
+			configValidateAssert: assert.NoError,
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "dynamic_log_indexing"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.LogsIndex = "otel-logs-%{service.name}"
+				config.LogsIndexFallback = "default-service"
+				config.LogsIndexTimeFormat = "yyyy.MM.dd"
+			}),
+			configValidateAssert: assert.NoError,
+		},
+
+		{
+			id: component.NewIDWithName(metadata.Type, "log_index_time_format_valid"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.LogsIndex = "otel-logs-%{service.name}"
+				config.LogsIndexFallback = "default-service"
+				config.LogsIndexTimeFormat = "yyyy.MM.dd"
+			}),
+			configValidateAssert: assert.NoError,
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "log_index_time_format_empty"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.LogsIndex = "otel-logs-%{service.name}"
+				config.LogsIndexFallback = "default-service"
+				config.LogsIndexTimeFormat = ""
+			}),
+			configValidateAssert: assert.NoError,
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "log_index_time_format_invalid"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.LogsIndex = "otel-logs-%{service.name}"
+				config.LogsIndexFallback = "default-service"
+				config.LogsIndexTimeFormat = "invalid_format!"
+			}),
+			configValidateAssert: func(t assert.TestingT, err error, _ ...any) bool {
+				return assert.ErrorContains(t, err, errLogsIndexTimeFormatInvalid.Error())
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "log_index_time_format_whitespace"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.LogsIndex = "otel-logs-%{service.name}"
+				config.LogsIndexFallback = "default-service"
+				config.LogsIndexTimeFormat = "   "
+			}),
+			configValidateAssert: func(t assert.TestingT, err error, _ ...any) bool {
+				return assert.ErrorContains(t, err, errLogsIndexTimeFormatInvalid.Error())
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "log_index_time_format_special_chars"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.LogsIndex = "otel-logs-%{service.name}"
+				config.LogsIndexFallback = "default-service"
+				config.LogsIndexTimeFormat = "yyyy/MM/dd@!#"
+			}),
+			configValidateAssert: func(t assert.TestingT, err error, _ ...any) bool {
+				return assert.ErrorContains(t, err, errLogsIndexTimeFormatInvalid.Error())
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "traces_index_valid"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.TracesIndex = "otel-traces-%{service.name}"
+				config.TracesIndexFallback = "default-service"
+				config.TracesIndexTimeFormat = "yyyy.MM.dd"
+			}),
+			configValidateAssert: assert.NoError,
+		},
+
+		{
+			id: component.NewIDWithName(metadata.Type, "traces_index_time_format_valid"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.TracesIndex = "otel-traces-%{service.name}"
+				config.TracesIndexFallback = "default-service"
+				config.TracesIndexTimeFormat = "yyyy.MM.dd"
+			}),
+			configValidateAssert: assert.NoError,
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "traces_index_time_format_empty"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.TracesIndex = "otel-traces-%{service.name}"
+				config.TracesIndexFallback = "default-service"
+				config.TracesIndexTimeFormat = ""
+			}),
+			configValidateAssert: assert.NoError,
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "traces_index_time_format_invalid"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.TracesIndex = "otel-traces-%{service.name}"
+				config.TracesIndexFallback = "default-service"
+				config.TracesIndexTimeFormat = "invalid_format!"
+			}),
+			configValidateAssert: func(t assert.TestingT, err error, _ ...any) bool {
+				return assert.ErrorContains(t, err, errTracesIndexTimeFormatInvalid.Error())
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "metrics_index_valid"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.MetricsIndex = "otel-metrics-%{service.name}"
+				config.MetricsIndexFallback = "default-service"
+				config.MetricsIndexTimeFormat = "yyyy.MM.dd"
+			}),
+			configValidateAssert: assert.NoError,
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "metrics_index_time_format_invalid"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.MetricsIndex = "otel-metrics-%{service.name}"
+				config.MetricsIndexFallback = "default-service"
+				config.MetricsIndexTimeFormat = "invalid_format!"
+			}),
+			configValidateAssert: func(t assert.TestingT, err error, _ ...any) bool {
+				return assert.ErrorContains(t, err, errMetricsIndexTimeFormatInvalid.Error())
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "pipeline"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.Pipeline = "my-pipeline"
+			}),
+			configValidateAssert: assert.NoError,
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "otel_v1"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.MappingsSettings.Mode = "otel-v1"
+			}),
+			configValidateAssert: assert.NoError,
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "otel_v1_with_dataset"),
+			expected: withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = sampleEndpoint
+				config.Dataset = "ngnix"
+				config.MappingsSettings.Mode = "otel-v1"
+			}),
+			configValidateAssert: func(t assert.TestingT, err error, _ ...any) bool {
+				return assert.ErrorContains(t, err, errOTelV1DatasetNamespaceUnused.Error())
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
+
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			vv := confmap.Validate(cfg)
+			tt.configValidateAssert(t, vv)
+			assert.Equal(t, tt.expected, cfg)
+		})
+	}
+}
+
+// TestQueueConfigDefaults verifies that sending_queue gets proper defaults when only batch is configured
+func TestQueueConfigDefaults(t *testing.T) {
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
+	require.NoError(t, err)
+
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig()
+
+	sub, err := cm.Sub(component.NewIDWithName(metadata.Type, "sending_queue_with_batch").String())
+	require.NoError(t, err)
+	require.NoError(t, sub.Unmarshal(cfg))
+
+	actualCfg := cfg.(*Config)
+
+	// Verify QueueConfig has the expected defaults
+	require.True(t, actualCfg.QueueConfig.HasValue(), "QueueConfig should have a value")
+	queueCfg := actualCfg.QueueConfig.Get()
+	assert.Equal(t, 10, queueCfg.NumConsumers, "NumConsumers should default to 10")
+	assert.Equal(t, int64(1000), queueCfg.QueueSize, "QueueSize should default to 1000")
+	assert.True(t, queueCfg.Batch.HasValue(), "Batch should be configured")
+
+	// Verify config is valid (no crash)
+	require.NoError(t, actualCfg.Validate())
+}
+
+// withDefaultConfig create a new default configuration
+// and applies provided functions to it.
+func withDefaultConfig(fns ...func(*Config)) *Config {
+	cfg := newDefaultConfig().(*Config)
+	for _, fn := range fns {
+		fn(cfg)
+	}
+	return cfg
+}
+
+func withDefaultHTTPClientConfig(fns ...func(config *confighttp.ClientConfig)) confighttp.ClientConfig {
+	cfg := confighttp.NewDefaultClientConfig()
+	for _, fn := range fns {
+		fn(&cfg)
+	}
+	return cfg
+}
+
+func TestOTelV1MappingModeValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		mode        string
+		manageTpl   bool
+		expectError string
+	}{
+		{
+			name: "otel-v1 mode valid",
+			mode: "otel-v1",
+		},
+		{
+			name:      "otel-v1 with manage_index_template true",
+			mode:      "otel-v1",
+			manageTpl: true,
+		},
+		{
+			name:        "ss4o with manage_index_template true is invalid",
+			mode:        "ss4o",
+			manageTpl:   true,
+			expectError: errManageIndexTemplateInvalidMode.Error(),
+		},
+		{
+			name: "ss4o with manage_index_template false is valid",
+			mode: "ss4o",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = "http://localhost:9200"
+				config.MappingsSettings.Mode = tt.mode
+				config.MappingsSettings.ManageIndexTemplate = tt.manageTpl
+			})
+			err := cfg.Validate()
+			if tt.expectError != "" {
+				assert.ErrorContains(t, err, tt.expectError)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestISMAndCustomMappingValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(*Config)
+		expectError string
+	}{
+		{
+			name: "ism enabled with otel-v1 is valid",
+			mutate: func(c *Config) {
+				c.MappingsSettings.Mode = "otel-v1"
+				c.MappingsSettings.ISM.Enabled = true
+			},
+		},
+		{
+			name: "ism enabled with ss4o is invalid",
+			mutate: func(c *Config) {
+				c.MappingsSettings.Mode = "ss4o"
+				c.MappingsSettings.ISM.Enabled = true
+			},
+			expectError: errISMInvalidMode.Error(),
+		},
+		{
+			name: "ism enabled with dynamic logs_index is invalid",
+			mutate: func(c *Config) {
+				c.MappingsSettings.Mode = "otel-v1"
+				c.MappingsSettings.ISM.Enabled = true
+				c.LogsIndex = "otel-logs-%{service.name}"
+			},
+			expectError: errISMDynamicLogsIndex.Error() + `: "otel-logs-%{service.name}"`,
+		},
+		{
+			name: "ism enabled with dynamic traces_index is invalid",
+			mutate: func(c *Config) {
+				c.MappingsSettings.Mode = "otel-v1"
+				c.MappingsSettings.ISM.Enabled = true
+				c.TracesIndex = "otel-traces-%{service.name}"
+			},
+			expectError: errISMDynamicTracesIndex.Error() + `: "otel-traces-%{service.name}"`,
+		},
+		{
+			name: "index_template_file with otel-v1 and manage_index_template is valid",
+			mutate: func(c *Config) {
+				c.MappingsSettings.Mode = "otel-v1"
+				c.MappingsSettings.ManageIndexTemplate = true
+				c.MappingsSettings.IndexTemplateFile = "/tmp/custom.json"
+			},
+		},
+		{
+			name: "index_template_file without manage_index_template is invalid",
+			mutate: func(c *Config) {
+				c.MappingsSettings.Mode = "otel-v1"
+				c.MappingsSettings.ManageIndexTemplate = false
+				c.MappingsSettings.IndexTemplateFile = "/tmp/custom.json"
+			},
+			expectError: errIndexTemplateFileInvalidMode.Error(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := withDefaultConfig(func(config *Config) {
+				config.ClientConfig.Endpoint = "http://localhost:9200"
+				tt.mutate(config)
+			})
+			err := cfg.Validate()
+			if tt.expectError != "" {
+				assert.ErrorContains(t, err, tt.expectError)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}

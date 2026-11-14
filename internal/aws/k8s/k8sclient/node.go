@@ -1,18 +1,7 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package k8sclient
+package k8sclient // import "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/k8s/k8sclient"
 
 import (
 	"context"
@@ -41,9 +30,6 @@ type NodeClient interface {
 	ClusterFailedNodeCount() int
 	// Get the number of nodes for current cluster
 	ClusterNodeCount() int
-
-	// shutdown is only used internally by clientset to stop the NodeClient
-	shutdown()
 }
 
 type nodeClientOption func(*nodeClient)
@@ -99,14 +85,13 @@ func (c *nodeClient) refresh() {
 
 		failed := false
 
-	Loop:
 		for _, condition := range node.conditions {
 			if _, ok := failedNodeConditions[condition.Type]; ok {
 				// match the failedNodeConditions type we care about
 				if condition.Status != v1.ConditionFalse {
 					// if this is not false, i.e. true or unknown
 					failed = true
-					break Loop
+					break
 				}
 			}
 		}
@@ -151,7 +136,7 @@ func (c *nodeClient) shutdown() {
 	c.stopped = true
 }
 
-func transformFuncNode(obj interface{}) (interface{}, error) {
+func transformFuncNode(obj any) (any, error) {
 	node, ok := obj.(*v1.Node)
 	if !ok {
 		return nil, fmt.Errorf("input obj %v is not Node type", obj)
@@ -168,12 +153,11 @@ func transformFuncNode(obj interface{}) (interface{}, error) {
 }
 
 func createNodeListWatch(client kubernetes.Interface) cache.ListerWatcher {
-	ctx := context.Background()
 	return &cache.ListWatch{
-		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
+		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 			return client.CoreV1().Nodes().List(ctx, opts)
 		},
-		WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
 			return client.CoreV1().Nodes().Watch(ctx, opts)
 		},
 	}

@@ -1,0 +1,5 @@
+# The following demonstrates how to enable protocols with defaults.
+envoy_als/defaults:
+
+envoy_als/custom:
+  endpoint: localhost:4600

@@ -1,51 +1,73 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package ec2
+//go:build (!remove_all_resourcedetection_detectors || enable_detector_aws_ec2) && !omit_detector_aws_ec2
+
+package ec2 // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/aws/ec2"
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/conventions"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/processor"
+	conventions "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.uber.org/zap"
 
+	ec2provider "github.com/open-telemetry/opentelemetry-collector-contrib/internal/metadataproviders/aws/ec2"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/aws/ec2/internal/metadata"
 )
 
-const (
-	// TypeStr is type of detector.
-	TypeStr   = "ec2"
-	tagPrefix = "ec2.tag."
-)
+const tagPrefix = "ec2.tag."
 
 var _ internal.Detector = (*Detector)(nil)
 
-type Detector struct {
-	metadataProvider metadataProvider
-	tagKeyRegexes    []*regexp.Regexp
+type ec2ifaceBuilder interface {
+	buildClient(ctx context.Context, region string, client *http.Client) (ec2.DescribeTagsAPIClient, error)
 }
 
-func NewDetector(_ component.ProcessorCreateSettings, dcfg internal.DetectorConfig) (internal.Detector, error) {
+type ec2ClientBuilder struct{}
+
+func (*ec2ClientBuilder) buildClient(ctx context.Context, region string, client *http.Client) (ec2.DescribeTagsAPIClient, error) {
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(region),
+		config.WithHTTPClient(client),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return ec2.NewFromConfig(cfg), nil
+}
+
+type Detector struct {
+	metadataProvider      ec2provider.Provider
+	tagKeyRegexes         []*regexp.Regexp
+	logger                *zap.Logger
+	rb                    *metadata.ResourceBuilder
+	ec2ClientBuilder      ec2ifaceBuilder
+	failOnMissingMetadata bool
+	tagsFromIMDS          bool
+}
+
+func NewDetector(set processor.Settings, dcfg internal.DetectorConfig, failOnMissingMetadata bool) (internal.Detector, error) {
 	cfg := dcfg.(Config)
-	sess, err := session.NewSession()
+	awsConfig, err := config.LoadDefaultConfig(context.Background())
+	awsConfig.Retryer = func() aws.Retryer {
+		return retry.NewStandard(func(options *retry.StandardOptions) {
+			options.MaxAttempts = cfg.MaxAttempts
+			options.MaxBackoff = cfg.MaxBackoff
+		})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -53,68 +75,117 @@ func NewDetector(_ component.ProcessorCreateSettings, dcfg internal.DetectorConf
 	if err != nil {
 		return nil, err
 	}
-	return &Detector{metadataProvider: newMetadataClient(sess), tagKeyRegexes: tagKeyRegexes}, nil
+
+	return &Detector{
+		metadataProvider:      ec2provider.NewProvider(awsConfig),
+		tagKeyRegexes:         tagKeyRegexes,
+		logger:                set.Logger,
+		rb:                    metadata.NewResourceBuilder(cfg.ResourceAttributes),
+		ec2ClientBuilder:      &ec2ClientBuilder{},
+		failOnMissingMetadata: failOnMissingMetadata || cfg.FailOnMissingMetadata,
+		tagsFromIMDS:          cfg.TagsFromIMDS,
+	}, nil
 }
 
-func (d *Detector) Detect(ctx context.Context) (pdata.Resource, error) {
-	res := pdata.NewResource()
-	if !d.metadataProvider.available(ctx) {
-		return res, nil
+func (d *Detector) Detect(ctx context.Context) (resource pcommon.Resource, schemaURL string, err error) {
+	if _, err = d.metadataProvider.InstanceID(ctx); err != nil {
+		d.logger.Debug("EC2 metadata unavailable", zap.Error(err))
+		if d.failOnMissingMetadata {
+			return pcommon.NewResource(), "", err
+		}
+		return pcommon.NewResource(), "", nil
 	}
 
-	meta, err := d.metadataProvider.get(ctx)
+	meta, err := d.metadataProvider.Get(ctx)
 	if err != nil {
-		return res, fmt.Errorf("failed getting identity document: %w", err)
+		// This is probably not an actual EC2 instance, even though the initial d.metadataProvider.InstanceID(ctx) has succeeded.
+		// Some cloud providers (for example OpenStack Nova, see processor/resourcedetectionprocessor/internal/openstack/nova)
+		// provide a partial implementation of the AWS EC2 metadata endpoint, so
+		// http://169.254.169.254/latest/meta-data/instance-id works but
+		// http://169.254.169.254/latest/dynamic/instance-identity/document does not.
+		d.logger.Debug("EC2 instance identity document unavailable", zap.Error(err))
+		if d.failOnMissingMetadata || !isNotFound(err) {
+			// For failOnMissingMetadata==true, we want to return the error anyway. For failOnMissingMetadata==false: An HTTP 404
+			// indicates that the endpoint is not implemented, that is, that this is not an actual EC2 instance. For this case
+			// we return an empty resource and no error, to honor failOnMissingMetadata==false. Any other error might be
+			// transient, so it is returned here to be routed into detectWithRetry, instead of being silently ignored.
+			return pcommon.NewResource(), "", fmt.Errorf("failed getting identity document: %w", err)
+		}
+		return pcommon.NewResource(), "", nil
 	}
 
-	hostname, err := d.metadataProvider.hostname(ctx)
-	if err != nil {
-		return res, fmt.Errorf("failed getting hostname: %w", err)
+	hostname, hostnameErr := d.metadataProvider.Hostname(ctx)
+	if hostnameErr != nil {
+		if d.failOnMissingMetadata {
+			return pcommon.NewResource(), "", fmt.Errorf("failed getting hostname: %w", hostnameErr)
+		}
+		d.logger.Debug("EC2 hostname unavailable", zap.Error(hostnameErr))
+		// Continue without the hostname, the remaining attributes and the tags below are still worth reporting.
 	}
 
-	attr := res.Attributes()
-	attr.InsertString(conventions.AttributeCloudProvider, conventions.AttributeCloudProviderAWS)
-	attr.InsertString(conventions.AttributeCloudPlatform, conventions.AttributeCloudPlatformAWSEC2)
-	attr.InsertString(conventions.AttributeCloudRegion, meta.Region)
-	attr.InsertString(conventions.AttributeCloudAccount, meta.AccountID)
-	attr.InsertString(conventions.AttributeCloudAvailabilityZone, meta.AvailabilityZone)
-	attr.InsertString(conventions.AttributeHostID, meta.InstanceID)
-	attr.InsertString(conventions.AttributeHostImageID, meta.ImageID)
-	attr.InsertString(conventions.AttributeHostType, meta.InstanceType)
-	attr.InsertString(conventions.AttributeHostName, hostname)
+	d.rb.SetCloudProvider(conventions.CloudProviderAWS.Value.AsString())
+	d.rb.SetCloudPlatform(conventions.CloudPlatformAWSEC2.Value.AsString())
+	d.rb.SetCloudRegion(meta.Region)
+	d.rb.SetCloudAccountID(meta.AccountID)
+	d.rb.SetCloudAvailabilityZone(meta.AvailabilityZone)
+	d.rb.SetHostID(meta.InstanceID)
+	d.rb.SetHostImageID(meta.ImageID)
+	d.rb.SetHostType(meta.InstanceType)
+	if hostnameErr == nil {
+		d.rb.SetHostName(hostname)
+	}
+	res := d.rb.Emit()
 
 	if len(d.tagKeyRegexes) != 0 {
-		tags, err := connectAndFetchEc2Tags(meta.Region, meta.InstanceID, d.tagKeyRegexes)
-		if err != nil {
-			return res, fmt.Errorf("failed fetching ec2 instance tags: %w", err)
+		var tags map[string]string
+		if d.tagsFromIMDS {
+			// Use IMDS: no IAM permissions needed, requires InstanceMetadataTags=enabled on the instance
+			tags, err = fetchIMDSTags(ctx, d.metadataProvider, d.tagKeyRegexes)
+			if err != nil {
+				d.logger.Debug("failed to fetch tags from IMDS", zap.Error(err))
+			}
+		} else {
+			// Use EC2 DescribeTags API (default): requires ec2:DescribeTags IAM permission
+			httpClient := getClientConfig(ctx, d.logger)
+			ec2Client, err := d.ec2ClientBuilder.buildClient(ctx, meta.Region, httpClient)
+			if err != nil {
+				d.logger.Debug("failed to build ec2 client", zap.Error(err))
+				return res, conventions.SchemaURL, nil
+			}
+			tags, err = fetchEC2Tags(ctx, ec2Client, meta.InstanceID, d.tagKeyRegexes)
+			if err != nil {
+				d.logger.Debug("failed fetching ec2 instance tags", zap.Error(err))
+			}
 		}
 		for key, val := range tags {
-			attr.InsertString(tagPrefix+key, val)
+			res.Attributes().PutStr(tagPrefix+key, val)
 		}
 	}
-
-	return res, nil
+	return res, conventions.SchemaURL, nil
 }
 
-func connectAndFetchEc2Tags(region string, instanceID string, tagKeyRegexes []*regexp.Regexp) (map[string]string, error) {
-	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String(region)},
-	)
+// isNotFound reports whether err has been caused by an HTTP 404 response from the metadata endpoint.
+func isNotFound(err error) bool {
+	// The IMDS client reports non-2xx responses as *smithyhttp.ResponseError; matching on the status code accessor
+	// keeps this independent of which of the SDK's response error types is used.
+	var statusErr interface{ HTTPStatusCode() int }
+	return errors.As(err, &statusErr) && statusErr.HTTPStatusCode() == http.StatusNotFound
+}
+
+func getClientConfig(ctx context.Context, logger *zap.Logger) *http.Client {
+	client, err := internal.ClientFromContext(ctx)
 	if err != nil {
-		return nil, err
+		client = http.DefaultClient
+		logger.Debug("Error retrieving client from context thus creating default", zap.Error(err))
 	}
-	e := ec2.New(sess)
-
-	return fetchEC2Tags(e, instanceID, tagKeyRegexes)
+	return client
 }
 
-func fetchEC2Tags(svc ec2iface.EC2API, instanceID string, tagKeyRegexes []*regexp.Regexp) (map[string]string, error) {
-	ec2Tags, err := svc.DescribeTags(&ec2.DescribeTagsInput{
-		Filters: []*ec2.Filter{{
-			Name: aws.String("resource-id"),
-			Values: []*string{
-				aws.String(instanceID),
-			},
+func fetchEC2Tags(ctx context.Context, svc ec2.DescribeTagsAPIClient, instanceID string, tagKeyRegexes []*regexp.Regexp) (map[string]string, error) {
+	ec2Tags, err := svc.DescribeTags(ctx, &ec2.DescribeTagsInput{
+		Filters: []types.Filter{{
+			Name:   aws.String("resource-id"),
+			Values: []string{instanceID},
 		}},
 	})
 	if err != nil {
@@ -128,6 +199,28 @@ func fetchEC2Tags(svc ec2iface.EC2API, instanceID string, tagKeyRegexes []*regex
 		}
 	}
 	return tags, nil
+}
+
+func fetchIMDSTags(ctx context.Context, provider ec2provider.Provider, tagKeyRegexes []*regexp.Regexp) (map[string]string, error) {
+	keys, err := provider.Tags(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	tags := make(map[string]string)
+	var errs []error
+	for _, key := range keys {
+		if !regexArrayMatch(tagKeyRegexes, key) {
+			continue
+		}
+		val, err := provider.Tag(ctx, key)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to get tag value for key %q: %w", key, err))
+			continue
+		}
+		tags[key] = val
+	}
+	return tags, errors.Join(errs...)
 }
 
 func compileRegexes(cfg Config) ([]*regexp.Regexp, error) {

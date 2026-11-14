@@ -1,0 +1,49 @@
+bearertokenauth:
+bearertokenauth/sometoken:
+  token: "sometoken"
+bearertokenauth/withscheme:
+  scheme: MyScheme
+  token: "my-token"
+bearertokenauth/multipletokens:
+  scheme: "Bearer"
+  tokens:
+    - "token1"
+    - "thistokenalsoworks"
+bearertokenauth/withfilename:
+  scheme: "Bearer"
+  filename: "file-containing.token"
+bearertokenauth/both:
+  scheme: "Bearer"
+  token: "ignoredtoken"
+  filename: "file-containing.token"
+bearertokenauth/withtokensandfilename:
+  scheme: "Bearer"
+  tokens:
+    - "ignoredtoken1"
+    - "ignoredtoken2"
+  filename: "file-containing.token"
+bearertokenauth/tokensandtoken:
+  scheme: "Bearer"
+  tokens:
+    - "token1"
+    - "thistokenalsoworks"
+  token: "my-token"
+bearertokenauth/withheader:
+  header: "X-Custom-Authorization"
+  scheme: ""
+  token: "my-token"
+bearertokenauth/withretryonfailure:
+  scheme: "Bearer"
+  filename: "file-containing.token"
+  retry_on_failure:
+    enabled: true
+    max_retries: 5
+    interval: 2s
+bearertokenauth/withwaitfortokenfile:
+  scheme: "Bearer"
+  filename: "file-containing.token"
+  wait_for_token_file: true
+  retry_on_failure:
+    enabled: true
+    max_retries: 5
+    interval: 2s

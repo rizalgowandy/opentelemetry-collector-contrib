@@ -4,10 +4,10 @@ receivers:
 processors:
 
 exporters:
-  loadbalancing:
+  load_balancing:
     protocol:
       otlp:
-        endpoint: should-be-replaced
+        endpoint: should-be-replaced:4317
 
     resolver:
       static:
@@ -20,10 +20,10 @@ service:
       - nop
       processors: []
       exporters:
-      - loadbalancing
+      - load_balancing
     logs:
       receivers:
         - nop
       processors: []
       exporters:
-        - loadbalancing
+        - load_balancing

@@ -1,0 +1,24 @@
+name: Scorecard supply-chain security
+
+on:
+  # For Branch-Protection check. Only the default branch is supported. See
+  # https://github.com/ossf/scorecard/blob/main/docs/checks.md#branch-protection
+  branch_protection_rule:
+  # To guarantee Maintained check is occasionally updated. See
+  # https://github.com/ossf/scorecard/blob/main/docs/checks.md#maintained
+  schedule:
+    - cron: "39 1 * * 3"
+  push:
+    branches: ["main"]
+
+permissions: {}
+
+jobs:
+  analysis:
+    cache-mode: none
+    if: github.repository == 'open-telemetry/opentelemetry-collector-contrib'
+    permissions:
+      contents: read # for actions/checkout
+      id-token: write # for Scorecard to publish results
+      security-events: write # for the SARIF upload to code scanning
+    uses: open-telemetry/shared-workflows/.github/workflows/scorecard.yml@efc55838c9769c5476e0a5cf7183a8c5b4ae70a5 # v0.24.0

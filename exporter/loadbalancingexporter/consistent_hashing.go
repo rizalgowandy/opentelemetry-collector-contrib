@@ -1,28 +1,19 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package loadbalancingexporter
+package loadbalancingexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/loadbalancingexporter"
 
 import (
+	"encoding/binary"
 	"hash/crc32"
 	"sort"
-
-	"go.opentelemetry.io/collector/consumer/pdata"
 )
 
-const maxPositions uint32 = 36000 // 360 degrees with two decimal places
-const defaultWeight int = 100     // the number of points in the ring for each entry. For better results, it should be higher than 100.
+const (
+	maxPositions     uint32 = 131071 // the number of positions in the ring
+	defaultWeight    int    = 200    // the number of points in the ring for each entry
+	linearProbeLimit int    = 10     // The number of times to probe ahead in the hash ring if there is a collision while constructing the hash ring
+)
 
 // position represents a specific angle in the ring.
 // Each entry in the ring is positioned at an angle in a hypothetical circle, meaning that it ranges from 0 to 360.
@@ -31,6 +22,12 @@ type position uint32
 // ringItem connects a specific angle in the ring with a specific endpoint.
 type ringItem struct {
 	pos      position
+	endpoint string
+}
+
+type ringCandidate struct {
+	pos      position
+	hash     uint32
 	endpoint string
 }
 
@@ -49,26 +46,32 @@ func newHashRing(endpoints []string) *hashRing {
 }
 
 // endpointFor calculates which backend is responsible for the given traceID
-func (h *hashRing) endpointFor(traceID pdata.TraceID) string {
-	b := traceID.Bytes()
+func (h *hashRing) endpointFor(identifier []byte) string {
+	if h == nil {
+		// perhaps the ring itself couldn't get initialized yet?
+		return ""
+	}
 	hasher := crc32.NewIEEE()
-	hasher.Write(b[:])
+	hasher.Write(identifier)
 	hash := hasher.Sum32()
 	pos := hash % maxPositions
 
 	return h.findEndpoint(position(pos))
 }
 
-// findEndpoint returns the "next" endpoint starting from the given position
+// findEndpoint returns the "next" endpoint starting from the given position, or an empty string in case no endpoints are available
 func (h *hashRing) findEndpoint(pos position) string {
 	ringSize := len(h.items)
+	if ringSize == 0 {
+		return ""
+	}
 	left, right := h.items[:ringSize/2], h.items[ringSize/2:]
 	found := bsearch(pos, left, right)
 	return found.endpoint
 }
 
 // bsearch is a binary search-like algorithm, returning the closest "next" item instead of an exact match
-func bsearch(pos position, left []ringItem, right []ringItem) ringItem {
+func bsearch(pos position, left, right []ringItem) ringItem {
 	// if it's the last item of the left side, return it
 	if left[len(left)-1].pos == pos {
 		return left[len(left)-1]
@@ -84,7 +87,7 @@ func bsearch(pos position, left []ringItem, right []ringItem) ringItem {
 		return left[0]
 	}
 
-	// if the requested position is higher than the highest in the left, the item is in the right side
+	// if the requested position is greater than the highest in the left, the item is in the right side
 	if pos > left[len(left)-1].pos {
 		size := len(right)
 		if size == 1 {
@@ -106,15 +109,25 @@ func bsearch(pos position, left []ringItem, right []ringItem) ringItem {
 
 // positionFor calculates all the positions in the ring based. The numPoints indicates how many positions to calculate.
 // The slice length of the result matches the numPoints.
-func positionsFor(endpoint string, numPoints int) []position {
-	res := make([]position, 0, numPoints)
-	for i := 0; i < numPoints; i++ {
+func positionsFor(endpoint string, numPoints int) []ringCandidate {
+	return positionsForWithMaxPositions(endpoint, numPoints, maxPositions)
+}
+
+func positionsForWithMaxPositions(endpoint string, numPoints int, maxPositions uint32) []ringCandidate {
+	res := make([]ringCandidate, 0, numPoints)
+	buf := make([]byte, 4)
+	for i := range numPoints {
 		h := crc32.NewIEEE()
+		binary.LittleEndian.PutUint32(buf, uint32(i))
 		h.Write([]byte(endpoint))
-		h.Write([]byte{byte(i)})
+		h.Write(buf)
 		hash := h.Sum32()
 		pos := hash % maxPositions
-		res = append(res, position(pos))
+		res = append(res, ringCandidate{
+			pos:      position(pos),
+			hash:     hash,
+			endpoint: endpoint,
+		})
 	}
 
 	return res
@@ -122,23 +135,45 @@ func positionsFor(endpoint string, numPoints int) []position {
 
 // positionsForEndpoints calculates all the positions for all the given endpoints
 func positionsForEndpoints(endpoints []string, weight int) []ringItem {
-	var items []ringItem
-	positions := map[position]bool{} // tracking the used positions
-	for _, endpoint := range endpoints {
-		// for this initial implementation, we don't allow endpoints to have custom weights
-		for _, pos := range positionsFor(endpoint, weight) {
-			// if this position is occupied already, skip this item
-			if _, found := positions[pos]; found {
-				continue
-			}
-			positions[pos] = true
+	return positionsForEndpointsWithOptions(endpoints, weight, maxPositions, linearProbeLimit)
+}
 
-			item := ringItem{
-				pos:      pos,
-				endpoint: endpoint,
-			}
-			items = append(items, item)
+func positionsForEndpointsWithOptions(endpoints []string, weight int, maxPositions uint32, probeLimit int) []ringItem {
+	candidates := make([]ringCandidate, 0, len(endpoints)*weight)
+	for _, endpoint := range endpoints {
+		candidates = append(candidates, positionsForWithMaxPositions(endpoint, weight, maxPositions)...)
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].pos != candidates[j].pos {
+			return candidates[i].pos < candidates[j].pos
 		}
+		if candidates[i].hash != candidates[j].hash {
+			return candidates[i].hash < candidates[j].hash
+		}
+		return candidates[i].endpoint < candidates[j].endpoint
+	})
+
+	items := make([]ringItem, 0, len(candidates))
+	positions := map[position]bool{} // tracking the used positions
+	for _, candidate := range candidates {
+		// if this position is occupied already, look ahead in the array for a free position
+		actualPos := candidate.pos
+		positionsProbed := 0
+		for positions[actualPos] && positionsProbed < probeLimit {
+			actualPos = (actualPos + 1) % position(maxPositions)
+			positionsProbed++
+		}
+		if positionsProbed >= probeLimit {
+			continue // Not able to find a free spot; skip this item
+		}
+
+		positions[actualPos] = true
+
+		items = append(items, ringItem{
+			pos:      actualPos,
+			endpoint: candidate.endpoint,
+		})
 	}
 
 	sort.Slice(items, func(i, j int) bool {

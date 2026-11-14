@@ -1,29 +1,24 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package awscloudwatchlogsexporter
+package awscloudwatchlogsexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awscloudwatchlogsexporter"
 
 import (
-	"go.opentelemetry.io/collector/config/configmodels"
+	"errors"
+
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/config/configretry"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/awsutil"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/cwlogs"
 )
 
 // Config represent a configuration for the CloudWatch logs exporter.
 type Config struct {
-	configmodels.ExporterSettings `mapstructure:",squash"` // squash ensures fields are correctly decoded in embedded struct.
-
-	exporterhelper.RetrySettings `mapstructure:"retry_on_failure"`
+	BackOffConfig configretry.BackOffConfig `mapstructure:"retry_on_failure"`
 
 	// LogGroupName is the name of CloudWatch log group which defines group of log streams
 	// that share the same retention, monitoring, and access control settings.
@@ -33,15 +28,74 @@ type Config struct {
 	// that share the same source.
 	LogStreamName string `mapstructure:"log_stream_name"`
 
-	// Region is the AWS region where the logs are sent to.
-	// Optional.
-	Region string `mapstructure:"region"`
-
 	// Endpoint is the CloudWatch Logs service endpoint which the requests
 	// are forwarded to. https://docs.aws.amazon.com/general/latest/gr/cwl_region.html
 	// e.g. logs.us-east-1.amazonaws.com
 	// Optional.
 	Endpoint string `mapstructure:"endpoint"`
+
+	// LogRetention is the option to set the log retention policy for the CloudWatch Log Group. Defaults to Never Expire if not specified or set to 0
+	// Possible values are 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 2192, 2557, 2922, 3288, or 3653
+	LogRetention int32 `mapstructure:"log_retention"`
+
+	// Tags is the option to set tags for the CloudWatch Log Group.  If specified, please add at least 1 and at most 50 tags.  Input is a string to string map like so: { 'key': 'value' }
+	// Keys must be between 1-128 characters and follow the regex pattern: ^([\p{L}\p{Z}\p{N}_.:/=+\-@]+)$
+	// Values must be between 1-256 characters and follow the regex pattern: ^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$
+	Tags map[string]string `mapstructure:"tags"`
+
+	// Queue settings frm the exporterhelper
+	QueueSettings configoptional.Optional[exporterhelper.QueueBatchConfig] `mapstructure:"sending_queue"`
+
+	logger *zap.Logger
+
+	AWSSessionSettings awsutil.AWSSessionSettings `mapstructure:",squash"`
+
+	// Export raw log string instead of log wrapper
+	// Required for emf logs
+	RawLog bool `mapstructure:"raw_log,omitempty"`
+
+	// MaxEventPayloadBytes is the per-event payload cap in bytes; oversized log events are truncated.
+	// Defaults to 256 KiB (262144) for backwards compatibility; may be raised up to the
+	// CloudWatch Logs per-event API limit of 1 MiB (1048576).
+	MaxEventPayloadBytes int `mapstructure:"max_event_payload_bytes,omitempty"`
+}
+
+var _ component.Config = (*Config)(nil)
+
+// Validate config
+func (config *Config) Validate() error {
+	if config.LogGroupName == "" {
+		return errors.New("'log_group_name' must be set")
+	}
+	if config.LogStreamName == "" {
+		return errors.New("'log_stream_name' must be set")
+	}
+
+	if isPatternValid, invalidPattern := isPatternValid(config.LogGroupName); !isPatternValid {
+		return errors.New("'log_group_name' has an invalid pattern between curly brackets: " + invalidPattern)
+	}
+	if isPatternValid, invalidPattern := isPatternValid(config.LogStreamName); !isPatternValid {
+		return errors.New("'log_stream_name'  has an invalid pattern between curly brackets: " + invalidPattern)
+	}
+
+	if err := config.QueueSettings.Validate(); err != nil {
+		return err
+	}
+
+	if retErr := cwlogs.ValidateRetentionValue(config.LogRetention); retErr != nil {
+		return retErr
+	}
+
+	if config.MaxEventPayloadBytes != 0 {
+		if config.MaxEventPayloadBytes < cwlogs.MinAllowedEventPayloadBytes {
+			return errors.New("'max_event_payload_bytes' is too small to fit the per-event header and truncation suffix")
+		}
+		if config.MaxEventPayloadBytes > cwlogs.MaxAllowedEventPayloadBytes {
+			return errors.New("'max_event_payload_bytes' exceeds the CloudWatch Logs per-event API limit (1 MiB)")
+		}
+	}
+
+	return cwlogs.ValidateTagsInput(config.Tags)
 }
 
 // TODO(jbd): Add ARN role to config.

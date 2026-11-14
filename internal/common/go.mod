@@ -1,26 +1,24 @@
 module github.com/open-telemetry/opentelemetry-collector-contrib/internal/common
 
-go 1.16
+go 1.26.0
 
 require (
-	github.com/Microsoft/go-winio v0.4.16 // indirect
-	github.com/cenkalti/backoff/v4 v4.1.1
-	github.com/containerd/containerd v1.4.4 // indirect
-	github.com/docker/distribution v2.7.1+incompatible // indirect
-	github.com/docker/docker v20.10.7+incompatible
-	github.com/docker/go-connections v0.4.0
-	github.com/docker/go-units v0.4.0 // indirect
-	github.com/gogo/protobuf v1.3.2 // indirect
-	github.com/google/go-cmp v0.5.5 // indirect
-	github.com/gorilla/mux v1.8.0 // indirect
-	github.com/moby/term v0.0.0-20201216013528-df9cb8a40635 // indirect
-	github.com/morikuni/aec v1.0.0 // indirect
+	github.com/distribution/reference v0.6.0
+	github.com/stretchr/testify v1.12.1
+	go.opentelemetry.io/collector/featuregate v1.71.1-0.20261112225459-4888f0b280f9
+	go.uber.org/goleak v1.3.0
+	go.uber.org/zap v1.28.0
+)
+
+require (
+	github.com/hashicorp/go-version v1.9.0 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
-	github.com/opencontainers/image-spec v1.0.1 // indirect
-	github.com/sirupsen/logrus v1.8.1 // indirect
-	github.com/stretchr/testify v1.7.0
-	golang.org/x/net v0.0.0-20210316092652-d523dce5a7f4 // indirect
-	golang.org/x/time v0.0.0-20210220033141-f8bda1e9f3ba // indirect
-	google.golang.org/grpc v1.36.0 // indirect
-	gotest.tools/v3 v3.0.3 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+)
+
+retract (
+	v0.76.2
+	v0.76.1
+	v0.65.0
 )

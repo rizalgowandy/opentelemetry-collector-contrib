@@ -1,18 +1,7 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package k8sclient
+package k8sclient // import "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/k8s/k8sclient"
 
 import (
 	"context"
@@ -31,9 +20,6 @@ import (
 type PodClient interface {
 	// Get the mapping between the namespace and the number of belonging pods
 	NamespaceToRunningPodNum() map[string]int
-
-	// shutdown is only used internally by clientset to stop the PodClient
-	shutdown()
 }
 
 type podClientOption func(*podClient)
@@ -114,7 +100,7 @@ func (c *podClient) shutdown() {
 	c.stopped = true
 }
 
-func transformFuncPod(obj interface{}) (interface{}, error) {
+func transformFuncPod(obj any) (any, error) {
 	pod, ok := obj.(*v1.Pod)
 	if !ok {
 		return nil, fmt.Errorf("input obj %v is not Pod type", obj)
@@ -126,12 +112,11 @@ func transformFuncPod(obj interface{}) (interface{}, error) {
 }
 
 func createPodListWatch(client kubernetes.Interface, ns string) cache.ListerWatcher {
-	ctx := context.Background()
 	return &cache.ListWatch{
-		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
+		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 			return client.CoreV1().Pods(ns).List(ctx, opts)
 		},
-		WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
 			return client.CoreV1().Pods(ns).Watch(ctx, opts)
 		},
 	}

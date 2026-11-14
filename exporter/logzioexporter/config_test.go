@@ -1,48 +1,119 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package logzioexporter
 
 import (
-	"path"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configtest"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configcompression"
+	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/config/configretry"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/logzioexporter/internal/metadata"
 )
 
 func TestLoadConfig(t *testing.T) {
-	factories, err := componenttest.NopFactories()
-	assert.Nil(t, err)
-
-	factory := NewFactory()
-	factories.Exporters[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
-
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
 	require.NoError(t, err)
-	require.NotNil(t, cfg)
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig()
 
-	assert.Equal(t, 2, len(cfg.Exporters))
+	sub, err := cm.Sub(component.NewIDWithName(metadata.Type, "2").String())
+	require.NoError(t, err)
+	require.NoError(t, sub.Unmarshal(cfg))
 
-	cfgExp := cfg.Exporters[config.NewIDWithName(typeStr, "2")]
-	assert.Equal(t, &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewIDWithName(typeStr, "2")),
-		TracesToken:      "logzioTESTtoken",
-		Region:           "eu",
-		CustomEndpoint:   "https://some-url.com:8888",
-	}, cfgExp)
+	expected := &Config{
+		Token:  "token",
+		Region: "eu",
+	}
+	expected.BackOffConfig = configretry.NewDefaultBackOffConfig()
+	expected.BackOffConfig.MaxInterval = 5 * time.Second
+	expected.QueueSettings = configoptional.None[exporterhelper.QueueBatchConfig]()
+	clientConfig := confighttp.NewDefaultClientConfig()
+	clientConfig.Timeout = 30 * time.Second
+	clientConfig.Compression = configcompression.TypeGzip
+	clientConfig.WriteBufferSize = 512 * 1024
+	expected.ClientConfig = clientConfig
+	assert.Equal(t, expected, cfg)
+}
+
+func TestDefaultLoadConfig(t *testing.T) {
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "configd.yaml"))
+	require.NoError(t, err)
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig()
+
+	sub, err := cm.Sub(component.NewIDWithName(metadata.Type, "2").String())
+	require.NoError(t, err)
+	require.NoError(t, sub.Unmarshal(cfg))
+
+	expected := &Config{
+		Token: "logzioTESTtoken",
+	}
+	expected.BackOffConfig = configretry.NewDefaultBackOffConfig()
+	expected.QueueSettings = configoptional.Some(exporterhelper.NewDefaultQueueConfig())
+	clientConfig := confighttp.NewDefaultClientConfig()
+	clientConfig.Timeout = 30 * time.Second
+	clientConfig.Compression = configcompression.TypeGzip
+	clientConfig.WriteBufferSize = 512 * 1024
+	expected.ClientConfig = clientConfig
+	assert.Equal(t, expected, cfg)
+}
+
+func TestCheckAndWarnDeprecatedOptions(t *testing.T) {
+	clientConfig := confighttp.NewDefaultClientConfig()
+	clientConfig.Timeout = 10 * time.Second
+	clientConfig.Compression = configcompression.TypeGzip
+	clientConfig.WriteBufferSize = 512 * 1024
+	// Config with legacy options
+	actualCfg := &Config{
+		QueueSettings:  configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
+		BackOffConfig:  configretry.NewDefaultBackOffConfig(),
+		Token:          "logzioTESTtoken",
+		CustomEndpoint: "https://api.example.com",
+		QueueMaxLength: 10,
+		DrainInterval:  10,
+		ClientConfig:   clientConfig,
+	}
+	params := exportertest.NewNopSettings(metadata.Type)
+	logger := hclog2ZapLogger{
+		Zap:  params.Logger,
+		name: loggerName,
+	}
+	actualCfg.checkAndWarnDeprecatedOptions(&logger)
+
+	clientConfigEndpoint := confighttp.NewDefaultClientConfig()
+	clientConfigEndpoint.Timeout = 10 * time.Second
+	clientConfigEndpoint.Compression = configcompression.TypeGzip
+	clientConfigEndpoint.WriteBufferSize = 512 * 1024
+	clientConfigEndpoint.Endpoint = "https://api.example.com"
+
+	expected := &Config{
+		Token:          "logzioTESTtoken",
+		CustomEndpoint: "https://api.example.com",
+		QueueMaxLength: 10,
+		DrainInterval:  10,
+		BackOffConfig:  configretry.NewDefaultBackOffConfig(),
+		QueueSettings:  configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
+		ClientConfig:   clientConfigEndpoint,
+	}
+	expected.QueueSettings.Get().QueueSize = 10
+	assert.Equal(t, expected, actualCfg)
+}
+
+func TestNullTokenConfig(tester *testing.T) {
+	cfg := Config{
+		Region: "eu",
+	}
+	assert.Error(tester, cfg.Validate(), "Empty token should produce error")
 }

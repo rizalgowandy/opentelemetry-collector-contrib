@@ -1,71 +1,238 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package system
+//go:build (!remove_all_resourcedetection_detectors || enable_detector_system) && !omit_detector_system
+
+package system // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/system"
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"strings"
 
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/conventions"
+	"github.com/shirou/gopsutil/v4/cpu"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/processor"
+	conventions "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.uber.org/zap"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/metadataproviders/system"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/system/internal/metadata"
 )
 
-const (
-	// TypeStr is type of detector.
-	TypeStr = "system"
-)
+var hostnameSourcesMap = map[string]func(*Detector) (string, error){
+	"os":     getHostname,
+	"dns":    getFQDN,
+	"cname":  lookupCNAME,
+	"lookup": reverseLookupHost,
+}
 
 var _ internal.Detector = (*Detector)(nil)
 
 // Detector is a system metadata detector
 type Detector struct {
-	provider systemMetadata
+	provider system.Provider
 	logger   *zap.Logger
+	cfg      Config
+	rb       *metadata.ResourceBuilder
 }
 
 // NewDetector creates a new system metadata detector
-func NewDetector(p component.ProcessorCreateSettings, _ internal.DetectorConfig) (internal.Detector, error) {
-	return &Detector{provider: &systemMetadataImpl{}, logger: p.Logger}, nil
+func NewDetector(p processor.Settings, dcfg internal.DetectorConfig, _ bool) (internal.Detector, error) {
+	cfg := dcfg.(Config)
+	if len(cfg.HostnameSources) == 0 {
+		cfg.HostnameSources = []string{"dns", "os"}
+	}
+	if cfg.deprecatedOSBuildID.Enabled {
+		p.Logger.Warn("the os.build.id resource attribute is deprecated, use os.build_id instead")
+	}
+
+	return &Detector{
+		provider: system.NewProvider(),
+		logger:   p.Logger,
+		cfg:      cfg,
+		rb:       metadata.NewResourceBuilder(cfg.ResourceAttributes),
+	}, nil
+}
+
+// toIEEERA converts a MAC address to IEEE RA format.
+// Per the spec: "MAC Addresses MUST be represented in IEEE RA hexadecimal form: as hyphen-separated
+// octets in uppercase hexadecimal form from most to least significant."
+// Golang returns MAC addresses as colon-separated octets in lowercase hexadecimal form from most
+// to least significant, so we need to:
+// - Replace colons with hyphens
+// - Convert to uppercase
+func toIEEERA(mac net.HardwareAddr) string {
+	return strings.ToUpper(strings.ReplaceAll(mac.String(), ":", "-"))
 }
 
 // Detect detects system metadata and returns a resource with the available ones
-func (d *Detector) Detect(_ context.Context) (pdata.Resource, error) {
-	res := pdata.NewResource()
-	attrs := res.Attributes()
+func (d *Detector) Detect(ctx context.Context) (resource pcommon.Resource, schemaURL string, err error) {
+	var hostname string
 
 	osType, err := d.provider.OSType()
 	if err != nil {
-		return res, fmt.Errorf("failed getting OS type: %w", err)
+		return pcommon.NewResource(), "", fmt.Errorf("failed getting OS type: %w", err)
 	}
 
-	hostname, err := d.provider.FQDN()
+	osVersion, err := d.provider.OSVersion()
 	if err != nil {
-		// Fallback to OS hostname
-		d.logger.Debug("FQDN query failed, falling back to OS hostname", zap.Error(err))
-		hostname, err = d.provider.Hostname()
-		if err != nil {
-			return res, fmt.Errorf("failed getting OS hostname: %w", err)
+		return pcommon.NewResource(), "", fmt.Errorf("failed getting OS version: %w", err)
+	}
+
+	hostArch, err := d.provider.HostArch()
+	if err != nil {
+		return pcommon.NewResource(), "", fmt.Errorf("failed getting host architecture: %w", err)
+	}
+
+	var hostIPAttribute []any
+	if d.cfg.ResourceAttributes.HostIP.Enabled {
+		hostIPs, errIPs := d.provider.HostIPs()
+		if errIPs != nil {
+			return pcommon.NewResource(), "", fmt.Errorf("failed getting host IP addresses: %w", errIPs)
+		}
+		for _, ip := range hostIPs {
+			hostIPAttribute = append(hostIPAttribute, ip.String())
 		}
 	}
 
-	attrs.InsertString(conventions.AttributeHostName, hostname)
-	attrs.InsertString(conventions.AttributeOSType, osType)
+	var hostMACAttribute []any
+	if d.cfg.ResourceAttributes.HostMac.Enabled {
+		hostMACs, errMACs := d.provider.HostMACs()
+		if errMACs != nil {
+			return pcommon.NewResource(), "", fmt.Errorf("failed to get host MAC addresses: %w", errMACs)
+		}
+		for _, mac := range hostMACs {
+			hostMACAttribute = append(hostMACAttribute, toIEEERA(mac))
+		}
+	}
 
-	return res, nil
+	var hostInterfaceAttribute []any
+	if d.cfg.ResourceAttributes.HostInterface.Enabled {
+		interfaces, errInterfaces := d.provider.HostInterfaces()
+		if errInterfaces != nil {
+			return pcommon.NewResource(), "", fmt.Errorf("failed to get host network interfaces: %w", errInterfaces)
+		}
+		for _, iface := range interfaces {
+			hostInterfaceAttribute = append(hostInterfaceAttribute, iface.Name)
+		}
+	}
+
+	osDescription, err := d.provider.OSDescription(ctx)
+	if err != nil {
+		return pcommon.NewResource(), "", fmt.Errorf("failed getting OS description: %w", err)
+	}
+
+	var cpuInfo []cpu.InfoStat
+	if d.cfg.ResourceAttributes.HostCPUCacheL2Size.Enabled || d.cfg.ResourceAttributes.HostCPUFamily.Enabled ||
+		d.cfg.ResourceAttributes.HostCPUModelID.Enabled || d.cfg.ResourceAttributes.HostCPUVendorID.Enabled ||
+		d.cfg.ResourceAttributes.HostCPUModelName.Enabled || d.cfg.ResourceAttributes.HostCPUStepping.Enabled {
+		cpuInfo, err = d.provider.CPUInfo(ctx)
+		if err != nil {
+			return pcommon.NewResource(), "", fmt.Errorf("failed getting host cpuinfo: %w", err)
+		}
+	}
+
+	for _, source := range d.cfg.HostnameSources {
+		getHostFromSource := hostnameSourcesMap[source]
+		hostname, err = getHostFromSource(d)
+		if err == nil {
+			d.rb.SetHostName(hostname)
+			d.rb.SetOsType(osType)
+			d.rb.SetOsVersion(osVersion)
+			if d.cfg.ResourceAttributes.HostID.Enabled {
+				if hostID, hostIDErr := d.provider.HostID(ctx); hostIDErr == nil {
+					d.rb.SetHostID(hostID)
+				} else {
+					d.logger.Warn("failed to get host ID", zap.Error(hostIDErr))
+				}
+			}
+			d.rb.SetHostArch(hostArch)
+			d.rb.SetHostIP(hostIPAttribute)
+			d.rb.SetHostMac(hostMACAttribute)
+			d.rb.SetHostInterface(hostInterfaceAttribute)
+			d.rb.SetOsDescription(osDescription)
+			if d.cfg.ResourceAttributes.OsName.Enabled {
+				if osName, err2 := d.provider.OSName(ctx); err2 == nil {
+					d.rb.SetOsName(osName)
+				} else {
+					d.logger.Warn("failed to get OS name", zap.Error(err2))
+				}
+			}
+			var osBuildID string
+			if d.cfg.ResourceAttributes.OsBuildID.Enabled || d.cfg.deprecatedOSBuildID.Enabled {
+				var err2 error
+				if osBuildID, err2 = d.provider.OSBuildID(ctx); err2 == nil {
+					d.rb.SetOsBuildID(osBuildID)
+				} else {
+					d.logger.Warn("failed to get OS build id", zap.Error(err2))
+				}
+			}
+			if len(cpuInfo) > 0 {
+				setHostCPUInfo(d, cpuInfo[0])
+			}
+			res := d.rb.Emit()
+			if d.cfg.deprecatedOSBuildID.Enabled && osBuildID != "" {
+				res.Attributes().PutStr("os.build.id", osBuildID)
+			}
+			return res, conventions.SchemaURL, nil
+		}
+		d.logger.Debug(err.Error())
+	}
+
+	return pcommon.NewResource(), "", errors.New("all hostname sources failed to get hostname")
+}
+
+// getHostname returns OS hostname
+func getHostname(d *Detector) (string, error) {
+	hostname, err := d.provider.Hostname()
+	if err != nil {
+		return "", fmt.Errorf("failed getting OS hostname: %w", err)
+	}
+	return hostname, nil
+}
+
+// getFQDN returns FQDN of the host
+func getFQDN(d *Detector) (string, error) {
+	hostname, err := d.provider.FQDN()
+	if err != nil {
+		return "", fmt.Errorf("getFQDN failed getting FQDN: %w", err)
+	}
+	return hostname, nil
+}
+
+func lookupCNAME(d *Detector) (string, error) {
+	cname, err := d.provider.LookupCNAME()
+	if err != nil {
+		return "", fmt.Errorf("lookupCNAME failed to get CNAME: %w", err)
+	}
+	return cname, nil
+}
+
+func reverseLookupHost(d *Detector) (string, error) {
+	hostname, err := d.provider.ReverseLookupHost()
+	if err != nil {
+		return "", fmt.Errorf("reverseLookupHost failed to lookup host: %w", err)
+	}
+	return hostname, nil
+}
+
+func setHostCPUInfo(d *Detector, cpuInfo cpu.InfoStat) {
+	d.logger.Debug("getting host's cpuinfo", zap.String("coreID", cpuInfo.CoreID))
+	d.rb.SetHostCPUVendorID(cpuInfo.VendorID)
+	d.rb.SetHostCPUFamily(cpuInfo.Family)
+
+	// For windows, this field is left blank. See https://github.com/shirou/gopsutil/blob/v3.23.9/cpu/cpu_windows.go#L113
+	// Skip setting modelId if the field is blank.
+	// ISSUE: https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/27675
+	if cpuInfo.Model != "" {
+		d.rb.SetHostCPUModelID(cpuInfo.Model)
+	}
+
+	d.rb.SetHostCPUModelName(cpuInfo.ModelName)
+	d.rb.SetHostCPUStepping(fmt.Sprintf("%d", cpuInfo.Stepping))
+	d.rb.SetHostCPUCacheL2Size(int64(cpuInfo.CacheSize))
 }

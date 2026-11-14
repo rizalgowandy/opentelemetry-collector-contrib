@@ -1,0 +1,1083 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package kafka
+
+import (
+	"context"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kfake"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
+	"github.com/twmb/franz-go/pkg/sasl"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/config/configopaque"
+	"go.opentelemetry.io/collector/config/configtls"
+	"go.opentelemetry.io/collector/extension"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
+	"go.uber.org/zap/zaptest/observer"
+	"golang.org/x/oauth2"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/kafka/kafkatest"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/kafka/configkafka"
+)
+
+func TestNewFranzSyncProducer_SASL(t *testing.T) {
+	_, clientConfig := kafkatest.NewCluster(t, kfake.EnableSASL(),
+		kfake.Superuser(PLAIN, "plain_user", "plain_password"),
+		kfake.Superuser(SCRAMSHA256, "scramsha256_user", "scramsha256_password"),
+		kfake.Superuser(SCRAMSHA512, "scramsha512_user", "scramsha512_password"),
+	)
+	tryConnect := func(mechanism, username, password string) error {
+		clientConfig := clientConfig // Copy the client config to avoid modifying the original
+		clientConfig.Authentication.SASL = &configkafka.SASLConfig{
+			Mechanism: mechanism,
+			Username:  username,
+			Password:  password,
+		}
+		tl := zaptest.NewLogger(t, zaptest.Level(zap.WarnLevel))
+		client, err := NewFranzSyncProducer(
+			t.Context(), componenttest.NewNopHost(), clientConfig,
+			configkafka.NewDefaultProducerConfig(), time.Second, tl,
+		)
+		if err != nil {
+			return err
+		}
+		defer client.Close()
+		return client.Ping(t.Context())
+	}
+
+	type testcase struct {
+		mechanism string
+		username  string
+		password  string
+		expecErr  bool
+	}
+
+	for name, tt := range map[string]testcase{
+		"PLAIN": {
+			mechanism: PLAIN,
+			username:  "plain_user",
+			password:  "plain_password",
+		},
+		"SCRAM-SHA-256": {
+			mechanism: SCRAMSHA256,
+			username:  "scramsha256_user",
+			password:  "scramsha256_password",
+		},
+		"SCRAM-SHA-512": {
+			mechanism: SCRAMSHA512,
+			username:  "scramsha512_user",
+			password:  "scramsha512_password",
+		},
+		"invalid_PLAIN": {
+			mechanism: PLAIN,
+			username:  "scramsha256_user",
+			password:  "scramsha256_password",
+			expecErr:  true,
+		},
+		"invalid_SCRAM-SHA-256": {
+			mechanism: SCRAMSHA256,
+			username:  "scramsha512_user",
+			password:  "scramsha512_password",
+			expecErr:  true,
+		},
+		"invalid_SCRAM-SHA-512": {
+			mechanism: SCRAMSHA512,
+			username:  "scramsha256_user",
+			password:  "scramsha256_password",
+			expecErr:  true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			err := tryConnect(tt.mechanism, tt.username, tt.password)
+			if tt.expecErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestNewFranzSyncProducer_TLS(t *testing.T) {
+	// We create an httptest.Server just so we can get its TLS configuration.
+	httpServer := httptest.NewTLSServer(http.NewServeMux())
+	defer httpServer.Close()
+	serverTLS := httpServer.TLS
+	caCert := httpServer.Certificate() // self-signed
+
+	core, observedLogs := observer.New(zap.WarnLevel)
+	logger := zap.New(core)
+
+	_, clientConfig := kafkatest.NewCluster(t, kfake.TLS(serverTLS))
+	tryConnect := func(cfg *configtls.ClientConfig) error {
+		observedLogs.TakeAll()       // drop existing logs
+		clientConfig := clientConfig // copy
+		clientConfig.TLS = cfg
+		client, err := NewFranzSyncProducer(
+			t.Context(), componenttest.NewNopHost(), clientConfig,
+			configkafka.NewDefaultProducerConfig(), time.Second, logger,
+		)
+		if err != nil {
+			return err
+		}
+		defer client.Close()
+		return client.Ping(t.Context())
+	}
+
+	t.Run("tls_valid_ca", func(t *testing.T) {
+		tlsConfig := configtls.NewDefaultClientConfig()
+		tlsConfig.CAPem = configopaque.String(
+			pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCert.Raw}),
+		)
+		require.NoError(t, tryConnect(&tlsConfig))
+		assert.Empty(t, observedLogs.All())
+	})
+
+	t.Run("tls_insecure_skip_verify", func(t *testing.T) {
+		t.Parallel()
+		tlsConfig := configtls.NewDefaultClientConfig()
+		tlsConfig.InsecureSkipVerify = true
+		require.NoError(t, tryConnect(&tlsConfig))
+		assert.Empty(t, observedLogs.All())
+	})
+
+	t.Run("tls_unknown_ca", func(t *testing.T) {
+		config := configtls.NewDefaultClientConfig()
+		err := tryConnect(&config)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "x509: certificate signed by unknown authority")
+		assert.NotEmpty(t, observedLogs.All())
+	})
+
+	t.Run("plaintext", func(t *testing.T) {
+		// Should fail because the server expects TLS.
+		require.Error(t, tryConnect(nil))
+		filtered := observedLogs.FilterMessage(
+			// franz-go logs this warning message:
+			"read from broker received EOF during api versions discovery, which often happens when the broker requires TLS and the client is not using it (is TLS misconfigured?)",
+		)
+		assert.NotEmpty(t, filtered.All())
+	})
+}
+
+func TestNewFranzSyncProducerCompression(t *testing.T) {
+	compressionAlgos := []string{"none", "gzip", "snappy", "lz4", "zstd"}
+	for i, compressionAlgo := range compressionAlgos {
+		t.Run(compressionAlgo, func(t *testing.T) {
+			t.Parallel()
+			validTopic := fmt.Sprintf("test-topic-%s", compressionAlgo)
+			cluster, clientConfig := kafkatest.NewCluster(t,
+				kfake.SeedTopics(1, validTopic),
+			)
+			prodCfg := configkafka.NewDefaultProducerConfig()
+			prodCfg.Compression = compressionAlgo
+
+			tl := zaptest.NewLogger(t, zaptest.Level(zap.InfoLevel))
+			client, err := NewFranzSyncProducer(
+				t.Context(), componenttest.NewNopHost(), clientConfig,
+				prodCfg, time.Second, tl,
+			)
+			require.NoError(t, err)
+			defer client.Close()
+
+			ctx, cancel := context.WithTimeoutCause(t.Context(), time.Second,
+				errors.New("Failed to connect to Kafka cluster"),
+			)
+			defer cancel()
+			require.NoError(t, client.Ping(ctx))
+
+			// Franz-go only send the compressed message if the compressed size
+			// is smaller than the uncompressed size.
+			body := "test message: This is a sample message used for testing Kafka compression algorithms. The content is intentionally long to ensure that compression is applied and can be verified during the test. The message contains a variety of words and phrases to simulate realistic payloads that might be encountered in production environments. This helps ensure that the compression logic works as expected and that the system can handle typical workloads safely and efficiently."
+			cluster.ControlKey(int16(kmsg.Produce), func(kreq kmsg.Request) (kmsg.Response, error, bool) {
+				preq := kreq.(*kmsg.ProduceRequest)
+				assert.Len(t, preq.Topics, 1, "expected one topic in produce request")
+				assert.Equal(t, validTopic, preq.Topics[0].Topic, "produced to wrong topic")
+				assert.Len(t, preq.Topics[0].Partitions, 1, "expected one partition in produce request")
+				assert.Equal(t, int32(0), preq.Topics[0].Partitions[0].Partition, "produced to wrong partition")
+
+				var rb kmsg.RecordBatch
+				require.NoError(t, rb.ReadFrom(preq.Topics[0].Partitions[0].Records))
+				// Check the compression bits (lowest 3 bits)
+				compressionBits := rb.Attributes & 0x07
+				assert.Equal(t, int16(i), compressionBits)
+				assert.Equal(t, int32(1), rb.NumRecords, "expected one record in produce request")
+
+				return &kmsg.ProduceResponse{
+					Version: kreq.GetVersion(),
+					Topics: []kmsg.ProduceResponseTopic{{
+						Topic: validTopic,
+						Partitions: []kmsg.ProduceResponseTopicPartition{
+							kmsg.NewProduceResponseTopicPartition(),
+						},
+					}},
+				}, nil, true
+			})
+
+			result := client.ProduceSync(ctx, &kgo.Record{
+				Topic: validTopic, Value: []byte(body),
+			})
+			client.Close()
+			require.Len(t, result, 1, "expected one produce result")
+			res := result[0]
+			require.NoError(t, res.Err, "failed to produce message: %v", res.Err)
+			assert.Equal(t, validTopic, res.Record.Topic, "produced message to wrong topic")
+			assert.Equal(t, uint8(i), res.Record.Attrs.CompressionType())
+			assert.Equal(t, []byte(body), res.Record.Value, "produced message with wrong value")
+		})
+	}
+}
+
+func TestNewFranzSyncProducerRequiredAcks(t *testing.T) {
+	topic := "topic"
+	_, clientConfig := kafkatest.NewCluster(t, kfake.SeedTopics(1, topic))
+	acks := []configkafka.RequiredAcks{
+		configkafka.NoResponse,
+		configkafka.WaitForLocal,
+		configkafka.WaitForAll,
+	}
+	for _, ack := range acks {
+		t.Run(acksToString(t, ack), func(t *testing.T) {
+			t.Parallel()
+			prodCfg := configkafka.NewDefaultProducerConfig()
+			prodCfg.RequiredAcks = ack
+
+			tl := zaptest.NewLogger(t, zaptest.Level(zap.WarnLevel))
+			client, err := NewFranzSyncProducer(
+				t.Context(), componenttest.NewNopHost(), clientConfig,
+				prodCfg, time.Second, tl,
+			)
+			require.NoError(t, err)
+			defer client.Close()
+
+			ctx, cancel := context.WithTimeoutCause(t.Context(), time.Second,
+				errors.New("Failed to connect to Kafka cluster"),
+			)
+			defer cancel()
+			require.NoError(t, client.Ping(ctx))
+
+			// Produce a test message.
+			result := client.ProduceSync(ctx, &kgo.Record{
+				Topic: topic, Value: []byte("test message"),
+			})
+			for _, v := range result {
+				require.NoError(t, v.Err, "failed to produce message: %v", v.Err)
+				assert.Equal(t, topic, v.Record.Topic, "produced message to wrong topic")
+			}
+		})
+	}
+}
+
+func TestNewFranzSyncProducerMaxInflightRequestsPerBroker(t *testing.T) {
+	_, clientCfg := kafkatest.NewCluster(t)
+	tl := zaptest.NewLogger(t, zaptest.Level(zap.WarnLevel))
+	prodCfg := configkafka.NewDefaultProducerConfig()
+	prodCfg.MaxInflightRequestsPerBroker = 100
+	cl, err := NewFranzSyncProducer(
+		t.Context(), componenttest.NewNopHost(), clientCfg,
+		prodCfg, time.Second, tl,
+	)
+	require.NoError(t, err)
+	t.Cleanup(cl.Close)
+	assert.Equal(t, 100, cl.OptValue(kgo.MaxProduceRequestsInflightPerBroker))
+}
+
+func acksToString(tb testing.TB, acks configkafka.RequiredAcks) string {
+	switch acks {
+	case configkafka.NoResponse:
+		return "NoResponse"
+	case configkafka.WaitForLocal:
+		return "WaitForLocal"
+	case configkafka.WaitForAll:
+		return "WaitForAll"
+	default:
+		tb.Fatalf("unknown RequiredAcks value: %v", acks)
+		return "" // Unreachable, but required.
+	}
+}
+
+func TestNewFranzKafkaConsumerRegex(t *testing.T) {
+	topicCount := 10
+	topics := make([]string, topicCount)
+	topicPrefix := "topic-"
+	for i := range topicCount {
+		topics[i] = fmt.Sprintf("%s%d", topicPrefix, i)
+	}
+	_, clientConfig := kafkatest.NewCluster(t, kfake.SeedTopics(1, topics...))
+	regexTopic := []string{"^" + topicPrefix + ".*"}
+	consumeConfig := configkafka.NewDefaultConsumerConfig()
+	// Set to earliest commit so we don't have to worry about synchronizing the
+	// producer and consumer.
+	consumeConfig.InitialOffset = configkafka.EarliestOffset
+
+	client := mustNewFranzConsumerGroup(t, clientConfig, consumeConfig, regexTopic)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	recordChan := fetchRecords(ctx, client, topicCount)
+	recordValue := []byte("test message")
+	rs := make([]*kgo.Record, 0, topicCount)
+	for _, topic := range topics {
+		rs = append(rs, &kgo.Record{Topic: topic, Value: recordValue})
+	}
+	client.ProduceSync(ctx, rs...)
+
+	fetch := <-recordChan
+	require.NoError(t, fetch.Err())
+	assert.Equal(t, topicCount, fetch.NumRecords())
+	seenTopics := make([]string, 0, topicCount)
+	fetch.EachRecord(func(r *kgo.Record) {
+		assert.Contains(t, r.Topic, topicPrefix)
+		assert.Len(t, r.Topic, len(topicPrefix)+1)
+		assert.Equal(t, recordValue, r.Value)
+		seenTopics = append(seenTopics, r.Topic)
+	})
+	sort.Strings(seenTopics)
+	assert.Equal(t, seenTopics, topics)
+}
+
+type onBrokerWrite func(meta kgo.BrokerMetadata, key int16, bytesWritten int, writeWait, timeToWrite time.Duration, err error)
+
+func (f onBrokerWrite) OnBrokerWrite(meta kgo.BrokerMetadata, key int16, bytesWritten int, writeWait, timeToWrite time.Duration, err error) {
+	f(meta, key, bytesWritten, writeWait, timeToWrite, err)
+}
+
+func TestNewFranzKafkaConsumer_InitialOffset(t *testing.T) {
+	for _, initial := range []string{configkafka.EarliestOffset, configkafka.LatestOffset} {
+		t.Run(initial, func(t *testing.T) {
+			topic := "topic"
+			_, clientConfig := kafkatest.NewCluster(t, kfake.SeedTopics(1, topic))
+			consumeConfig := configkafka.NewDefaultConsumerConfig()
+			consumeConfig.InitialOffset = initial
+			fetchIssued := make(chan struct{})
+			var once2 sync.Once
+			client := mustNewFranzConsumerGroup(t, clientConfig, consumeConfig, []string{topic},
+				kgo.WithHooks(onBrokerWrite(func(_ kgo.BrokerMetadata, key int16, _ int, _, _ time.Duration, _ error) {
+					if key == kmsg.Fetch.Int16() {
+						once2.Do(func() { close(fetchIssued) })
+					}
+				})),
+			)
+
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+
+			produce := func() {
+				require.NoError(t, client.ProduceSync(ctx, &kgo.Record{
+					Topic: topic, Value: []byte("test message"),
+				}).FirstErr())
+			}
+			produce() // Produce before consuming
+
+			// Depending on the Initial offset configuration, the consumer will
+			// fetch 1 or 2 records.
+			var expected int
+			switch initial {
+			case configkafka.EarliestOffset:
+				expected = 2
+			case configkafka.LatestOffset:
+				expected = 1
+			}
+			recordChan := fetchRecords(ctx, client, expected)
+
+			// Wait until the consumer issues the fetch request to produce.
+			select {
+			case <-fetchIssued:
+			case <-ctx.Done():
+				t.Fatalf("timeout waiting for the partition to be assigned")
+			}
+			produce() // Produce again.
+
+			fetch := <-recordChan
+			require.NoError(t, fetch.Err())
+			assert.Equal(t, expected, fetch.NumRecords())
+			fetch.EachRecord(func(r *kgo.Record) {
+				assert.Equal(t, []byte("test message"), r.Value)
+			})
+		})
+	}
+}
+
+func TestBalancerOptFromStrategies(t *testing.T) {
+	type testcase struct {
+		strategies []configkafka.GroupRebalanceStrategy
+		host       component.Host
+		wantNil    bool
+		wantErr    string
+	}
+	for name, tc := range map[string]testcase{
+		"strategies_only": {
+			strategies: []configkafka.GroupRebalanceStrategy{
+				configkafka.CooperativeStickyBalanceStrategy,
+			},
+			host: componenttest.NewNopHost(),
+		},
+		"strategies_resolve_empty": {
+			strategies: []configkafka.GroupRebalanceStrategy{""},
+			host:       componenttest.NewNopHost(),
+			wantErr:    "group_rebalance_strategies has no valid group rebalance strategies",
+		},
+		"strategies_extension_not_found": {
+			strategies: []configkafka.GroupRebalanceStrategy{
+				configkafka.CooperativeStickyBalanceStrategy,
+				"my_balancer",
+			},
+			host:    componenttest.NewNopHost(),
+			wantErr: `group_rebalance_strategies[1] extension "my_balancer" not found`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			opt, err := balancerOptFromStrategies(tc.strategies, tc.host)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			if tc.wantNil {
+				assert.Nil(t, opt)
+			} else {
+				assert.NotNil(t, opt)
+			}
+		})
+	}
+}
+
+func TestBalancersFromStrategies(t *testing.T) {
+	balancerExtID := component.MustNewID("my_balancer")
+	host := &mockHost{extensions: map[component.ID]component.Component{
+		balancerExtID: &mockGroupBalancer{},
+	}}
+
+	balancers, err := balancersFromStrategies(
+		[]configkafka.GroupRebalanceStrategy{
+			configkafka.CooperativeStickyBalanceStrategy,
+			"my_balancer",
+		},
+		host,
+	)
+
+	require.NoError(t, err)
+	require.Len(t, balancers, 2)
+	assert.Equal(t, "cooperative-sticky", balancers[0].ProtocolName())
+	assert.Equal(t, "mock", balancers[1].ProtocolName())
+}
+
+func fetchRecords(ctx context.Context, client *kgo.Client, wantRecords int) <-chan kgo.Fetches {
+	fetchChan := make(chan kgo.Fetches)
+	go func() {
+		var records int
+		var fetches kgo.Fetches
+		defer func() {
+			fetchChan <- fetches
+			close(fetchChan)
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				fetch := client.PollRecords(ctx, wantRecords)
+				records += fetch.NumRecords()
+				fetches = append(fetches, fetch...)
+				if records == wantRecords {
+					return
+				}
+			}
+		}
+	}()
+	return fetchChan
+}
+
+func mustNewFranzConsumerGroup(t *testing.T,
+	clientConfig configkafka.ClientConfig,
+	consumerConfig configkafka.ConsumerConfig,
+	topics []string, opts ...kgo.Opt,
+) *kgo.Client {
+	t.Helper()
+	// We want to keep the metadata cache very short lived in tests to speed
+	// up and avoid waiting for too long.
+	minAge := 10 * time.Millisecond
+	opts = append(opts, kgo.MetadataMinAge(minAge), kgo.MetadataMaxAge(minAge*2))
+	client, err := NewFranzConsumerGroup(
+		t.Context(), componenttest.NewNopHost(), clientConfig, consumerConfig,
+		topics, nil, zaptest.NewLogger(t, zaptest.Level(zap.InfoLevel)), opts...,
+	)
+	require.NoError(t, err)
+	t.Cleanup(client.Close)
+	return client
+}
+
+func TestFranzClient_MetadataRefreshInterval(t *testing.T) {
+	topic := "test-topic"
+	metadataMaxAge := 25 * time.Millisecond
+	metadataMinAge := 10 * time.Millisecond
+
+	type setupClientFunc func(t *testing.T, clientConfig configkafka.ClientConfig, topic string, metadataMinAge time.Duration)
+	tests := []struct {
+		name        string
+		setupClient setupClientFunc
+	}{
+		{
+			name: "producer",
+			setupClient: func(t *testing.T, clientConfig configkafka.ClientConfig, _ string, metadataMinAge time.Duration) {
+				tl := zaptest.NewLogger(t, zaptest.Level(zap.WarnLevel))
+				client, err := NewFranzSyncProducer(
+					t.Context(), componenttest.NewNopHost(), clientConfig,
+					configkafka.NewDefaultProducerConfig(), time.Second, tl,
+					kgo.MetadataMinAge(metadataMinAge),
+				)
+				require.NoError(t, err)
+				t.Cleanup(client.Close)
+			},
+		},
+		{
+			name: "consumer",
+			setupClient: func(t *testing.T, clientConfig configkafka.ClientConfig, topic string, metadataMinAge time.Duration) {
+				consumeConfig := configkafka.NewDefaultConsumerConfig()
+				mustNewFranzConsumerGroup(t, clientConfig, consumeConfig, []string{topic}, kgo.MetadataMinAge(metadataMinAge))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cluster, clientConfig := kafkatest.NewCluster(t, kfake.SeedTopics(1, topic))
+			// Set the metadata refresh interval which is expected to be translated into the franz-go client's metadataMaxAge configuration
+			clientConfig.Metadata.RefreshInterval = metadataMaxAge
+
+			metadataReqCh := make(chan struct{}, 10)
+			cluster.Control(func(req kmsg.Request) (kmsg.Response, error, bool) {
+				if _, ok := req.(*kmsg.MetadataRequest); ok {
+					select {
+					case metadataReqCh <- struct{}{}:
+					default:
+					}
+				}
+				return nil, nil, false
+			})
+
+			tt.setupClient(t, clientConfig, topic, metadataMinAge)
+
+			// Wait for initial metadata request. Due to the configuration passed into franz-go client, the metadataMaxAge should be set to 25 milliseconds.
+			select {
+			case <-metadataReqCh:
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for initial metadata request")
+			}
+
+			// Check for second metadata request
+			select {
+			case <-metadataReqCh:
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for metadata refresh")
+			}
+		})
+	}
+}
+
+func TestFranzClient_ProtocolVersion(t *testing.T) {
+	type testcase struct {
+		protocolVersion string
+		expectedVersion int
+	}
+	tests := map[string]testcase{
+		"without protocol version": {
+			expectedVersion: 5, // maximum
+		},
+		"with protocol version": {
+			protocolVersion: "2.1.0",
+			expectedVersion: 2,
+		},
+	}
+
+	for name, testcase := range tests {
+		t.Run(name, func(t *testing.T) {
+			var calls int
+			cluster, clientConfig := kafkatest.NewCluster(t)
+			cluster.ControlKey(int16(kmsg.ApiVersions), func(req kmsg.Request) (kmsg.Response, error, bool) {
+				calls++
+				assert.Equal(t, int16(testcase.expectedVersion), req.GetVersion())
+				return nil, nil, false
+			})
+
+			clientConfig.ProtocolVersion = testcase.protocolVersion
+			t.Run("consumer", func(t *testing.T) {
+				consumeConfig := configkafka.NewDefaultConsumerConfig()
+				client := mustNewFranzConsumerGroup(t, clientConfig, consumeConfig, []string{})
+				assert.NoError(t, client.Ping(t.Context()))
+			})
+			t.Run("producer", func(t *testing.T) {
+				client, err := NewFranzSyncProducer(
+					t.Context(), componenttest.NewNopHost(), clientConfig,
+					configkafka.NewDefaultProducerConfig(), time.Second, zap.NewNop(),
+				)
+				require.NoError(t, err)
+				require.NoError(t, client.Ping(t.Context())) // trigger an API call
+				client.Close()
+			})
+			assert.Equal(t, 2, calls)
+		})
+	}
+}
+
+func TestNewFranzClient_And_Admin(t *testing.T) {
+	_, clientCfg := kafkatest.NewCluster(t, kfake.SeedTopics(1, "meta-topic"))
+	tl := zaptest.NewLogger(t, zaptest.Level(zap.WarnLevel))
+
+	// Plain client
+	cl, err := NewFranzClient(t.Context(), componenttest.NewNopHost(), clientCfg, tl)
+	require.NoError(t, err)
+	t.Cleanup(cl.Close)
+
+	// Admin from fresh client
+	ad, cl2, err := NewFranzClusterAdminClient(t.Context(), componenttest.NewNopHost(), clientCfg, tl)
+	require.NoError(t, err)
+	t.Cleanup(func() { ad.Close(); cl2.Close() })
+
+	// Metadata via admin should return brokers & topic
+	md, err := ad.Metadata(t.Context(), "meta-topic")
+	require.NoError(t, err)
+	assert.NotEmpty(t, md.Brokers)
+	_, ok := md.Topics["meta-topic"]
+	assert.True(t, ok)
+}
+
+func TestFranzClient_MetadataRetryMax(t *testing.T) {
+	for _, maxRetries := range []int{0, 2} {
+		t.Run(fmt.Sprintf("max_%d", maxRetries), func(t *testing.T) {
+			cluster, clientConfig := kafkatest.NewCluster(t)
+			clientConfig.Metadata.Retry.Max = maxRetries
+			clientConfig.Metadata.Retry.Backoff = time.Millisecond
+
+			// CreateTopics answered with NOT_CONTROLLER is a request franz-go
+			// retries. Metadata is unusable here because franz-go serves it
+			// from its own cache rather than retrying against the broker.
+			var attempts atomic.Int64
+			cluster.ControlKey(int16(kmsg.CreateTopics), func(req kmsg.Request) (kmsg.Response, error, bool) {
+				cluster.KeepControl()
+				attempts.Add(1)
+				resp := req.ResponseKind().(*kmsg.CreateTopicsResponse)
+				resp.Topics = append(resp.Topics, kmsg.CreateTopicsResponseTopic{
+					Topic:     "retry-topic",
+					ErrorCode: kerr.NotController.Code,
+				})
+				return resp, nil, true
+			})
+
+			tl := zaptest.NewLogger(t, zaptest.Level(zap.ErrorLevel))
+			client, err := NewFranzClient(t.Context(), componenttest.NewNopHost(), clientConfig, tl)
+			require.NoError(t, err)
+			t.Cleanup(client.Close)
+
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			createReq := kmsg.NewPtrCreateTopicsRequest()
+			topic := kmsg.NewCreateTopicsRequestTopic()
+			topic.Topic = "retry-topic"
+			topic.NumPartitions = 1
+			topic.ReplicationFactor = 1
+			createReq.Topics = append(createReq.Topics, topic)
+			_, err = createReq.RequestWith(ctx, client)
+			require.NoError(t, err)
+			assert.Equal(t, int64(maxRetries+1), attempts.Load())
+		})
+	}
+}
+
+func TestNewRetryBackoffFn(t *testing.T) {
+	t.Run("default_matches_franz_go", func(t *testing.T) {
+		fn := newRetryBackoffFn(250 * time.Millisecond)
+		assert.Equal(t, 250*time.Millisecond, fn(0))
+		// Bounds are the unjittered backoff scaled by the +/-20% jitter range.
+		for fails, unjittered := range map[int]time.Duration{
+			1: 250 * time.Millisecond,
+			2: 500 * time.Millisecond,
+			3: time.Second,
+			4: 2 * time.Second,
+		} {
+			got := fn(fails)
+			assert.GreaterOrEqual(t, got, time.Duration(float64(unjittered)*0.8))
+			assert.LessOrEqual(t, got, time.Duration(float64(unjittered)*1.2))
+		}
+		assert.Equal(t, 5*time.Second, fn(11))
+	})
+
+	t.Run("caps_at_five_seconds", func(t *testing.T) {
+		fn := newRetryBackoffFn(250 * time.Millisecond)
+		for fails := range 100 {
+			assert.LessOrEqual(t, fn(fails), 5*time.Second)
+		}
+	})
+
+	t.Run("small_backoff_keeps_doubling_past_ten_failures", func(t *testing.T) {
+		// 1ms is still under the cap at failure 11, so it must keep doubling.
+		fn := newRetryBackoffFn(time.Millisecond)
+		for fails, unjittered := range map[int]time.Duration{
+			10: 512 * time.Millisecond,
+			11: 1024 * time.Millisecond,
+			12: 2048 * time.Millisecond,
+		} {
+			got := fn(fails)
+			assert.GreaterOrEqual(t, got, time.Duration(float64(unjittered)*0.8))
+			assert.LessOrEqual(t, got, time.Duration(float64(unjittered)*1.2))
+		}
+		// Clamps only once the doubling passes the cap.
+		assert.Equal(t, 5*time.Second, fn(20))
+	})
+
+	t.Run("extreme_backoff_does_not_overflow", func(t *testing.T) {
+		// 100000h passes validation but overflows when doubled.
+		minBackoff := 100000 * time.Hour
+		fn := newRetryBackoffFn(minBackoff)
+		for fails := range 100 {
+			got := fn(fails)
+			assert.Positive(t, got)
+			assert.LessOrEqual(t, got, minBackoff)
+		}
+	})
+
+	t.Run("cap_raised_to_backoff", func(t *testing.T) {
+		// A minimum above the 5s default cap raises the cap rather than
+		// being truncated down to it.
+		fn := newRetryBackoffFn(30 * time.Second)
+		for fails := range 100 {
+			got := fn(fails)
+			assert.GreaterOrEqual(t, got, 24*time.Second)
+			assert.LessOrEqual(t, got, 30*time.Second)
+		}
+	})
+}
+
+func TestConfigureKgoKerberos(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cfg         configkafka.KerberosConfig
+		wantErrIs   error
+		wantErrText string
+	}{
+		"password_auth": {
+			cfg: configkafka.KerberosConfig{
+				ServiceName: "kafka",
+				Realm:       "EXAMPLE.COM",
+				Username:    "user",
+				Password:    "pass",
+			},
+		},
+		"disable_fast_negotiation": {
+			cfg: configkafka.KerberosConfig{
+				ServiceName:     "kafka",
+				Username:        "user",
+				Password:        "pass",
+				DisablePAFXFAST: true,
+			},
+		},
+		"bad_config_path": {
+			cfg: configkafka.KerberosConfig{
+				ServiceName: "kafka",
+				ConfigPath:  filepath.Join("nonexistent", "krb5.conf"),
+			},
+			wantErrText: "configuration file could not be opened",
+		},
+		"bad_keytab_path": {
+			cfg: configkafka.KerberosConfig{
+				ServiceName: "kafka",
+				Username:    "user",
+				KeyTabPath:  filepath.Join("nonexistent", "krb5.keytab"),
+			},
+			wantErrIs: fs.ErrNotExist,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			opt, err := configureKgoKerberos(&tc.cfg)
+			if tc.wantErrIs != nil {
+				require.ErrorIs(t, err, tc.wantErrIs)
+				return
+			}
+			if tc.wantErrText != "" {
+				require.ErrorContains(t, err, tc.wantErrText)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, opt)
+		})
+	}
+}
+
+func TestLoadAWSCredentialsProvider_ExpiryWindow(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		lifetime  time.Duration
+		wantCalls int32
+		wantKey   string
+	}{
+		{name: "reuse valid credentials", lifetime: 5 * time.Minute, wantCalls: 1, wantKey: "AKID1"},
+		{name: "refresh near-expiry credentials", lifetime: 30 * time.Second, wantCalls: 2, wantKey: "AKID2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Given a real web identity provider backed by a local STS endpoint.
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseForm(); err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if r.Form.Get("Action") != "AssumeRoleWithWebIdentity" {
+					t.Errorf("unexpected STS action: %s", r.Form.Get("Action"))
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				call := calls.Add(1)
+				lifetime := tt.lifetime
+				if call > 1 {
+					lifetime = time.Hour
+				}
+				w.Header().Set("Content-Type", "text/xml")
+				_, err := fmt.Fprintf(w, `<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>AKID%d</AccessKeyId><SecretAccessKey>SECRET</SecretAccessKey><SessionToken>TOKEN</SessionToken><Expiration>%s</Expiration></Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>`, call, time.Now().Add(lifetime).UTC().Format(time.RFC3339))
+				if err != nil {
+					t.Error(err)
+				}
+			}))
+			t.Cleanup(server.Close)
+
+			dir := t.TempDir()
+			tokenFile := filepath.Join(dir, "token")
+			require.NoError(t, os.WriteFile(tokenFile, []byte("test-web-identity-token"), 0o600))
+			for _, name := range []string{"AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE", "AWS_DEFAULT_PROFILE"} {
+				t.Setenv(name, "")
+			}
+			t.Setenv("AWS_CONFIG_FILE", filepath.Join(dir, "config"))
+			t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(dir, "credentials"))
+			t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", tokenFile)
+			t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test")
+			t.Setenv("AWS_ROLE_SESSION_NAME", "test-session")
+			t.Setenv("AWS_ENDPOINT_URL_STS", server.URL)
+			t.Setenv("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+			provider, err := loadAWSCredentialsProvider(t.Context(), "us-west-2")
+			require.NoError(t, err)
+			_, err = provider.Retrieve(t.Context())
+			require.NoError(t, err)
+
+			// When credentials are requested again without waiting for expiration.
+			creds, err := provider.Retrieve(t.Context())
+
+			// Then only credentials inside the expiry window are refreshed.
+			require.NoError(t, err)
+			require.Equal(t, tt.wantKey, creds.AccessKeyID)
+			require.Equal(t, tt.wantCalls, calls.Load())
+		})
+	}
+}
+
+func saslMechanism(t *testing.T, opt kgo.Opt) sasl.Mechanism {
+	t.Helper()
+	cl, err := kgo.NewClient(opt)
+	require.NoError(t, err)
+	t.Cleanup(cl.Close)
+	mechanisms := cl.OptValue(kgo.SASL).([]sasl.Mechanism)
+	require.Len(t, mechanisms, 1)
+	return mechanisms[0]
+}
+
+func TestConfigureKgoSASL_AWSMSKIAMOAUTHBEARER_ReusesCredentials(t *testing.T) {
+	var loads, retrievals atomic.Int32
+	orig := loadAWSCredentialsProvider
+	t.Cleanup(func() { loadAWSCredentialsProvider = orig })
+	loadAWSCredentialsProvider = func(_ context.Context, region string) (aws.CredentialsProvider, error) {
+		loads.Add(1)
+		assert.Equal(t, "us-west-2", region)
+		// Mirror LoadDefaultConfig, which wraps the provider in a cache.
+		return aws.NewCredentialsCache(aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			retrievals.Add(1)
+			return aws.Credentials{AccessKeyID: "AKID", SecretAccessKey: "SECRET"}, nil
+		})), nil
+	}
+
+	opt, err := configureKgoSASL(t.Context(), &configkafka.SASLConfig{
+		Mechanism: AWSMSKIAMOAUTHBEARER,
+		AWSMSK:    configkafka.AWSMSKConfig{Region: "us-west-2"},
+	}, componenttest.NewNopHost())
+	require.NoError(t, err)
+
+	mech := saslMechanism(t, opt)
+	for range 3 {
+		_, msg, err := mech.Authenticate(t.Context(), "broker:9098")
+		require.NoError(t, err)
+		assert.Contains(t, string(msg), "auth=Bearer ")
+	}
+	assert.Equal(t, int32(1), loads.Load())
+	assert.Equal(t, int32(1), retrievals.Load())
+}
+
+func TestConfigureKgoSASL_AWSMSKIAMOAUTHBEARER_LoadError(t *testing.T) {
+	orig := loadAWSCredentialsProvider
+	t.Cleanup(func() { loadAWSCredentialsProvider = orig })
+	loadAWSCredentialsProvider = func(context.Context, string) (aws.CredentialsProvider, error) {
+		return nil, errors.New("bad profile")
+	}
+
+	_, err := configureKgoSASL(t.Context(), &configkafka.SASLConfig{
+		Mechanism: AWSMSKIAMOAUTHBEARER,
+		AWSMSK:    configkafka.AWSMSKConfig{Region: "us-west-2"},
+	}, componenttest.NewNopHost())
+	require.ErrorContains(t, err, "bad profile")
+}
+
+func TestConfigureKgoSASL_OAUTHBEARER(t *testing.T) {
+	extID := component.MustNewID("oauth2client")
+
+	t.Run("missing_extension", func(t *testing.T) {
+		_, err := configureKgoSASL(t.Context(), &configkafka.SASLConfig{
+			Mechanism:              OAUTHBEARER,
+			OAuthBearerTokenSource: extID,
+		}, componenttest.NewNopHost())
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "is not configured")
+	})
+
+	t.Run("incompatible_extension", func(t *testing.T) {
+		host := &mockHost{extensions: map[component.ID]component.Component{
+			extID: &mockGroupBalancer{},
+		}}
+		_, err := configureKgoSASL(t.Context(), &configkafka.SASLConfig{
+			Mechanism:              OAUTHBEARER,
+			OAuthBearerTokenSource: extID,
+		}, host)
+		require.EqualError(t, err, `oauthbearer_token_source extension "oauth2client" does not implement Token(context.Context)`)
+	})
+
+	t.Run("present_extension_success", func(t *testing.T) {
+		host := &mockHost{extensions: map[component.ID]component.Component{
+			extID: &mockTokenSource{token: "tok"},
+		}}
+		opt, err := configureKgoSASL(t.Context(), &configkafka.SASLConfig{
+			Mechanism:              OAUTHBEARER,
+			OAuthBearerTokenSource: extID,
+		}, host)
+		require.NoError(t, err)
+		require.NotNil(t, opt)
+
+		mech := saslMechanism(t, opt)
+		_, msg, err := mech.Authenticate(t.Context(), "broker:9092")
+		require.NoError(t, err)
+		assert.Contains(t, string(msg), "auth=Bearer tok")
+	})
+
+	t.Run("token_retrieval_error", func(t *testing.T) {
+		host := &mockHost{extensions: map[component.ID]component.Component{
+			extID: &mockTokenSource{err: errors.New("token fetch failed")},
+		}}
+		opt, err := configureKgoSASL(t.Context(), &configkafka.SASLConfig{
+			Mechanism:              OAUTHBEARER,
+			OAuthBearerTokenSource: extID,
+		}, host)
+		require.NoError(t, err)
+		require.NotNil(t, opt)
+
+		mech := saslMechanism(t, opt)
+		_, _, err = mech.Authenticate(t.Context(), "broker:9092")
+		require.ErrorContains(t, err, "token fetch failed")
+	})
+}
+
+func TestConfigureKgoSASL_UnsupportedMechanism(t *testing.T) {
+	_, err := configureKgoSASL(t.Context(), &configkafka.SASLConfig{
+		Mechanism: "BOGUS",
+	}, componenttest.NewNopHost())
+	require.ErrorContains(t, err, "unsupported SASL mechanism")
+}
+
+func TestFranzClient_DialTimeout(t *testing.T) {
+	_, clientCfg := kafkatest.NewCluster(t)
+	tl := zaptest.NewLogger(t, zaptest.Level(zap.WarnLevel))
+
+	t.Run("default", func(t *testing.T) {
+		cl, err := NewFranzClient(t.Context(), componenttest.NewNopHost(), clientCfg, tl)
+		require.NoError(t, err)
+		t.Cleanup(cl.Close)
+		assert.Equal(t, 10*time.Second, cl.OptValue(kgo.DialTimeout))
+	})
+
+	t.Run("custom", func(t *testing.T) {
+		cfg := clientCfg
+		cfg.DialTimeout = 25 * time.Second
+		cl, err := NewFranzClient(t.Context(), componenttest.NewNopHost(), cfg, tl)
+		require.NoError(t, err)
+		t.Cleanup(cl.Close)
+		assert.Equal(t, 25*time.Second, cl.OptValue(kgo.DialTimeout))
+	})
+}
+
+// mockHost is a minimal component.Host that returns a fixed extension map.
+type mockHost struct {
+	extensions map[component.ID]component.Component
+}
+
+func (m *mockHost) GetExtensions() map[component.ID]component.Component {
+	return m.extensions
+}
+
+// mockTokenSource is a contextTokenSource extension used to test OAUTHBEARER.
+type mockTokenSource struct {
+	extension.Extension
+	token string
+	err   error
+}
+
+func (m *mockTokenSource) Token(context.Context) (*oauth2.Token, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return &oauth2.Token{AccessToken: m.token}, nil
+}
+
+// mockGroupBalancer is a no-op kgo.GroupBalancer used in tests.
+type mockGroupBalancer struct {
+	extension.Extension
+}
+
+var _ kgo.GroupBalancer = (*mockGroupBalancer)(nil)
+
+func (*mockGroupBalancer) ProtocolName() string {
+	return "mock"
+}
+
+func (*mockGroupBalancer) JoinGroupMetadata([]string, map[string][]int32, int32) []byte {
+	return nil
+}
+
+func (*mockGroupBalancer) ParseSyncAssignment([]byte) (map[string][]int32, error) {
+	return nil, nil
+}
+
+func (*mockGroupBalancer) MemberBalancer([]kmsg.JoinGroupResponseMember) (kgo.GroupMemberBalancer, map[string]struct{}, error) {
+	return nil, nil, nil
+}
+
+func (*mockGroupBalancer) IsCooperative() bool {
+	return false
+}

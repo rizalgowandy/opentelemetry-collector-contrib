@@ -1,0 +1,15 @@
+display_name: Metrics Transform Processor
+type: metrics_transform
+deprecated_type: metricstransform
+
+status:
+  class: processor
+  stability:
+    beta: [metrics]
+  distributions: [contrib, k8s]
+  codeowners:
+    active: [himanshu130700]
+    emeritus: [dmitryax]
+
+tests:
+  config:

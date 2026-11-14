@@ -1,34 +1,35 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package groupbytraceprocessor
+package groupbytraceprocessor // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/groupbytraceprocessor"
 
 import (
+	"fmt"
 	"time"
+)
 
-	"go.opentelemetry.io/collector/config"
+// EmitStrategy controls how the processor groups spans before releasing them to
+// the next consumer.
+type EmitStrategy string
+
+const (
+	// EmitStrategyTrace (default) buffers all spans for a trace together and
+	// releases them as one batch after wait_duration.
+	EmitStrategyTrace EmitStrategy = "trace"
+
+	// EmitStrategyService buffers the spans a trace passed through each service
+	// and releases them separately after wait_duration, one batch per call to a
+	// service.
+	EmitStrategyService EmitStrategy = "service"
 )
 
 // Config is the configuration for the processor.
 type Config struct {
-	config.ProcessorSettings `mapstructure:",squash"` // squash ensures fields are correctly decoded in embedded struct
-
 	// NumTraces is the max number of traces to keep in memory waiting for the duration.
 	// Default: 1_000_000.
 	NumTraces int `mapstructure:"num_traces"`
 
-	// NumWorkers is a number of workers processing event queue. Should be equal to physical processors number.
+	// NumWorkers is a number of workers processing event queue.
 	// Default: 1.
 	NumWorkers int `mapstructure:"num_workers"`
 
@@ -47,4 +48,20 @@ type Config struct {
 	// Default: false.
 	// Not yet implemented, and an error will be returned when this option is used.
 	StoreOnDisk bool `mapstructure:"store_on_disk"`
+
+	// EmitStrategy controls the span-emit granularity.
+	// Valid values: "trace" (default), "service".
+	EmitStrategy EmitStrategy `mapstructure:"emit_strategy"`
+}
+
+func (cfg *Config) Validate() error {
+	switch cfg.EmitStrategy {
+	case EmitStrategyTrace, EmitStrategyService:
+		// valid
+	default:
+		return fmt.Errorf("unknown emit_strategy %q: valid values are %q and %q",
+			cfg.EmitStrategy, EmitStrategyTrace, EmitStrategyService)
+	}
+
+	return nil
 }

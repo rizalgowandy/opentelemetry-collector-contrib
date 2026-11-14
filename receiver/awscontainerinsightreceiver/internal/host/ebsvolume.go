@@ -1,18 +1,7 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package host
+package host // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awscontainerinsightreceiver/internal/host"
 
 import (
 	"bufio"
@@ -25,17 +14,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"go.uber.org/zap"
 )
 
 var ebsMountPointRegex = regexp.MustCompile(`kubernetes\.io/aws-ebs/mounts/aws/(.+)/(vol-\w+)$`)
 
 type ebsVolumeClient interface {
-	DescribeVolumesWithContext(context.Context, *ec2.DescribeVolumesInput, ...request.Option) (*ec2.DescribeVolumesOutput, error)
+	DescribeVolumes(ctx context.Context, params *ec2.DescribeVolumesInput, optFns ...func(*ec2.Options)) (*ec2.DescribeVolumesOutput, error)
 }
 
 type ebsVolumeProvider interface {
@@ -63,12 +51,15 @@ type ebsVolume struct {
 
 type ebsVolumeOption func(*ebsVolume)
 
-func newEBSVolume(ctx context.Context, session *session.Session, instanceID string, region string,
-	refreshInterval time.Duration, logger *zap.Logger, options ...ebsVolumeOption) ebsVolumeProvider {
+func newEBSVolume(ctx context.Context, cfg aws.Config, instanceID, region string,
+	refreshInterval time.Duration, logger *zap.Logger, options ...ebsVolumeOption,
+) ebsVolumeProvider {
+	cfg.Region = region
+
 	e := &ebsVolume{
 		dev2Vol:         make(map[string]string),
 		instanceID:      instanceID,
-		client:          ec2.New(session, aws.NewConfig().WithRegion(region)),
+		client:          ec2.NewFromConfig(cfg),
 		refreshInterval: refreshInterval,
 		maxJitterTime:   3 * time.Second,
 		shutdownC:       make(chan bool),
@@ -86,7 +77,7 @@ func newEBSVolume(ctx context.Context, session *session.Session, instanceID stri
 		// keep refreshing to get updated ebs volumes
 		return true
 	}
-	go refreshUntil(ctx, e.refresh, e.refreshInterval, shouldRefresh, e.maxJitterTime)
+	go RefreshUntil(ctx, e.refresh, e.refreshInterval, shouldRefresh, e.maxJitterTime)
 
 	return e
 }
@@ -95,10 +86,10 @@ func (e *ebsVolume) refresh(ctx context.Context) {
 	e.logger.Info("Fetch ebs volumes from ec2 api")
 
 	input := &ec2.DescribeVolumesInput{
-		Filters: []*ec2.Filter{
+		Filters: []ec2types.Filter{
 			{
 				Name:   aws.String("attachment.instance-id"),
-				Values: aws.StringSlice([]string{e.instanceID}),
+				Values: []string{e.instanceID},
 			},
 		},
 	}
@@ -106,12 +97,13 @@ func (e *ebsVolume) refresh(ctx context.Context) {
 	devPathSet := make(map[string]bool)
 	allSuccess := false
 	for {
-		result, err := e.client.DescribeVolumesWithContext(ctx, input)
+		result, err := e.client.DescribeVolumes(ctx, input)
 		if err != nil {
 			e.logger.Warn("Fail to call ec2 DescribeVolumes", zap.Error(err))
 			break
 		}
-		for _, volume := range result.Volumes {
+		for i := range result.Volumes {
+			volume := result.Volumes[i]
 			for _, attachment := range volume.Attachments {
 				devPath := e.addEBSVolumeMapping(volume.AvailabilityZone, attachment)
 				devPathSet[devPath] = true
@@ -121,7 +113,7 @@ func (e *ebsVolume) refresh(ctx context.Context) {
 		if result.NextToken == nil {
 			break
 		}
-		input.SetNextToken(*result.NextToken)
+		input.NextToken = result.NextToken
 	}
 
 	if allSuccess {
@@ -135,16 +127,16 @@ func (e *ebsVolume) refresh(ctx context.Context) {
 	}
 }
 
-func (e *ebsVolume) addEBSVolumeMapping(zone *string, attachement *ec2.VolumeAttachment) string {
-	// *attachement.Device is sth like: /dev/xvda
-	devPath := e.findNvmeBlockNameIfPresent(*attachement.Device)
+func (e *ebsVolume) addEBSVolumeMapping(zone *string, attachment ec2types.VolumeAttachment) string {
+	// *attachment.Device is sth like: /dev/xvda
+	devPath := e.findNvmeBlockNameIfPresent(*attachment.Device)
 	if devPath == "" {
-		devPath = *attachement.Device
+		devPath = *attachment.Device
 	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.dev2Vol[devPath] = fmt.Sprintf("aws://%s/%s", *zone, *attachement.VolumeId)
+	e.dev2Vol[devPath] = fmt.Sprintf("aws://%s/%s", *zone, *attachment.VolumeId)
 	return devPath
 }
 
@@ -190,7 +182,7 @@ func (e *ebsVolume) getEBSVolumeID(devName string) string {
 	return ""
 }
 
-//extract the ebs volume id used by kubernetes cluster
+// extract the ebs volume id used by kubernetes cluster
 func (e *ebsVolume) extractEbsIDsUsedByKubernetes() map[string]string {
 	ebsVolumeIDs := make(map[string]string)
 
@@ -209,7 +201,7 @@ func (e *ebsVolume) extractEbsIDsUsedByKubernetes() map[string]string {
 			continue
 		}
 
-		//example line: /dev/nvme1n1 /var/lib/kubelet/plugins/kubernetes.io/aws-ebs/mounts/aws/us-west-2b/vol-0d9f0816149eb2050 ext4 rw,relatime,data=ordered 0 0
+		// example line: /dev/nvme1n1 /var/lib/kubelet/plugins/kubernetes.io/aws-ebs/mounts/aws/us-west-2b/vol-0d9f0816149eb2050 ext4 rw,relatime,data=ordered 0 0
 		keys := strings.Split(lineStr, " ")
 		if len(keys) < 2 {
 			continue

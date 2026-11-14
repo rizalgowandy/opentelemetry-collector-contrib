@@ -1,33 +1,22 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-package containerinsight
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+package containerinsight // import "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/containerinsight"
 
 import (
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
-	"time"
 
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
 )
 
-// SumFields takes an array of type map[string]interface{} and do
+// SumFields takes an array of type map[string]any and do
 // the summation on the values corresponding to the same keys.
-// It is assumed that the underlying type of interface{} to be float64.
-func SumFields(fields []map[string]interface{}) map[string]float64 {
+// It is assumed that the underlying type of any to be float64.
+func SumFields(fields []map[string]any) map[string]float64 {
 	if len(fields) == 0 {
 		return nil
 	}
@@ -44,12 +33,13 @@ func SumFields(fields []map[string]interface{}) map[string]float64 {
 		return result
 	}
 
-	for i := 1; i < len(fields); i++ {
+	for _, currentField := range fields[1:] { // #nosec G602 -- len(fields) >= 2 here: len==0 and len==1 are both returned above
 		for k, v := range result {
-			if fields[i][k] == nil {
+			fieldValue, exists := currentField[k]
+			if !exists || fieldValue == nil {
 				continue
 			}
-			if fv, ok := fields[i][k].(float64); ok {
+			if fv, ok := fieldValue.(float64); ok {
 				result[k] = v + fv
 			}
 		}
@@ -149,12 +139,12 @@ func getPrefixByMetricType(mType string) string {
 
 // MetricName returns the metric name based on metric type and measurement name
 // For example, a type "node" and a measurement "cpu_utilization" gives "node_cpu_utilization"
-func MetricName(mType string, measurement string) string {
+func MetricName(mType, measurement string) string {
 	return getPrefixByMetricType(mType) + measurement
 }
 
 // RemovePrefix removes the prefix (e.g. "node_", "pod_") from the metric name
-func RemovePrefix(mType string, metricName string) string {
+func RemovePrefix(mType, metricName string) string {
 	prefix := getPrefixByMetricType(mType)
 	return strings.Replace(metricName, prefix, "", 1)
 }
@@ -164,26 +154,28 @@ func GetUnitForMetric(metric string) string {
 	return metricToUnitMap[metric]
 }
 
-// ConvertToOTLPMetrics converts a field containing metric values and a tag containing the relevant labels to OTLP metrics
-func ConvertToOTLPMetrics(fields map[string]interface{}, tags map[string]string, logger *zap.Logger) pdata.Metrics {
-	md := pdata.NewMetrics()
+// ConvertToOTLPMetrics converts a field containing metric values and tags containing the relevant labels to OTLP metrics.
+// For legacy reasons, the timestamp is stored in the tags map with the key "Timestamp", but, unlike other tags,
+// it is not added as a resource attribute to avoid high-cardinality metrics.
+func ConvertToOTLPMetrics(fields map[string]any, tags map[string]string, logger *zap.Logger) pmetric.Metrics {
+	md := pmetric.NewMetrics()
 	rms := md.ResourceMetrics()
-	rms.Resize(1)
-	rm := rms.At(0)
+	rm := rms.AppendEmpty()
 
-	var timestamp pdata.Timestamp
+	var timestamp pcommon.Timestamp
 	resource := rm.Resource()
 	for tagKey, tagValue := range tags {
 		if tagKey == Timestamp {
 			timeNs, _ := strconv.ParseUint(tagValue, 10, 64)
-			timestamp = pdata.Timestamp(timeNs)
-			// convert from nanosecond to millisecond (as emf log use millisecond timestamp)
-			tagValue = strconv.FormatUint(timeNs/uint64(time.Millisecond), 10)
+			timestamp = pcommon.Timestamp(timeNs)
+
+			// Do not add Timestamp as a resource attribute to avoid high-cardinality.
+			continue
 		}
-		resource.Attributes().UpsertString(tagKey, tagValue)
+		resource.Attributes().PutStr(tagKey, tagValue)
 	}
 
-	ilms := rm.InstrumentationLibraryMetrics()
+	ilms := rm.ScopeMetrics()
 
 	metricType := tags[MetricType]
 	for key, value := range fields {
@@ -191,21 +183,21 @@ func ConvertToOTLPMetrics(fields map[string]interface{}, tags map[string]string,
 		unit := GetUnitForMetric(metric)
 		switch t := value.(type) {
 		case int:
-			ilms.Append(intGauge(key, unit, int64(t), timestamp))
+			intGauge(ilms.AppendEmpty(), key, unit, int64(t), timestamp)
 		case int32:
-			ilms.Append(intGauge(key, unit, int64(t), timestamp))
+			intGauge(ilms.AppendEmpty(), key, unit, int64(t), timestamp)
 		case int64:
-			ilms.Append(intGauge(key, unit, t, timestamp))
+			intGauge(ilms.AppendEmpty(), key, unit, t, timestamp)
 		case uint:
-			ilms.Append(doubleGauge(key, unit, float64(t), timestamp))
+			intGauge(ilms.AppendEmpty(), key, unit, int64(t), timestamp)
 		case uint32:
-			ilms.Append(doubleGauge(key, unit, float64(t), timestamp))
+			intGauge(ilms.AppendEmpty(), key, unit, int64(t), timestamp)
 		case uint64:
-			ilms.Append(doubleGauge(key, unit, float64(t), timestamp))
+			intGauge(ilms.AppendEmpty(), key, unit, int64(t), timestamp)
 		case float32:
-			ilms.Append(doubleGauge(key, unit, float64(t), timestamp))
+			doubleGauge(ilms.AppendEmpty(), key, unit, float64(t), timestamp)
 		case float64:
-			ilms.Append(doubleGauge(key, unit, t, timestamp))
+			doubleGauge(ilms.AppendEmpty(), key, unit, t, timestamp)
 		default:
 			valueType := fmt.Sprintf("%T", value)
 			logger.Warn("Detected unexpected field", zap.String("key", key), zap.Any("value", value), zap.String("value type", valueType))
@@ -215,43 +207,30 @@ func ConvertToOTLPMetrics(fields map[string]interface{}, tags map[string]string,
 	return md
 }
 
-func intGauge(metricName string, unit string, value int64, ts pdata.Timestamp) pdata.InstrumentationLibraryMetrics {
-	ilm := pdata.NewInstrumentationLibraryMetrics()
-
+func intGauge(ilm pmetric.ScopeMetrics, metricName, unit string, value int64, ts pcommon.Timestamp) {
 	metric := initMetric(ilm, metricName, unit)
 
-	metric.SetDataType(pdata.MetricDataTypeIntGauge)
-	intGauge := metric.IntGauge()
+	intGauge := metric.SetEmptyGauge()
 	dataPoints := intGauge.DataPoints()
-	dataPoints.Resize(1)
-	dataPoint := dataPoints.At(0)
+	dataPoint := dataPoints.AppendEmpty()
 
-	dataPoint.SetValue(value)
+	dataPoint.SetIntValue(value)
 	dataPoint.SetTimestamp(ts)
-
-	return ilm
 }
 
-func doubleGauge(metricName string, unit string, value float64, ts pdata.Timestamp) pdata.InstrumentationLibraryMetrics {
-	ilm := pdata.NewInstrumentationLibraryMetrics()
-
+func doubleGauge(ilm pmetric.ScopeMetrics, metricName, unit string, value float64, ts pcommon.Timestamp) {
 	metric := initMetric(ilm, metricName, unit)
 
-	metric.SetDataType(pdata.MetricDataTypeDoubleGauge)
-	doubleGauge := metric.DoubleGauge()
+	doubleGauge := metric.SetEmptyGauge()
 	dataPoints := doubleGauge.DataPoints()
-	dataPoints.Resize(1)
-	dataPoint := dataPoints.At(0)
+	dataPoint := dataPoints.AppendEmpty()
 
-	dataPoint.SetValue(value)
+	dataPoint.SetDoubleValue(value)
 	dataPoint.SetTimestamp(ts)
-
-	return ilm
 }
 
-func initMetric(ilm pdata.InstrumentationLibraryMetrics, name, unit string) pdata.Metric {
-	ilm.Metrics().Resize(1)
-	metric := ilm.Metrics().At(0)
+func initMetric(ilm pmetric.ScopeMetrics, name, unit string) pmetric.Metric {
+	metric := ilm.Metrics().AppendEmpty()
 	metric.SetName(name)
 	metric.SetUnit(unit)
 

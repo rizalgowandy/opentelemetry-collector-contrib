@@ -1,71 +1,89 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package docker
+//go:build (!remove_all_resourcedetection_detectors || enable_detector_docker) && !omit_detector_docker
+
+package docker // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/docker"
 
 import (
 	"context"
 	"fmt"
 
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/conventions"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/processor"
+	conventions "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.uber.org/zap"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/metadataproviders/docker"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal"
-)
-
-const (
-	// TypeStr is type of detector.
-	TypeStr = "docker"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/docker/internal/metadata"
 )
 
 var _ internal.Detector = (*Detector)(nil)
 
 // Detector is a system metadata detector
 type Detector struct {
-	provider dockerMetadata
-	logger   *zap.Logger
+	provider              docker.Provider
+	logger                *zap.Logger
+	rb                    *metadata.ResourceBuilder
+	cfg                   metadata.ResourceAttributesConfig
+	failOnMissingMetadata bool
 }
 
 // NewDetector creates a new system metadata detector
-func NewDetector(p component.ProcessorCreateSettings, dcfg internal.DetectorConfig) (internal.Detector, error) {
-	dockerProvider, err := newDockerMetadata()
+func NewDetector(p processor.Settings, cfg internal.DetectorConfig, failOnMissingMetadata bool) (internal.Detector, error) {
+	dockerProvider, err := docker.NewProvider()
 	if err != nil {
 		return nil, fmt.Errorf("failed creating detector: %w", err)
 	}
 
-	return &Detector{provider: dockerProvider, logger: p.Logger}, nil
+	return &Detector{
+		provider:              dockerProvider,
+		logger:                p.Logger,
+		rb:                    metadata.NewResourceBuilder(cfg.(Config).ResourceAttributes),
+		cfg:                   cfg.(Config).ResourceAttributes,
+		failOnMissingMetadata: failOnMissingMetadata,
+	}, nil
 }
 
 // Detect detects system metadata and returns a resource with the available ones
-func (d *Detector) Detect(ctx context.Context) (pdata.Resource, error) {
-	res := pdata.NewResource()
-	attrs := res.Attributes()
-
-	osType, err := d.provider.OSType(ctx)
-	if err != nil {
-		return res, fmt.Errorf("failed getting OS type: %w", err)
+func (d *Detector) Detect(ctx context.Context) (resource pcommon.Resource, schemaURL string, err error) {
+	if d.cfg.OsType.Enabled {
+		osType, err := d.provider.OSType(ctx)
+		if err != nil {
+			if d.failOnMissingMetadata {
+				return pcommon.NewResource(), "", fmt.Errorf("docker metadata unavailable: %w", err)
+			}
+			d.logger.Debug("docker metadata unavailable", zap.Error(err))
+			return pcommon.NewResource(), "", nil
+		}
+		d.rb.SetOsType(osType)
 	}
 
-	hostname, err := d.provider.Hostname(ctx)
-	if err != nil {
-		return res, fmt.Errorf("failed getting OS hostname: %w", err)
+	if d.cfg.HostName.Enabled {
+		hostname, err := d.provider.Hostname(ctx)
+		if err != nil {
+			if d.failOnMissingMetadata {
+				return pcommon.NewResource(), "", fmt.Errorf("docker metadata unavailable: %w", err)
+			}
+			d.logger.Debug("docker metadata unavailable", zap.Error(err))
+			return pcommon.NewResource(), "", nil
+		}
+		d.rb.SetHostName(hostname)
 	}
 
-	attrs.InsertString(conventions.AttributeHostName, hostname)
-	attrs.InsertString(conventions.AttributeOSType, osType)
+	if d.cfg.ContainerName.Enabled || d.cfg.ContainerImageName.Enabled {
+		info, err := d.provider.ContainerInfo(ctx)
+		if err != nil {
+			if d.failOnMissingMetadata {
+				return pcommon.NewResource(), "", fmt.Errorf("docker metadata unavailable: %w", err)
+			}
+			d.logger.Debug("docker metadata unavailable", zap.Error(err))
+			return pcommon.NewResource(), "", nil
+		}
+		d.rb.SetContainerName(info.Name)
+		d.rb.SetContainerImageName(info.Image)
+	}
 
-	return res, nil
+	return d.rb.Emit(), conventions.SchemaURL, nil
 }

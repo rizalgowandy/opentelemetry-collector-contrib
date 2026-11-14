@@ -1,45 +1,31 @@
-// Copyright 2019, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package carbonreceiver
+package carbonreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/carbonreceiver"
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
-	"sync"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/component/componenterror"
+	"go.opentelemetry.io/collector/component/componentstatus"
 	"go.opentelemetry.io/collector/consumer"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/receiver"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/carbonreceiver/protocol"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/carbonreceiver/transport"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/carbonreceiver/internal/protocol"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/carbonreceiver/internal/transport"
 )
 
-var (
-	errEmptyEndpoint = errors.New("empty endpoint")
-)
+var errEmptyEndpoint = errors.New("empty endpoint")
 
-// carbonreceiver implements a component.MetricsReceiver for Carbon plaintext, aka "line", protocol.
+// carbonreceiver implements a receiver.Metrics for Carbon plaintext, aka "line", protocol.
 // see https://graphite.readthedocs.io/en/latest/feeding-carbon.html#the-plaintext-protocol.
 type carbonReceiver struct {
-	sync.Mutex
-	logger *zap.Logger
-	config *Config
+	settings receiver.Settings
+	config   *Config
 
 	server       transport.Server
 	reporter     transport.Reporter
@@ -47,20 +33,15 @@ type carbonReceiver struct {
 	nextConsumer consumer.Metrics
 }
 
-var _ component.MetricsReceiver = (*carbonReceiver)(nil)
+var _ receiver.Metrics = (*carbonReceiver)(nil)
 
-// New creates the Carbon receiver with the given configuration.
-func New(
-	logger *zap.Logger,
+// newMetricsReceiver creates the Carbon receiver with the given configuration.
+func newMetricsReceiver(
+	set receiver.Settings,
 	config Config,
 	nextConsumer consumer.Metrics,
-) (component.MetricsReceiver, error) {
-
-	if nextConsumer == nil {
-		return nil, componenterror.ErrNilNextConsumer
-	}
-
-	if config.Endpoint == "" {
+) (receiver.Metrics, error) {
+	if config.AddrConfig.Endpoint == "" {
 		return nil, errEmptyEndpoint
 	}
 
@@ -77,19 +58,16 @@ func New(
 		return nil, err
 	}
 
-	// This should be the last one built, or if any other error is raised after
-	// it, the server should be closed.
-	server, err := buildTransportServer(config)
+	rep, err := newReporter(set)
 	if err != nil {
 		return nil, err
 	}
 
 	r := carbonReceiver{
-		logger:       logger,
+		settings:     set,
 		config:       &config,
 		nextConsumer: nextConsumer,
-		server:       server,
-		reporter:     newReporter(config.ID(), logger),
+		reporter:     rep,
 		parser:       parser,
 	}
 
@@ -97,26 +75,28 @@ func New(
 }
 
 func buildTransportServer(config Config) (transport.Server, error) {
-	switch strings.ToLower(config.Transport) {
+	switch strings.ToLower(string(config.AddrConfig.Transport)) {
 	case "", "tcp":
-		return transport.NewTCPServer(config.Endpoint, config.TCPIdleTimeout)
+		return transport.NewTCPServer(config.AddrConfig.Endpoint, config.TCPIdleTimeout)
 	case "udp":
-		return transport.NewUDPServer(config.Endpoint)
+		return transport.NewUDPServer(config.AddrConfig.Endpoint)
 	}
 
-	return nil, fmt.Errorf("unsupported transport %q for receiver %v", config.Transport, config.ID())
+	return nil, fmt.Errorf("unsupported transport %q", string(config.AddrConfig.Transport))
 }
 
 // Start tells the receiver to start its processing.
 // By convention the consumer of the received data is set when the receiver
 // instance is created.
 func (r *carbonReceiver) Start(_ context.Context, host component.Host) error {
-	r.Lock()
-	defer r.Unlock()
-
+	server, err := buildTransportServer(*r.config)
+	if err != nil {
+		return err
+	}
+	r.server = server
 	go func() {
-		if err := r.server.ListenAndServe(r.parser, r.nextConsumer, r.reporter); err != nil {
-			host.ReportFatalError(err)
+		if err := r.server.ListenAndServe(r.parser, r.nextConsumer, r.reporter); err != nil && !errors.Is(err, net.ErrClosed) {
+			componentstatus.ReportStatus(host, componentstatus.NewFatalErrorEvent(err))
 		}
 	}()
 	return nil
@@ -125,8 +105,8 @@ func (r *carbonReceiver) Start(_ context.Context, host component.Host) error {
 // Shutdown tells the receiver that should stop reception,
 // giving it a chance to perform any necessary clean-up.
 func (r *carbonReceiver) Shutdown(context.Context) error {
-	r.Lock()
-	defer r.Unlock()
-
+	if r.server == nil {
+		return nil
+	}
 	return r.server.Close()
 }

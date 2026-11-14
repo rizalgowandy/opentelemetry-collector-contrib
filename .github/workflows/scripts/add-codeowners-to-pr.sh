@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+#
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Adds code owners without write access as reviewers on a PR. Note that
+# the code owners must still be a member of the `open-telemetry`
+# organization. Reviewers are requested one at a time so that a single
+# code owner who cannot be requested does not prevent the rest from being
+# requested.
+#
+# Note that since this script is considered a requirement for PRs,
+# it should never fail.
+
+set -euo pipefail
+
+if [[ -z "${REPO:-}" || -z "${PR:-}" ]]; then
+    echo "One or more of REPO and PR have not been set, please ensure each is set."
+    exit 0
+fi
+
+request_review () {
+    # We have to use the GitHub API directly due to an issue with how the CLI
+    # handles PR updates that causes it require access to organization teams,
+    # and the GitHub token doesn't provide that permission.
+    # For more: https://github.com/cli/cli/issues/4844
+    local reviewer="$1"
+    local response
+    local message
+
+    echo "Requesting review from ${reviewer}"
+    response=$(curl -s \
+        -X POST \
+        -H "Accept: application/vnd.github+json" \
+        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+        "https://api.github.com/repos/${REPO}/pulls/${PR}/requested_reviewers" \
+        -d "{\"reviewers\":[\"${reviewer}\"]}")
+    message=$(echo "${response}" | jq -r '.message // empty' 2>/dev/null || true)
+    if [[ -n "${message}" ]]; then
+        echo "Could not request a review from ${reviewer}: ${message}"
+    fi
+}
+
+# Helper files pull in "testing" without being named *_test.go. Match the import
+# whether it is grouped, single-line, or aliased.
+imports_testing () {
+    grep -qE '^[[:space:]]*(import[[:space:]]+)?([A-Za-z0-9_.]+[[:space:]]+)?"testing"$' "$1"
+}
+
+# A component "targets" a platform if it ships non-test source constrained to
+# that platform. Go expresses this two ways and both must be handled:
+#   * implicitly, via the name_GOOS.go filename suffix. A name_GOOS_GOARCH.go
+#     file is deliberately NOT matched here: validating GOARCH would mean
+#     hardcoding Go's architecture list, and every such file in this repo also
+#     carries an explicit //go:build line, so the second loop catches it.
+#   * explicitly, via //go:build, where the platform may sit inside a compound
+#     expression ("darwin || freebsd") and where negation -- either a bare
+#     "!windows" or a negated group "!(windows && arm64)" -- must not count.
+# Derived at runtime so the set cannot drift as components are added or removed.
+component_targets_platform () {
+    local dir="$1" plat="$2" file line expr
+    [[ -d "${dir}" ]] || return 1
+
+    while IFS= read -r file; do
+        [[ "${file}" == *_test.go ]] && continue
+        imports_testing "${file}" && continue
+        [[ "$(basename "${file}" .go)" == *_"${plat}" ]] && return 0
+    done < <(find "${dir}" -type f -name "*_${plat}.go" 2>/dev/null)
+
+    while IFS= read -r file; do
+        [[ "${file}" == *_test.go ]] && continue
+        imports_testing "${file}" && continue
+        line=$(grep -m1 '^//go:build ' "${file}") || continue
+        expr="${line#//go:build }"
+        # Nested negations like "!((linux) || windows)" defeat any regex, so
+        # treat a negated directive as no evidence: this can miss a label,
+        # never invent one.
+        case "${expr}" in *'!'*) continue;; esac
+        expr=" $(printf '%s' "${expr}" | sed -E 's/[^a-zA-Z0-9_]/ /g') "
+        [[ "${expr}" == *" ${plat} "* ]] && return 0
+    done < <(grep -rl --include='*.go' "^//go:build .*${plat}" "${dir}" 2>/dev/null)
+
+    return 1
+}
+
+main () {
+    CUR_DIRECTORY=$(dirname "$0")
+    # Reviews may have comments that need to be cleaned up for jq,
+    # so restrict output to only printable characters and ensure escape
+    # sequences are removed.
+    # The latestReviews key only returns the latest review for each reviewer,
+    # cutting out any other reviews. We use that instead of requestedReviews
+    # since we need to get the list of users eligible for requesting another
+    # review. The GitHub CLI does not offer a list of all reviewers, which
+    # is only available through the API. To cut down on API calls to GitHub,
+    # we use the latest reviews to determine which users to filter out.
+    JSON=$(gh pr view "${PR}" --json "files,author,latestReviews" | tr -dc '[:print:]' | sed -E 's/\\[a-z]//g')
+    AUTHOR=$(echo -n "${JSON}"| jq -r '.author.login')
+    FILES=$(echo -n "${JSON}"| jq -r '.files[].path')
+    REVIEW_LOGINS=$(echo -n "${JSON}"| jq -r '.latestReviews[].author.login')
+    COMPONENTS=$(bash "${CUR_DIRECTORY}/get-components.sh" | tac) # Reversed so we visit subdirectories first
+    LABELS=""
+    NEEDS_WINDOWS=""
+    NEEDS_DARWIN=""
+    declare -A PROCESSED_COMPONENTS
+    declare -A REVIEWED
+    declare -A REVIEWER_SET
+
+    for REVIEWER in ${REVIEW_LOGINS}; do
+        # GitHub adds "app/" in front of user logins. The API docs don't make
+        # it clear what this means or whether it will always be present. The
+        # '/' character isn't a valid character for usernames, so this won't
+        # replace characters within a username.
+        REVIEWED["@${REVIEWER//app\//}"]=true
+    done
+
+    if [[ -v REVIEWED[@] ]]; then
+        echo "Users that have already reviewed this PR and will not have another review requested:" "${!REVIEWED[@]}"
+    else
+        echo "This PR has not yet been reviewed, all code owners are eligible for a review request"
+    fi
+
+    for COMPONENT in ${COMPONENTS}; do
+        # Files will be in alphabetical order and there are many files to
+        # a component, so loop through files in an inner loop. This allows
+        # us to remove all files for a component from the list so they
+        # won't be checked against the remaining components in the components
+        # list. This provides a meaningful speedup in practice.
+        for FILE in ${FILES}; do
+            MATCH=$(echo -n "${FILE}" | grep -E "^${COMPONENT}" || true)
+
+            if [[ -z "${MATCH}" ]]; then
+                continue
+            fi
+
+            # If we match a file with a component we don't need to process the file again.
+            FILES=$(echo -n "${FILES}" | grep -v "${FILE}")
+
+            if [[ -v PROCESSED_COMPONENTS["${COMPONENT}"] ]]; then
+                continue
+            fi
+
+            PROCESSED_COMPONENTS["${COMPONENT}"]=true
+
+            if [[ -z "${NEEDS_WINDOWS}" ]] && component_targets_platform "${COMPONENT}" windows; then
+                NEEDS_WINDOWS=1
+            fi
+
+            if [[ -z "${NEEDS_DARWIN}" ]] && component_targets_platform "${COMPONENT}" darwin; then
+                NEEDS_DARWIN=1
+            fi
+
+            OWNERS=$(COMPONENT="${COMPONENT}" bash "${CUR_DIRECTORY}/get-codeowners.sh")
+
+            for OWNER in ${OWNERS}; do
+                # Users that leave reviews are removed from the "requested reviewers"
+                # list and are eligible to have another review requested. We only want
+                # to request a review once, so remove them from the list.
+                if [[ -v REVIEWED["${OWNER}"] || "${OWNER}" = "@${AUTHOR}" ]]; then
+                    continue
+                fi
+
+                REVIEWER_SET["${OWNER#@}"]=true
+            done
+
+            LABEL_NAME="$(awk -v path="${COMPONENT}" '$1 == path {print $2}' .github/component_labels.txt)"
+
+            if (( "${#LABEL_NAME}" > 50 )); then
+                echo "'${LABEL_NAME}' exceeds GitHub's 50-character limit on labels, skipping adding label"
+                continue
+            fi
+
+            if [[ -n "${LABELS}" ]]; then
+                LABELS+=","
+            fi
+            LABELS+="${LABEL_NAME}"
+        done
+    done
+
+    if [[ -n "${NEEDS_WINDOWS}" ]]; then
+        LABELS+=",Run Windows"
+    fi
+
+    if [[ -n "${NEEDS_DARWIN}" ]]; then
+        LABELS+=",Run Darwin"
+    fi
+
+    if [[ -n "${LABELS}" ]]; then
+        echo "Adding labels: ${LABELS}"
+        gh pr edit "${PR}" --add-label "${LABELS}" || echo "Failed to add labels"
+    else
+        echo "No labels found"
+    fi
+
+    # Note that adding the labels above will not trigger any other workflows to
+    # add code owners, so we have to do it here.
+    #
+    # Reviewers are requested one at a time so a single invalid reviewer
+    # doesn't drop the rest of the requests.
+    if [[ -n "${!REVIEWER_SET[*]}" ]]; then
+        for REVIEWER in "${!REVIEWER_SET[@]}"; do
+            request_review "${REVIEWER}"
+        done
+    else
+        echo "No code owners found"
+    fi
+}
+
+# We don't want this workflow to ever fail and block a PR,
+# so ensure all errors are caught.
+main || echo "Failed to run $0"

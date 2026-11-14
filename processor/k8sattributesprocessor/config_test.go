@@ -1,0 +1,674 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package k8sattributesprocessor
+
+import (
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/common/testutil"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/k8sconfig"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/k8sattributesprocessor/internal/kube"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/k8sattributesprocessor/internal/metadata"
+)
+
+func TestLoadConfig(t *testing.T) {
+	defer testutil.SetFeatureGateForTest(t, metadata.ProcessorK8sattributesEnableKubeletPodSourceFeatureGate, true)()
+	tests := []struct {
+		id       component.ID
+		expected component.Config
+	}{
+		{
+			id: component.NewID(metadata.Type),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Exclude:   ExcludeConfig{Pods: []ExcludePodConfig{{Name: "jaeger-agent"}, {Name: "jaeger-collector"}}},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+				},
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "2"),
+			expected: &Config{
+				APIConfig:   k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeKubeConfig},
+				Passthrough: false,
+				Extract: ExtractConfig{
+					Metadata: []string{"k8s.pod.name", "k8s.pod.uid", "k8s.pod.ip", "k8s.deployment.name", "k8s.namespace.name", "k8s.node.name", "k8s.pod.start_time", "k8s.cluster.uid"},
+					Annotations: []FieldExtractConfig{
+						{TagName: "a1", Key: "annotation-one", From: "pod"},
+						{TagName: "a2", Key: "annotation-two", From: kube.MetadataFromPod},
+					},
+					Labels: []FieldExtractConfig{
+						{TagName: "l1", Key: "label1", From: "pod"},
+						{TagName: "l2", Key: "label2", From: kube.MetadataFromPod},
+					},
+				},
+				Filter: FilterConfig{
+					Namespace:      "ns2",
+					Node:           "ip-111.us-west-2.compute.internal",
+					NodeFromEnvVar: "K8S_NODE",
+					Labels: []FieldFilterConfig{
+						{Key: "key1", Value: "value1"},
+						{Key: "key2", Value: "value2", Op: "not-equals"},
+					},
+					Fields: []FieldFilterConfig{
+						{Key: "key1", Value: "value1"},
+						{Key: "key2", Value: "value2", Op: "not-equals"},
+					},
+				},
+				Association: []PodAssociationConfig{
+					{
+						Sources: []PodAssociationSourceConfig{
+							{
+								From: "resource_attribute",
+								Name: "ip",
+							},
+						},
+					},
+					{
+						Sources: []PodAssociationSourceConfig{
+							{
+								From: "resource_attribute",
+								Name: "k8s.pod.ip",
+							},
+						},
+					},
+					{
+						Sources: []PodAssociationSourceConfig{
+							{
+								From: "resource_attribute",
+								Name: "host.name",
+							},
+						},
+					},
+					{
+						Sources: []PodAssociationSourceConfig{
+							{
+								From: "connection",
+								Name: "ip",
+							},
+						},
+					},
+				},
+				Exclude: ExcludeConfig{
+					Pods: []ExcludePodConfig{
+						{Name: "jaeger-agent"},
+						{Name: "jaeger-collector"},
+					},
+				},
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "3"),
+			expected: &Config{
+				APIConfig:   k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeKubeConfig},
+				Passthrough: false,
+				Extract: ExtractConfig{
+					Annotations: []FieldExtractConfig{
+						{KeyRegex: "opentel.*", From: kube.MetadataFromPod},
+					},
+					Labels: []FieldExtractConfig{
+						{KeyRegex: "opentel.*", From: kube.MetadataFromPod},
+					},
+					Metadata: enabledAttributes(),
+				},
+				Exclude: ExcludeConfig{
+					Pods: []ExcludePodConfig{
+						{Name: "jaeger-agent"},
+						{Name: "jaeger-collector"},
+					},
+				},
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "too_many_sources"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "duplicate_association_single_source"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "duplicate_association_reordered_sources"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "distinct_associations"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+				},
+				Association: []PodAssociationConfig{
+					{
+						Sources: []PodAssociationSourceConfig{
+							{From: "resource_attribute", Name: "k8s.pod.uid"},
+							{From: "resource_attribute", Name: "container.id"},
+						},
+					},
+					{
+						Sources: []PodAssociationSourceConfig{
+							{From: "resource_attribute", Name: "k8s.pod.uid"},
+						},
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "bad_keys_labels"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "bad_keys_annotations"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "bad_from_labels"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "bad_from_annotations"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "bad_keyregex_labels"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "bad_keyregex_annotations"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "bad_filter_label_op"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "bad_filter_field_op"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "otel_annotations"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata:        enabledAttributes(),
+					OtelAnnotations: true,
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "wait_for_metadata"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadata:        true,
+				WaitForMetadataTimeout: 30 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "passthrough_mode"),
+			expected: &Config{
+				APIConfig:   k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Passthrough: true,
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "filter_label_exists"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+				},
+				Filter: FilterConfig{
+					Labels: []FieldFilterConfig{
+						{Key: "app", Op: "exists"},
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "filter_label_does_not_exist"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+				},
+				Filter: FilterConfig{
+					Labels: []FieldFilterConfig{
+						{Key: "deprecated-label", Op: "does-not-exist"},
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "extract_from_namespace"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+					Labels: []FieldExtractConfig{
+						{TagName: "ns_label", Key: "team", From: "namespace"},
+					},
+					Annotations: []FieldExtractConfig{
+						{TagName: "ns_annotation", Key: "owner", From: "namespace"},
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "extract_from_node"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: []string{"k8s.node.name", "k8s.node.uid"},
+					Labels: []FieldExtractConfig{
+						{TagName: "node_label", Key: "node-role", From: "node"},
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "extract_from_deployment"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+					Labels: []FieldExtractConfig{
+						{TagName: "deployment_label", Key: "app", From: "deployment"},
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "extract_from_replicaset"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+					Labels: []FieldExtractConfig{
+						{TagName: "replicaset_label", Key: "app", From: "replicaset"},
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "extract_from_statefulset"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+					Labels: []FieldExtractConfig{
+						{TagName: "statefulset_label", Key: "app", From: "statefulset"},
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "extract_from_daemonset"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+					Labels: []FieldExtractConfig{
+						{TagName: "daemonset_label", Key: "app", From: "daemonset"},
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "extract_from_job"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+					Labels: []FieldExtractConfig{
+						{TagName: "job_label", Key: "app", From: "job"},
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "extract_from_cronjob"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+					Labels: []FieldExtractConfig{
+						{TagName: "cronjob_label", Key: "app", From: "cronjob"},
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "all_metadata_fields"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: []string{
+						"k8s.namespace.name", "k8s.pod.name", "k8s.pod.uid", "k8s.pod.hostname",
+						"k8s.pod.start_time", "k8s.pod.ip", "k8s.deployment.name", "k8s.deployment.uid",
+						"k8s.replicaset.name", "k8s.replicaset.uid", "k8s.daemonset.name", "k8s.daemonset.uid",
+						"k8s.statefulset.name", "k8s.statefulset.uid", "k8s.job.name", "k8s.job.uid",
+						"k8s.cronjob.name", "k8s.cronjob.uid", "k8s.node.name", "k8s.node.uid",
+						"k8s.container.name", "container.id", "container.image.name", "container.image.tag",
+						"container.image.repo_digests", "service.namespace", "service.name",
+						"service.version", "service.instance.id", "k8s.cluster.uid",
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "both_container_image_tags"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: []string{
+						"container.image.tag", "container.image.tags",
+					},
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        5 * time.Minute,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "bad_metadata_field"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "custom_intervals"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        20 * time.Second,
+				PodDeleteGracePeriod:   30 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "bad_watch_sync_period"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "disable_watch_sync"),
+			expected: &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Extract: ExtractConfig{
+					Metadata: enabledAttributes(),
+				},
+				Exclude:                defaultExcludes,
+				WaitForMetadataTimeout: 10 * time.Second,
+				WatchSyncPeriod:        0,
+				PodDeleteGracePeriod:   120 * time.Second,
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "bad_pod_delete_grace_period"),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "bad_kubelet_request_timeout"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
+			require.NoError(t, err)
+
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
+
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			// Set "K8S_NODE" to pass validation.
+			t.Setenv("K8S_NODE", "ip-111.us-west-2.compute.internal")
+			if tt.expected == nil {
+				err = confmap.Validate(cfg)
+				assert.Error(t, err)
+				return
+			}
+
+			assert.NoError(t, confmap.Validate(cfg))
+			if expected, ok := tt.expected.(*Config); ok && expected.Kubelet == (KubeletConfig{}) {
+				expected.Kubelet = KubeletConfig{PollInterval: 10 * time.Second, RequestTimeout: 10 * time.Second}
+			}
+			assert.Equal(t, tt.expected, cfg)
+		})
+	}
+}
+
+func TestValidateKubeletRequiresFeatureGate(t *testing.T) {
+	defer testutil.SetFeatureGateForTest(t, metadata.ProcessorK8sattributesEnableKubeletPodSourceFeatureGate, false)()
+
+	cfg := createDefaultConfig().(*Config)
+	cfg.Filter.Node = "node-a"
+	cfg.Kubelet.Enabled = true
+
+	err := cfg.Validate()
+	require.EqualError(t, err, "kubelet.enabled requires feature gate processor.k8sattributes.EnableKubeletPodSource")
+}
+
+func TestConfigValidateDuplicatePodAssociations(t *testing.T) {
+	newSource := func(from, name string) PodAssociationSourceConfig {
+		return PodAssociationSourceConfig{From: from, Name: name}
+	}
+
+	tests := []struct {
+		name        string
+		association []PodAssociationConfig
+		wantErr     bool
+	}{
+		{
+			name: "identical single source",
+			association: []PodAssociationConfig{
+				{Sources: []PodAssociationSourceConfig{newSource("resource_attribute", "container.id")}},
+				{Sources: []PodAssociationSourceConfig{newSource("resource_attribute", "container.id")}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "same multi-source set in different order",
+			association: []PodAssociationConfig{
+				{Sources: []PodAssociationSourceConfig{
+					newSource("resource_attribute", "k8s.pod.uid"),
+					newSource("resource_attribute", "container.id"),
+				}},
+				{Sources: []PodAssociationSourceConfig{
+					newSource("resource_attribute", "container.id"),
+					newSource("resource_attribute", "k8s.pod.uid"),
+				}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "differ by one source",
+			association: []PodAssociationConfig{
+				{Sources: []PodAssociationSourceConfig{
+					newSource("resource_attribute", "k8s.pod.uid"),
+					newSource("resource_attribute", "container.id"),
+				}},
+				{Sources: []PodAssociationSourceConfig{
+					newSource("resource_attribute", "k8s.pod.uid"),
+				}},
+			},
+			wantErr: false,
+		},
+		{
+			name: "same name different source type",
+			association: []PodAssociationConfig{
+				{Sources: []PodAssociationSourceConfig{newSource("resource_attribute", "ip")}},
+				{Sources: []PodAssociationSourceConfig{newSource("connection", "ip")}},
+			},
+			wantErr: false,
+		},
+		{
+			name: "single valid association",
+			association: []PodAssociationConfig{
+				{Sources: []PodAssociationSourceConfig{newSource("resource_attribute", "k8s.pod.ip")}},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				APIConfig:   k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Association: tt.association,
+			}
+			err := cfg.Validate()
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestConfigValidateExcludePodNameRegex(t *testing.T) {
+	tests := []struct {
+		name    string
+		pods    []ExcludePodConfig
+		wantErr bool
+	}{
+		{
+			name:    "no excludes",
+			pods:    nil,
+			wantErr: false,
+		},
+		{
+			name:    "valid pattern",
+			pods:    []ExcludePodConfig{{Name: "jaeger-agent"}},
+			wantErr: false,
+		},
+		{
+			name:    "valid pattern with metacharacters",
+			pods:    []ExcludePodConfig{{Name: `^kube-(proxy|dns)-.*$`}},
+			wantErr: false,
+		},
+		{
+			name:    "unterminated character class",
+			pods:    []ExcludePodConfig{{Name: "[unclosed"}},
+			wantErr: true,
+		},
+		{
+			name:    "invalid pattern among valid ones",
+			pods:    []ExcludePodConfig{{Name: "jaeger-agent"}, {Name: "*invalid"}},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+				Exclude:   ExcludeConfig{Pods: tt.pods},
+			}
+			err := cfg.Validate()
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestFilterConfigInvalidEnvVar(t *testing.T) {
+	f := FilterConfig{
+		Namespace:      "ns2",
+		NodeFromEnvVar: "K8S_NODE",
+		Labels:         []FieldFilterConfig{},
+		Fields:         []FieldFilterConfig{},
+	}
+	assert.Error(t, confmap.Validate(f))
+}
+
+func TestValidateKubeletRequestTimeout(t *testing.T) {
+	defer testutil.SetFeatureGateForTest(t, metadata.ProcessorK8sattributesEnableKubeletPodSourceFeatureGate, true)()
+
+	cfg := NewFactory().CreateDefaultConfig().(*Config)
+	cfg.Filter.Node = "node-a"
+	cfg.Kubelet.Enabled = true
+	cfg.Kubelet.RequestTimeout = 0
+	require.EqualError(t, confmap.Validate(cfg), "kubelet.request_timeout must be greater than 0")
+
+	cfg.Kubelet.RequestTimeout = 5 * time.Second
+	require.NoError(t, confmap.Validate(cfg))
+}

@@ -1,0 +1,49 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package zipkinexporter
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/zipkinexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/coredistro"
+)
+
+func TestCreateDefaultConfig(t *testing.T) {
+	cfg := createDefaultConfig()
+	assert.NotNil(t, cfg, "failed to create default config")
+	assert.NoError(t, componenttest.CheckConfigStruct(cfg))
+}
+
+func TestCreateInstanceViaFactory(t *testing.T) {
+	cfg := createDefaultConfig()
+
+	// URL doesn't have a default value so set it directly.
+	zeCfg := cfg.(*Config)
+	zeCfg.ClientConfig.Endpoint = "http://some.location.org:9411/api/v2/spans"
+	ze, err := createTracesExporter(t.Context(), exportertest.NewNopSettings(metadata.Type), cfg)
+	assert.NoError(t, err)
+	assert.NotNil(t, ze)
+}
+
+func TestCoreDistroRemovalWarning(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	set := exportertest.NewNopSettings(metadata.Type)
+	set.BuildInfo = component.BuildInfo{Command: "otelcol", Description: "OpenTelemetry Collector"}
+	set.Logger = zap.New(core)
+
+	cfg := createDefaultConfig().(*Config)
+	cfg.ClientConfig.Endpoint = "http://some.location.org:9411/api/v2/spans"
+	_, err := NewFactory().CreateTraces(t.Context(), set, cfg)
+	require.NoError(t, err)
+	assert.Equal(t, 1, logs.FilterMessageSnippet(coredistro.RemovalWarning).Len())
+}

@@ -1,30 +1,23 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package translator
+package translator // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awsxrayreceiver/internal/translator"
 
 import (
 	"strconv"
 	"strings"
 
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/conventions"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	conventions "go.opentelemetry.io/otel/semconv/v1.43.0"
 
 	awsxray "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/xray"
 )
 
-func addCause(seg *awsxray.Segment, span *pdata.Span) {
+// ExceptionEventName the name of the exception event.
+// TODO: Remove this when collector defines this semantic convention.
+const ExceptionEventName = "exception"
+
+func addCause(seg *awsxray.Segment, span ptrace.Span) {
 	if seg.Cause == nil {
 		return
 	}
@@ -37,9 +30,9 @@ func addCause(seg *awsxray.Segment, span *pdata.Span) {
 	// temporarily setting the status to otlptrace.Status_UnknownError. This will be
 	// updated to a more specific error in the `segToSpans()` in translator.go once
 	// we traverse through all the subsegments.
-	if span.Status().Code() == pdata.StatusCodeUnset {
+	if span.Status().Code() == ptrace.StatusCodeUnset {
 		// StatusCodeUnset is the default value for the span.Status().
-		span.Status().SetCode(pdata.StatusCodeError)
+		span.Status().SetCode(ptrace.StatusCodeError)
 	}
 
 	switch seg.Cause.Type {
@@ -56,27 +49,26 @@ func addCause(seg *awsxray.Segment, span *pdata.Span) {
 		// not sure whether there are existing events, so
 		// append new empty events instead
 		exceptionEventStartIndex := evts.Len()
-		evts.Resize(exceptionEventStartIndex + len(seg.Cause.Exceptions))
+		evts.EnsureCapacity(exceptionEventStartIndex + len(seg.Cause.Exceptions))
 
-		for i, excp := range seg.Cause.Exceptions {
-			evt := evts.At(exceptionEventStartIndex + i)
-			evt.SetName(conventions.AttributeExceptionEventName)
+		for _, excp := range seg.Cause.Exceptions {
+			evt := evts.AppendEmpty()
+			evt.SetName(ExceptionEventName)
 			attrs := evt.Attributes()
-			attrs.Clear()
 			attrs.EnsureCapacity(8)
 
 			// ID is a required field
-			attrs.UpsertString(awsxray.AWSXrayExceptionIDAttribute, *excp.ID)
-			addString(excp.Message, conventions.AttributeExceptionMessage, &attrs)
-			addString(excp.Type, conventions.AttributeExceptionType, &attrs)
-			addBool(excp.Remote, awsxray.AWSXrayExceptionRemoteAttribute, &attrs)
-			addInt64(excp.Truncated, awsxray.AWSXrayExceptionTruncatedAttribute, &attrs)
-			addInt64(excp.Skipped, awsxray.AWSXrayExceptionSkippedAttribute, &attrs)
-			addString(excp.Cause, awsxray.AWSXrayExceptionCauseAttribute, &attrs)
+			attrs.PutStr(awsxray.AWSXrayExceptionIDAttribute, *excp.ID)
+			addString(excp.Message, string(conventions.ExceptionMessageKey), attrs)
+			addString(excp.Type, string(conventions.ExceptionTypeKey), attrs)
+			addBool(excp.Remote, awsxray.AWSXrayExceptionRemoteAttribute, attrs)
+			addInt64(excp.Truncated, awsxray.AWSXrayExceptionTruncatedAttribute, attrs)
+			addInt64(excp.Skipped, awsxray.AWSXrayExceptionSkippedAttribute, attrs)
+			addString(excp.Cause, awsxray.AWSXrayExceptionCauseAttribute, attrs)
 
 			if len(excp.Stack) > 0 {
 				stackTrace := convertStackFramesToStackTraceStr(excp)
-				attrs.UpsertString(conventions.AttributeExceptionStacktrace, stackTrace)
+				attrs.PutStr(string(conventions.ExceptionStacktraceKey), stackTrace)
 			}
 		}
 	}
@@ -86,21 +78,28 @@ func convertStackFramesToStackTraceStr(excp awsxray.Exception) string {
 	// resulting stacktrace looks like:
 	// "<*excp.Type>: <*excp.Message>\n" +
 	// "\tat <*frameN.Label>(<*frameN.Path>: <*frameN.Line>)\n"
+	exceptionType := awsxray.StringOrEmpty(excp.Type)
+	exceptionMessage := awsxray.StringOrEmpty(excp.Message)
 	var b strings.Builder
-	b.Grow(len(*excp.Type) + len(": ") + len(*excp.Message) + len("\n"))
-	b.WriteString(*excp.Type)
+	b.Grow(len(exceptionType) + len(": ") + len(exceptionMessage) + len("\n"))
+	b.WriteString(exceptionType)
 	b.WriteString(": ")
-	b.WriteString(*excp.Message)
+	b.WriteString(exceptionMessage)
 	b.WriteString("\n")
 	for _, frame := range excp.Stack {
-		line := strconv.Itoa(*frame.Line)
+		label := awsxray.StringOrEmpty(frame.Label)
+		path := awsxray.StringOrEmpty(frame.Path)
+		line := "<unknown>"
+		if frame.Line != nil {
+			line = strconv.Itoa(*frame.Line)
+		}
 		// the string representation of a frame looks like:
 		// <*frame.Label>(<*frame.Path>):line\n
-		b.Grow(4 + len(*frame.Label) + 2 + len(*frame.Path) + len(": ") + len(line) + len("\n"))
+		b.Grow(4 + len(label) + 2 + len(path) + len(": ") + len(line) + len("\n"))
 		b.WriteString("\tat ")
-		b.WriteString(*frame.Label)
+		b.WriteString(label)
 		b.WriteString("(")
-		b.WriteString(*frame.Path)
+		b.WriteString(path)
 		b.WriteString(": ")
 		b.WriteString(line)
 		b.WriteString(")")

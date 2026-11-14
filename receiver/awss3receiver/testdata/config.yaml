@@ -1,0 +1,56 @@
+aws_s3:
+aws_s3/1:
+  s3downloader:
+    s3_bucket: abucket
+    s3_partition_format: "%Y/%m"
+  starttime: "a date"
+  endtime: "2024-02-03a"
+aws_s3/2:
+  s3downloader:
+    s3_bucket: abucket
+  starttime: "2024-01-31 15:00"
+  endtime: "2024-02-03"
+aws_s3/3:
+  s3downloader:
+    s3_bucket: abucket
+    s3_partition_format: "year=%Y/month=%m/day=%d/hour=%H"
+    s3_partition_timezone: "Asia/Tokyo"
+    file_prefix: "otel"
+    file_prefix_include_telemetry_type: false
+    tag_object_after_ingestion: false
+    skip_ingesting_tagged_objects: false
+  starttime: "2024-01-31 15:00"
+  endtime: "2024-02-03"
+  encodings:
+    - extension: "foo/bar"
+      suffix: "baz"
+    - extension: "nop/nop"
+      suffix: "nop"
+  notifications:
+    opampextension: "opamp/bar"
+aws_s3/4:
+  s3downloader:
+    s3_bucket: abucket
+    tag_object_after_ingestion: true
+    skip_ingesting_tagged_objects: true
+  starttime: "2024-01-31T15:00:00Z"
+  endtime: "2024-02-03T00:00:00Z"
+aws_s3/5:
+  s3downloader:
+    s3_bucket: abucket
+  sqs:
+    queue_url: "https://sqs.us-east-1.amazonaws.com/123456789012/test-queue"
+    region: "us-east-1"
+    endpoint: "http://localhost:4575"
+aws_s3/6:
+  s3downloader:
+    s3_bucket: abucket
+    decompression: zstd
+  starttime: "2024-01-31 15:00"
+  endtime: "2024-02-03"
+aws_s3/7:
+  s3downloader:
+    s3_bucket: abucket
+    decompression: snappy
+  starttime: "2024-01-31 15:00"
+  endtime: "2024-02-03"

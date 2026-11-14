@@ -1,0 +1,23 @@
+display_name: Pulsar Receiver
+type: pulsar
+
+description: |
+  The Pulsar Receiver receives logs, metrics, and traces from [Apache Pulsar](https://pulsar.apache.org/).
+
+status:
+  class: receiver
+  stability:
+    alpha: [metrics, traces, logs]
+  distributions: [contrib]
+  unsupported_platforms: [aix, solaris]
+  codeowners:
+    active: [dao-jun]
+    emeritus: [dmitryax]
+
+tests:
+  goleak:
+    ignore:
+      any:
+        # Regarding the godbus/dbus ignore: see https://github.com/99designs/keyring/issues/103
+        - "github.com/godbus/dbus.(*Conn).inWorker"
+        - "github.com/apache/pulsar-client-go/pulsar/internal.(*connectionPool).checkAndCleanIdleConnections"

@@ -1,0 +1,24 @@
+type: alertmanager
+display_name: Alertmanager Exporter
+
+status:
+  class: exporter
+  stability:
+    development: [traces,logs]
+  distributions: []
+  codeowners:
+    active: [sokoide, mcube8]
+
+sending_queue:
+  support: default
+
+tests:
+  config:
+    endpoint: http://localhost:0
+    generator_url: opentelemetry-collector
+    severity: info
+    sending_queue:
+      enabled: false
+    retry_on_failure:
+      enabled: false 
+  expect_consumer_error: true 

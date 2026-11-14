@@ -1,0 +1,1502 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package opampextension
+
+import (
+	"context"
+	"errors"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/open-telemetry/opamp-go/client/types"
+	"github.com/open-telemetry/opamp-go/protobufs"
+	"github.com/open-telemetry/opamp-go/server"
+	servertypes "github.com/open-telemetry/opamp-go/server/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componentstatus"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/config/confignet"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/extension"
+	"go.opentelemetry.io/collector/extension/extensioncapabilities"
+	"go.opentelemetry.io/collector/extension/extensiontest"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pipeline"
+	"go.opentelemetry.io/collector/service"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/status"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/status/testhelpers"
+)
+
+func TestNewOpampAgent(t *testing.T) {
+	cfg := createDefaultConfig()
+	set := extensiontest.NewNopSettings(extensiontest.NopType)
+	set.BuildInfo = component.BuildInfo{Version: "test version", Command: "otelcoltest"}
+	o, err := newOpampAgent(cfg.(*Config), set)
+	assert.NoError(t, err)
+	assert.Equal(t, "otelcoltest", o.serviceName)
+	assert.Equal(t, "test version", o.serviceVersion)
+	assert.NotEmpty(t, o.instanceUID.String())
+	assert.True(t, o.capabilities.ReportsEffectiveConfig)
+	assert.True(t, o.capabilities.ReportsHealth)
+	assert.True(t, o.capabilities.ReportsHeartbeat)
+	assert.Empty(t, o.effectiveConfig)
+	assert.Nil(t, o.agentDescription)
+	assert.NoError(t, o.Shutdown(t.Context()))
+}
+
+func TestNewOpampAgentAttributes(t *testing.T) {
+	cfg := createDefaultConfig()
+	set := extensiontest.NewNopSettings(extensiontest.NopType)
+	set.BuildInfo = component.BuildInfo{Version: "test version", Command: "otelcoltest"}
+	set.Resource.Attributes().PutStr("service.name", "otelcol-distro")
+	set.Resource.Attributes().PutStr("service.version", "distro.0")
+	set.Resource.Attributes().PutStr("service.instance.id", "f8999bc1-4c9b-4619-9bae-7f009d2411ec")
+	o, err := newOpampAgent(cfg.(*Config), set)
+	assert.NoError(t, err)
+	assert.Equal(t, "otelcol-distro", o.serviceName)
+	assert.Equal(t, "distro.0", o.serviceVersion)
+	assert.Equal(t, "f8999bc1-4c9b-4619-9bae-7f009d2411ec", o.serviceInstanceID)
+	assert.NoError(t, o.Shutdown(t.Context()))
+}
+
+// TestOpampAgentConnectsOverUnixSocket exercises the full OpAMP handshake from
+// the extension's client to a server listening on a filesystem Unix domain
+// socket, over both the WebSocket and plain HTTP transports. The endpoint host
+// is cosmetic; the configured unix_socket drives the dial. The server-side
+// connection must be a *net.UnixConn so a consumer (e.g. the supervisor) can
+// authenticate the peer via SO_PEERCRED.
+func TestOpampAgentConnectsOverUnixSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix domain socket peer authentication is not supported on Windows")
+	}
+
+	tests := []struct {
+		name   string
+		server func(socketPath string) *OpAMPServer
+	}{
+		{
+			name: "websocket",
+			server: func(socketPath string) *OpAMPServer {
+				return &OpAMPServer{
+					WS: &commonFields{
+						// Host is cosmetic; DialContext dials the socket regardless.
+						Endpoint: "ws://localhost/v1/opamp",
+						Socket: &confignet.AddrConfig{
+							Transport: confignet.TransportTypeUnix,
+							Endpoint:  socketPath,
+						},
+					},
+				}
+			},
+		},
+		{
+			name: "http",
+			server: func(socketPath string) *OpAMPServer {
+				return &OpAMPServer{
+					HTTP: &httpFields{
+						commonFields: commonFields{
+							Endpoint: "http://localhost/v1/opamp",
+							Socket: &confignet.AddrConfig{
+								Transport: confignet.TransportTypeUnix,
+								Endpoint:  socketPath,
+							},
+						},
+					},
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// macOS limits the socket path to ~104 bytes, which t.TempDir() can
+			// exceed, so bind under a short base directory.
+			dir, err := os.MkdirTemp("/tmp", "opampuds") //nolint:usetesting // see above
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = os.RemoveAll(dir) })
+			socketPath := filepath.Join(dir, "opamp.sock")
+
+			ln, err := net.Listen("unix", socketPath)
+			require.NoError(t, err)
+
+			var gotUnixConn atomic.Bool
+			connected := make(chan struct{})
+			var once sync.Once
+
+			callbacks := servertypes.Callbacks{
+				OnConnecting: func(_ *http.Request) servertypes.ConnectionResponse {
+					return servertypes.ConnectionResponse{
+						Accept: true,
+						ConnectionCallbacks: servertypes.ConnectionCallbacks{
+							OnConnected: func(_ context.Context, conn servertypes.Connection) {
+								_, ok := conn.Connection().(*net.UnixConn)
+								gotUnixConn.Store(ok)
+								once.Do(func() { close(connected) })
+							},
+						},
+					}
+				},
+			}
+
+			srv := server.New(nil)
+			require.NoError(t, srv.Start(server.StartSettings{
+				Settings:   server.Settings{Callbacks: callbacks},
+				Listener:   ln,
+				ListenPath: "/v1/opamp",
+			}))
+			require.Equal(t, "unix", srv.Addr().Network())
+
+			cfg := createDefaultConfig().(*Config)
+			cfg.Server = tt.server(socketPath)
+			set := extensiontest.NewNopSettings(extensiontest.NopType)
+			o, err := newOpampAgent(cfg, set)
+			require.NoError(t, err)
+			require.NoError(t, o.Start(t.Context(), componenttest.NewNopHost()))
+
+			select {
+			case <-connected:
+			case <-time.After(10 * time.Second):
+				t.Fatal("timed out waiting for the opamp client to connect over the unix socket")
+			}
+			assert.True(t, gotUnixConn.Load(), "server-side connection should be a *net.UnixConn")
+
+			assert.NoError(t, o.Shutdown(t.Context()))
+			assert.NoError(t, srv.Stop(t.Context()))
+		})
+	}
+}
+
+func TestReportsHeartbeatCapabilityGating(t *testing.T) {
+	const heartbeatBit = protobufs.AgentCapabilities_AgentCapabilities_ReportsHeartbeat
+
+	tests := []struct {
+		name             string
+		reportsHeartbeat bool
+		wantBitSet       bool
+	}{
+		{
+			name:             "explicitly enabled",
+			reportsHeartbeat: true,
+			wantBitSet:       true,
+		},
+		{
+			name:             "disabled",
+			reportsHeartbeat: false,
+			wantBitSet:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := createDefaultConfig().(*Config)
+			cfg.Capabilities.ReportsHeartbeat = tt.reportsHeartbeat
+
+			set := extensiontest.NewNopSettings(extensiontest.NopType)
+			o, err := newOpampAgent(cfg, set)
+			require.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, o.Shutdown(t.Context())) })
+
+			caps := o.capabilities.toAgentCapabilities()
+			hasBit := caps&heartbeatBit != 0
+			assert.Equal(t, tt.wantBitSet, hasBit)
+		})
+	}
+}
+
+func TestCreateAgentDescription(t *testing.T) {
+	hostname, err := os.Hostname()
+	require.NoError(t, err)
+	description := getOSDescription(zap.NewNop())
+
+	serviceName := "otelcol-distrot"
+	serviceVersion := "distro.0"
+	serviceInstanceUUID := "f8999bc1-4c9b-4619-9bae-7f009d2411ec"
+	extraResourceAttrKey := "hello"
+	extraResourceAttrValue := "world"
+
+	testCases := []struct {
+		name string
+		cfg  func(*Config)
+
+		expected *protobufs.AgentDescription
+	}{
+		{
+			name: "No extra attributes",
+			cfg:  func(_ *Config) {},
+			expected: &protobufs.AgentDescription{
+				IdentifyingAttributes: []*protobufs.KeyValue{
+					stringKeyValue("service.instance.id", serviceInstanceUUID),
+					stringKeyValue("service.name", serviceName),
+					stringKeyValue("service.version", serviceVersion),
+				},
+				NonIdentifyingAttributes: []*protobufs.KeyValue{
+					stringKeyValue("host.arch", runtime.GOARCH),
+					stringKeyValue("host.name", hostname),
+					stringKeyValue("os.description", description),
+					stringKeyValue("os.type", runtime.GOOS),
+				},
+			},
+		},
+		{
+			name: "Extra attributes specified",
+			cfg: func(c *Config) {
+				c.AgentDescription.NonIdentifyingAttributes = map[string]string{
+					"env":          "prod",
+					"k8s.pod.name": "my-very-cool-pod",
+				}
+			},
+			expected: &protobufs.AgentDescription{
+				IdentifyingAttributes: []*protobufs.KeyValue{
+					stringKeyValue("service.instance.id", serviceInstanceUUID),
+					stringKeyValue("service.name", serviceName),
+					stringKeyValue("service.version", serviceVersion),
+				},
+				NonIdentifyingAttributes: []*protobufs.KeyValue{
+					stringKeyValue("env", "prod"),
+					stringKeyValue("host.arch", runtime.GOARCH),
+					stringKeyValue("host.name", hostname),
+					stringKeyValue("k8s.pod.name", "my-very-cool-pod"),
+					stringKeyValue("os.description", description),
+					stringKeyValue("os.type", runtime.GOOS),
+				},
+			},
+		},
+		{
+			name: "Extra attributes override",
+			cfg: func(c *Config) {
+				c.AgentDescription.NonIdentifyingAttributes = map[string]string{
+					"host.name": "override-host",
+				}
+			},
+			expected: &protobufs.AgentDescription{
+				IdentifyingAttributes: []*protobufs.KeyValue{
+					stringKeyValue("service.instance.id", serviceInstanceUUID),
+					stringKeyValue("service.name", serviceName),
+					stringKeyValue("service.version", serviceVersion),
+				},
+				NonIdentifyingAttributes: []*protobufs.KeyValue{
+					stringKeyValue("host.arch", runtime.GOARCH),
+					stringKeyValue("host.name", "override-host"),
+					stringKeyValue("os.description", description),
+					stringKeyValue("os.type", runtime.GOOS),
+				},
+			},
+		},
+		{
+			name: "Set IncludeResourceAttributes",
+			cfg: func(c *Config) {
+				c.AgentDescription.IncludeResourceAttributes = true
+			},
+			expected: &protobufs.AgentDescription{
+				IdentifyingAttributes: []*protobufs.KeyValue{
+					stringKeyValue("service.instance.id", serviceInstanceUUID),
+					stringKeyValue("service.name", serviceName),
+					stringKeyValue("service.version", serviceVersion),
+				},
+				NonIdentifyingAttributes: []*protobufs.KeyValue{
+					stringKeyValue(extraResourceAttrKey, extraResourceAttrValue),
+					stringKeyValue("host.arch", runtime.GOARCH),
+					stringKeyValue("host.name", hostname),
+					stringKeyValue("os.description", description),
+					stringKeyValue("os.type", runtime.GOOS),
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := createDefaultConfig().(*Config)
+			tc.cfg(cfg)
+
+			set := extensiontest.NewNopSettings(extensiontest.NopType)
+			set.Resource.Attributes().PutStr("service.name", serviceName)
+			set.Resource.Attributes().PutStr("service.version", serviceVersion)
+			set.Resource.Attributes().PutStr("service.instance.id", serviceInstanceUUID)
+			set.Resource.Attributes().PutStr(extraResourceAttrKey, extraResourceAttrValue)
+
+			o, err := newOpampAgent(cfg, set)
+			require.NoError(t, err)
+			assert.Nil(t, o.agentDescription)
+
+			err = o.createAgentDescription()
+			assert.NoError(t, err)
+			require.Equal(t, tc.expected, o.agentDescription)
+			assert.NoError(t, o.Shutdown(t.Context()))
+		})
+	}
+}
+
+func TestUpdateAgentIdentity(t *testing.T) {
+	cfg := createDefaultConfig()
+	set := extensiontest.NewNopSettings(extensiontest.NopType)
+	o, err := newOpampAgent(cfg.(*Config), set)
+	assert.NoError(t, err)
+
+	olduid := o.instanceUID
+	assert.NotEmpty(t, olduid.String())
+
+	uid := uuid.Must(uuid.NewV7())
+	assert.NotEqual(t, uid, olduid)
+
+	o.updateAgentIdentity(uid)
+	assert.Equal(t, o.instanceUID, uid)
+	assert.NoError(t, o.Shutdown(t.Context()))
+}
+
+func TestComposeEffectiveConfig(t *testing.T) {
+	cfg := createDefaultConfig()
+	set := extensiontest.NewNopSettings(extensiontest.NopType)
+	o, err := newOpampAgent(cfg.(*Config), set)
+	assert.NoError(t, err)
+	assert.Empty(t, o.effectiveConfig)
+
+	ec := o.composeEffectiveConfig()
+	assert.Nil(t, ec)
+
+	ecFileName := filepath.Join("testdata", "effective.yaml")
+	cm, err := confmaptest.LoadConf(ecFileName)
+	assert.NoError(t, err)
+	expected, err := os.ReadFile(ecFileName)
+	assert.NoError(t, err)
+
+	o.updateEffectiveConfig(cm, nil)
+	ec = o.composeEffectiveConfig()
+	assert.NotNil(t, ec)
+	assert.YAMLEq(t, string(expected), string(ec.ConfigMap.ConfigMap[""].Body))
+	assert.Equal(t, "text/yaml", ec.ConfigMap.ConfigMap[""].ContentType)
+	// With raw config reporting disabled, only the effective config is reported.
+	assert.NotContains(t, ec.ConfigMap.ConfigMap, rawConfigMapKey)
+
+	assert.NoError(t, o.Shutdown(t.Context()))
+}
+
+func TestComposeEffectiveConfigWithRawConfig(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	cfg.ReportsRawConfig = true
+	set := extensiontest.NewNopSettings(extensiontest.NopType)
+	o, err := newOpampAgent(cfg, set)
+	require.NoError(t, err)
+
+	effectiveFile := filepath.Join("testdata", "effective.yaml")
+	effectiveConf, err := confmaptest.LoadConf(effectiveFile)
+	require.NoError(t, err)
+	effectiveBytes, err := os.ReadFile(effectiveFile)
+	require.NoError(t, err)
+
+	rawFile := filepath.Join("testdata", "raw.yaml")
+	rawConf, err := confmaptest.LoadConf(rawFile)
+	require.NoError(t, err)
+	rawBytes, err := os.ReadFile(rawFile)
+	require.NoError(t, err)
+
+	// Raw reporting is enabled but no raw config has been captured yet: only the
+	// effective config is reported, under the "" key.
+	o.updateEffectiveConfig(effectiveConf, nil)
+	ec := o.composeEffectiveConfig()
+	require.NotNil(t, ec)
+	assert.YAMLEq(t, string(effectiveBytes), string(ec.ConfigMap.ConfigMap[""].Body))
+	assert.NotContains(t, ec.ConfigMap.ConfigMap, rawConfigMapKey)
+
+	// With a raw config captured, both keys are reported. The "" key keeps the
+	// effective (expanded) config unchanged; the "raw" key carries the
+	// unexpanded config verbatim, including the unexpanded ${env:...} reference.
+	o.updateEffectiveConfig(effectiveConf, rawConf)
+	ec = o.composeEffectiveConfig()
+	require.NotNil(t, ec)
+	require.Contains(t, ec.ConfigMap.ConfigMap, "")
+	require.Contains(t, ec.ConfigMap.ConfigMap, rawConfigMapKey)
+	assert.YAMLEq(t, string(effectiveBytes), string(ec.ConfigMap.ConfigMap[""].Body))
+	assert.YAMLEq(t, string(rawBytes), string(ec.ConfigMap.ConfigMap[rawConfigMapKey].Body))
+	assert.Equal(t, "text/yaml", ec.ConfigMap.ConfigMap[rawConfigMapKey].ContentType)
+	assert.Contains(t, string(ec.ConfigMap.ConfigMap[rawConfigMapKey].Body), "${env:OTLP_ENDPOINT}")
+
+	assert.NoError(t, o.Shutdown(t.Context()))
+}
+
+func TestNotifyConfigSnapshot(t *testing.T) {
+	effectiveFile := filepath.Join("testdata", "effective.yaml")
+	effectiveConf, err := confmaptest.LoadConf(effectiveFile)
+	require.NoError(t, err)
+	effectiveBytes, err := os.ReadFile(effectiveFile)
+	require.NoError(t, err)
+	rawConf, err := confmaptest.LoadConf(filepath.Join("testdata", "raw.yaml"))
+	require.NoError(t, err)
+	snapshot := extensioncapabilities.NewConfigSnapshot(effectiveConf, rawConf)
+
+	tests := []struct {
+		name         string
+		reportsRaw   bool
+		expectRawKey bool
+	}{
+		{name: "raw disabled", reportsRaw: false, expectRawKey: false},
+		{name: "raw enabled", reportsRaw: true, expectRawKey: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := createDefaultConfig().(*Config)
+			cfg.ReportsRawConfig = tt.reportsRaw
+			set := extensiontest.NewNopSettings(extensiontest.NopType)
+			o, err := newOpampAgent(cfg, set)
+			require.NoError(t, err)
+			o.opampClient = mockOpAMPClient{}
+
+			require.NoError(t, o.NotifyConfigSnapshot(t.Context(), snapshot))
+
+			ec := o.composeEffectiveConfig()
+			require.NotNil(t, ec)
+			// The effective config under "" is always present and unchanged,
+			// regardless of whether raw config reporting is enabled.
+			require.Contains(t, ec.ConfigMap.ConfigMap, "")
+			assert.YAMLEq(t, string(effectiveBytes), string(ec.ConfigMap.ConfigMap[""].Body))
+			if tt.expectRawKey {
+				assert.Contains(t, ec.ConfigMap.ConfigMap, rawConfigMapKey)
+			} else {
+				assert.NotContains(t, ec.ConfigMap.ConfigMap, rawConfigMapKey)
+			}
+
+			assert.NoError(t, o.Shutdown(t.Context()))
+		})
+	}
+}
+
+func TestShutdown(t *testing.T) {
+	cfg := createDefaultConfig()
+	set := extensiontest.NewNopSettings(extensiontest.NopType)
+	o, err := newOpampAgent(cfg.(*Config), set)
+	assert.NoError(t, err)
+
+	// Shutdown with no OpAMP client
+	assert.NoError(t, o.Shutdown(t.Context()))
+}
+
+func TestStart(t *testing.T) {
+	cfg := createDefaultConfig()
+	set := extensiontest.NewNopSettings(extensiontest.NopType)
+	o, err := newOpampAgent(cfg.(*Config), set)
+	assert.NoError(t, err)
+
+	assert.NoError(t, o.Start(t.Context(), componenttest.NewNopHost()))
+	assert.NoError(t, o.Shutdown(t.Context()))
+}
+
+func TestStartAvailableComponents(t *testing.T) {
+	cfg := createDefaultConfig()
+	agentConfig := cfg.(*Config)
+	agentConfig.Capabilities.ReportsAvailableComponents = true
+	set := extensiontest.NewNopSettings(extensiontest.NopType)
+	o, err := newOpampAgent(agentConfig, set)
+	o.opampClient = mockOpAMPClient{}
+	assert.NoError(t, err)
+
+	assert.NoError(t, o.Start(t.Context(), newAvailableComponentsHost(t)))
+	assert.Equal(t, generateTestAvailableComponents(), o.availableComponents)
+	assert.NoError(t, o.Shutdown(t.Context()))
+}
+
+// availableComponentsHost mocks a receiver.ReceiverHost for test purposes.
+type availableComponentsHost struct {
+	t *testing.T
+}
+
+// NewNopHost returns a new instance of nopHost with proper defaults for most tests.
+func newAvailableComponentsHost(t *testing.T) component.Host {
+	return &availableComponentsHost{
+		t: t,
+	}
+}
+
+func (*availableComponentsHost) GetFactory(component.Kind, component.Type) component.Factory {
+	return nil
+}
+
+func (*availableComponentsHost) GetExtensions() map[component.ID]component.Component {
+	return nil
+}
+
+func (ach *availableComponentsHost) GetModuleInfos() service.ModuleInfos {
+	return generateTestModuleInfo(ach.t)
+}
+
+func generateTestModuleInfo(t *testing.T) service.ModuleInfos {
+	return service.ModuleInfos{
+		Receiver: map[component.Type]service.ModuleInfo{
+			componentNewTypeNoErr(t, "otlp"):        {BuilderRef: "otlp@v0.117.0"},        // Receiver type and version
+			componentNewTypeNoErr(t, "apachespark"): {BuilderRef: "apachespark@v0.117.0"}, // Receiver type and version
+		},
+		Processor: map[component.Type]service.ModuleInfo{
+			componentNewTypeNoErr(t, "batch"): {BuilderRef: "batch@v0.117.0"}, // Processor type and version
+		},
+		Exporter: map[component.Type]service.ModuleInfo{
+			componentNewTypeNoErr(t, "logging"): {BuilderRef: "logging@v0.117.0"}, // Exporter type and version
+		},
+		Extension: map[component.Type]service.ModuleInfo{
+			componentNewTypeNoErr(t, "health_check"): {BuilderRef: "health_check@v0.117.0"}, // Extension type and version
+		},
+		Connector: map[component.Type]service.ModuleInfo{
+			componentNewTypeNoErr(t, "routing"): {BuilderRef: "routing@v0.117.0"}, // Connector type and version
+		},
+	}
+}
+
+func componentNewTypeNoErr(t *testing.T, typeName string) component.Type {
+	newType, err := component.NewType(typeName)
+	require.NoError(t, err)
+	return newType
+}
+
+func generateTestAvailableComponents() *protobufs.AvailableComponents {
+	return &protobufs.AvailableComponents{
+		Hash: []byte("(L\f|m.\xfb\x14n\xe9>ѱ퀜\xf5NEg\xa4\xca\f\x0f\xe0P6\xb3\x96\x04\xb0\xc9"),
+		Components: map[string]*protobufs.ComponentDetails{
+			"receivers": {
+				SubComponentMap: map[string]*protobufs.ComponentDetails{
+					"otlp": {
+						Metadata: []*protobufs.KeyValue{
+							{
+								Key: "code.namespace",
+								Value: &protobufs.AnyValue{
+									Value: &protobufs.AnyValue_StringValue{
+										StringValue: "otlp@v0.117.0",
+									},
+								},
+							},
+						},
+					},
+					"apachespark": {
+						Metadata: []*protobufs.KeyValue{
+							{
+								Key: "code.namespace",
+								Value: &protobufs.AnyValue{
+									Value: &protobufs.AnyValue_StringValue{
+										StringValue: "apachespark@v0.117.0",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			"processors": {
+				SubComponentMap: map[string]*protobufs.ComponentDetails{
+					"batch": {
+						Metadata: []*protobufs.KeyValue{
+							{
+								Key: "code.namespace",
+								Value: &protobufs.AnyValue{
+									Value: &protobufs.AnyValue_StringValue{
+										StringValue: "batch@v0.117.0",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			"exporters": {
+				SubComponentMap: map[string]*protobufs.ComponentDetails{
+					"logging": {
+						Metadata: []*protobufs.KeyValue{
+							{
+								Key: "code.namespace",
+								Value: &protobufs.AnyValue{
+									Value: &protobufs.AnyValue_StringValue{
+										StringValue: "logging@v0.117.0",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			"extensions": {
+				SubComponentMap: map[string]*protobufs.ComponentDetails{
+					"health_check": {
+						Metadata: []*protobufs.KeyValue{
+							{
+								Key: "code.namespace",
+								Value: &protobufs.AnyValue{
+									Value: &protobufs.AnyValue_StringValue{
+										StringValue: "health_check@v0.117.0",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			"connectors": {
+				SubComponentMap: map[string]*protobufs.ComponentDetails{
+					"routing": {
+						Metadata: []*protobufs.KeyValue{
+							{
+								Key: "code.namespace",
+								Value: &protobufs.AnyValue{
+									Value: &protobufs.AnyValue_StringValue{
+										StringValue: "routing@v0.117.0",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestHealthReportingReceiveUpdateFromAggregator(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	set := extensiontest.NewNopSettings(extensiontest.NopType)
+
+	statusUpdateChannel := make(chan *status.AggregateStatus)
+
+	mtx := &sync.RWMutex{}
+	now := time.Now()
+	expectedHealthUpdates := []*protobufs.ComponentHealth{
+		{
+			Healthy: false,
+		},
+		{
+			Healthy:            true,
+			StartTimeUnixNano:  uint64(now.UnixNano()),
+			Status:             "StatusOK",
+			StatusTimeUnixNano: uint64(now.UnixNano()),
+			ComponentHealthMap: map[string]*protobufs.ComponentHealth{
+				"test-receiver": {
+					Healthy:            true,
+					Status:             "StatusOK",
+					StatusTimeUnixNano: uint64(now.UnixNano()),
+				},
+			},
+		},
+		{
+			Healthy:            false,
+			Status:             "StatusPermanentError",
+			StatusTimeUnixNano: uint64(now.Add(1 * time.Second).UnixNano()),
+			LastError:          "error A",
+			ComponentHealthMap: map[string]*protobufs.ComponentHealth{
+				"test-receiver": {
+					Healthy:            false,
+					Status:             "StatusPermanentError",
+					StatusTimeUnixNano: uint64(now.Add(1 * time.Second).UnixNano()),
+					LastError:          "error A",
+				},
+			},
+		},
+		{
+			Healthy:            false,
+			Status:             "StatusPermanentError",
+			StatusTimeUnixNano: uint64(now.Add(2 * time.Second).UnixNano()),
+			LastError:          "error B",
+			ComponentHealthMap: map[string]*protobufs.ComponentHealth{
+				"test-receiver": {
+					Healthy:            false,
+					Status:             "StatusPermanentError",
+					StatusTimeUnixNano: uint64(now.Add(2 * time.Second).UnixNano()),
+					LastError:          "error B",
+				},
+			},
+		},
+		{
+			Healthy:            false,
+			Status:             "StatusPermanentError",
+			StatusTimeUnixNano: uint64(now.Add(3 * time.Second).UnixNano()),
+			LastError:          "error B",
+			ComponentHealthMap: map[string]*protobufs.ComponentHealth{
+				"test-receiver": {
+					Healthy:            false,
+					Status:             "StatusPermanentError",
+					StatusTimeUnixNano: uint64(now.Add(3 * time.Second).UnixNano()),
+					LastError:          "error B",
+				},
+				"test-exporter": {
+					Healthy:            false,
+					Status:             "StatusPermanentError",
+					StatusTimeUnixNano: uint64(now.Add(3 * time.Second).UnixNano()),
+					LastError:          "exporter error",
+				},
+			},
+		},
+		{
+			Healthy:            false,
+			Status:             "StatusPermanentError",
+			StatusTimeUnixNano: uint64(now.Add(4 * time.Second).UnixNano()),
+			LastError:          "exporter error",
+			ComponentHealthMap: map[string]*protobufs.ComponentHealth{
+				"test-receiver": {
+					Healthy:            true,
+					Status:             "StatusOK",
+					StatusTimeUnixNano: uint64(now.Add(4 * time.Second).UnixNano()),
+				},
+				"test-exporter": {
+					Healthy:            false,
+					Status:             "StatusPermanentError",
+					StatusTimeUnixNano: uint64(now.Add(4 * time.Second).UnixNano()),
+					LastError:          "exporter error",
+				},
+			},
+		},
+	}
+	receivedHealthUpdates := 0
+
+	mockOpampClient := &mockOpAMPClient{
+		setHealthFunc: func(health *protobufs.ComponentHealth) error {
+			mtx.Lock()
+			defer mtx.Unlock()
+			require.Equal(t, expectedHealthUpdates[receivedHealthUpdates], health)
+			receivedHealthUpdates++
+			return nil
+		},
+	}
+
+	sa := &mockStatusAggregator{
+		statusChan: statusUpdateChannel,
+	}
+
+	o := newTestOpampAgent(cfg, set, mockOpampClient, sa)
+
+	o.initHealthReporting()
+
+	assert.NoError(t, o.Start(t.Context(), componenttest.NewNopHost()))
+
+	statusUpdateChannel <- nil
+	statusUpdateChannel <- &status.AggregateStatus{
+		Event: &mockStatusEvent{
+			status:    componentstatus.StatusOK,
+			err:       nil,
+			timestamp: now,
+		},
+		ComponentStatusMap: map[string]*status.AggregateStatus{
+			"test-receiver": {
+				Event: &mockStatusEvent{
+					status:    componentstatus.StatusOK,
+					err:       nil,
+					timestamp: now,
+				},
+			},
+		},
+	}
+	statusUpdateChannel <- &status.AggregateStatus{
+		Event: &mockStatusEvent{
+			status:    componentstatus.StatusPermanentError,
+			err:       errors.New("error A"),
+			timestamp: now.Add(1 * time.Second),
+		},
+		ComponentStatusMap: map[string]*status.AggregateStatus{
+			"test-receiver": {
+				Event: &mockStatusEvent{
+					status:    componentstatus.StatusPermanentError,
+					err:       errors.New("error A"),
+					timestamp: now.Add(1 * time.Second),
+				},
+			},
+		},
+	}
+	statusUpdateChannel <- &status.AggregateStatus{
+		Event: &mockStatusEvent{
+			status:    componentstatus.StatusPermanentError,
+			err:       errors.New("error B"),
+			timestamp: now.Add(2 * time.Second),
+		},
+		ComponentStatusMap: map[string]*status.AggregateStatus{
+			"test-receiver": {
+				Event: &mockStatusEvent{
+					status:    componentstatus.StatusPermanentError,
+					err:       errors.New("error B"),
+					timestamp: now.Add(2 * time.Second),
+				},
+			},
+		},
+	}
+	statusUpdateChannel <- &status.AggregateStatus{
+		Event: &mockStatusEvent{
+			status:    componentstatus.StatusPermanentError,
+			err:       errors.New("error B"),
+			timestamp: now.Add(3 * time.Second),
+		},
+		ComponentStatusMap: map[string]*status.AggregateStatus{
+			"test-receiver": {
+				Event: &mockStatusEvent{
+					status:    componentstatus.StatusPermanentError,
+					err:       errors.New("error B"),
+					timestamp: now.Add(3 * time.Second),
+				},
+			},
+			"test-exporter": {
+				Event: &mockStatusEvent{
+					status:    componentstatus.StatusPermanentError,
+					err:       errors.New("exporter error"),
+					timestamp: now.Add(3 * time.Second),
+				},
+			},
+		},
+	}
+	statusUpdateChannel <- &status.AggregateStatus{
+		Event: &mockStatusEvent{
+			status:    componentstatus.StatusPermanentError,
+			err:       errors.New("exporter error"),
+			timestamp: now.Add(4 * time.Second),
+		},
+		ComponentStatusMap: map[string]*status.AggregateStatus{
+			"test-receiver": {
+				Event: &mockStatusEvent{
+					status:    componentstatus.StatusOK,
+					err:       nil,
+					timestamp: now.Add(4 * time.Second),
+				},
+			},
+			"test-exporter": {
+				Event: &mockStatusEvent{
+					status:    componentstatus.StatusPermanentError,
+					err:       errors.New("exporter error"),
+					timestamp: now.Add(4 * time.Second),
+				},
+			},
+		},
+	}
+
+	close(statusUpdateChannel)
+
+	require.Eventually(t, func() bool {
+		mtx.RLock()
+		defer mtx.RUnlock()
+		return receivedHealthUpdates == len(expectedHealthUpdates)
+	}, 1*time.Second, 100*time.Millisecond)
+
+	assert.NoError(t, o.Shutdown(t.Context()))
+	require.True(t, sa.unsubscribed)
+}
+
+func TestHealthReportingForwardComponentHealthToAggregator(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	set := extensiontest.NewNopSettings(extensiontest.NopType)
+
+	mtx := &sync.RWMutex{}
+
+	sa := &mockStatusAggregator{
+		mtx: mtx,
+	}
+
+	o := newTestOpampAgent(
+		cfg,
+		set,
+		&mockOpAMPClient{
+			setHealthFunc: func(_ *protobufs.ComponentHealth) error {
+				return nil
+			},
+		}, sa,
+	)
+
+	o.initHealthReporting()
+
+	assert.NoError(t, o.Start(t.Context(), componenttest.NewNopHost()))
+
+	traces := testhelpers.NewPipelineMetadata(pipeline.SignalTraces)
+
+	// StatusStarting will be sent immediately.
+	for _, id := range traces.InstanceIDs() {
+		o.Changed(id, componentstatus.NewEvent(componentstatus.StatusStarting))
+	}
+
+	// StatusOK will be queued until the PipelineWatcher Ready method is called.
+	for _, id := range traces.InstanceIDs() {
+		o.Changed(id, componentstatus.NewEvent(componentstatus.StatusOK))
+	}
+
+	// verify we have received the StatusStarting events
+	require.Eventually(t, func() bool {
+		mtx.RLock()
+		defer mtx.RUnlock()
+		return len(sa.receivedEvents) == len(traces.InstanceIDs())
+	}, 5*time.Second, 100*time.Millisecond)
+
+	for _, event := range sa.receivedEvents {
+		require.Equal(t, componentstatus.NewEvent(componentstatus.StatusStarting).Status(), event.event.Status())
+	}
+
+	// clean the received events of the mocked status aggregator
+	sa.receivedEvents = nil
+
+	err := o.Ready()
+	require.NoError(t, err)
+
+	// verify we have received the StatusOK events that have been queued while the agent has not been ready
+	require.Eventually(t, func() bool {
+		mtx.RLock()
+		defer mtx.RUnlock()
+		return len(sa.receivedEvents) == len(traces.InstanceIDs())
+	}, 5*time.Second, 100*time.Millisecond)
+
+	for _, event := range sa.receivedEvents {
+		require.Equal(t, componentstatus.NewEvent(componentstatus.StatusOK).Status(), event.event.Status())
+	}
+
+	// clean the received events of the mocked status aggregator
+	sa.receivedEvents = nil
+
+	// send another set of events - these should be passed through immediately
+	for _, id := range traces.InstanceIDs() {
+		o.Changed(id, componentstatus.NewEvent(componentstatus.StatusStopping))
+	}
+
+	require.Eventually(t, func() bool {
+		mtx.RLock()
+		defer mtx.RUnlock()
+		return len(sa.receivedEvents) == len(traces.InstanceIDs())
+	}, 5*time.Second, 100*time.Millisecond)
+
+	for _, event := range sa.receivedEvents {
+		require.Equal(t, componentstatus.NewEvent(componentstatus.StatusStopping).Status(), event.event.Status())
+	}
+
+	assert.NoError(t, o.Shutdown(t.Context()))
+	require.True(t, sa.unsubscribed)
+}
+
+func TestHealthReportingExitsOnClosedContext(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	set := extensiontest.NewNopSettings(extensiontest.NopType)
+
+	statusUpdateChannel := make(chan *status.AggregateStatus)
+	sa := &mockStatusAggregator{
+		statusChan: statusUpdateChannel,
+	}
+
+	mtx := &sync.RWMutex{}
+	now := time.Now()
+	expectedHealthUpdates := []*protobufs.ComponentHealth{
+		{
+			Healthy: false,
+		},
+		{
+			Healthy:            true,
+			StartTimeUnixNano:  uint64(now.UnixNano()),
+			Status:             "StatusOK",
+			StatusTimeUnixNano: uint64(now.UnixNano()),
+			ComponentHealthMap: map[string]*protobufs.ComponentHealth{
+				"test-receiver": {
+					Healthy:            true,
+					Status:             "StatusOK",
+					StatusTimeUnixNano: uint64(now.UnixNano()),
+				},
+			},
+		},
+	}
+	receivedHealthUpdates := 0
+
+	mockOpampClient := &mockOpAMPClient{
+		setHealthFunc: func(health *protobufs.ComponentHealth) error {
+			mtx.Lock()
+			defer mtx.Unlock()
+			require.Equal(t, expectedHealthUpdates[receivedHealthUpdates], health)
+			receivedHealthUpdates++
+			return nil
+		},
+	}
+
+	o := newTestOpampAgent(cfg, set, mockOpampClient, sa)
+
+	o.initHealthReporting()
+
+	assert.NoError(t, o.Start(t.Context(), componenttest.NewNopHost()))
+
+	statusUpdateChannel <- nil
+	statusUpdateChannel <- &status.AggregateStatus{
+		Event: &mockStatusEvent{
+			status:    componentstatus.StatusOK,
+			err:       nil,
+			timestamp: now,
+		},
+		ComponentStatusMap: map[string]*status.AggregateStatus{
+			"test-receiver": {
+				Event: &mockStatusEvent{
+					status:    componentstatus.StatusOK,
+					err:       nil,
+					timestamp: now,
+				},
+			},
+		},
+	}
+
+	require.Eventually(t, func() bool {
+		mtx.RLock()
+		defer mtx.RUnlock()
+		return receivedHealthUpdates == len(expectedHealthUpdates)
+	}, 1*time.Second, 100*time.Millisecond)
+
+	// invoke Shutdown before health update channel has been closed
+	assert.NoError(t, o.Shutdown(t.Context()))
+	require.True(t, sa.unsubscribed)
+}
+
+func TestHealthReportingReportsAttributeChanges(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := createDefaultConfig().(*Config)
+		set := extensiontest.NewNopSettings(extensiontest.NopType)
+
+		statusUpdateChannel := make(chan *status.AggregateStatus)
+		sa := &mockStatusAggregator{
+			statusChan: statusUpdateChannel,
+		}
+
+		receivedHealthUpdates := 0
+		mockOpampClient := &mockOpAMPClient{
+			setHealthFunc: func(_ *protobufs.ComponentHealth) error {
+				receivedHealthUpdates++
+				return nil
+			},
+		}
+
+		o := newTestOpampAgent(cfg, set, mockOpampClient, sa)
+		o.initHealthReporting()
+		assert.NoError(t, o.Start(t.Context(), componenttest.NewNopHost()))
+
+		now := time.Now()
+		sendUpdate := func(attrs pcommon.Map) {
+			attrCopy := pcommon.NewMap()
+			attrs.CopyTo(attrCopy)
+			statusUpdateChannel <- &status.AggregateStatus{
+				Event: &mockStatusEvent{
+					status:     componentstatus.StatusOK,
+					timestamp:  now,
+					attributes: &attrCopy,
+				},
+			}
+			synctest.Wait()
+		}
+
+		attrsV1 := pcommon.NewMap()
+		attrsV1.PutStr("detail", "v1")
+		sendUpdate(attrsV1)
+		require.GreaterOrEqual(t, receivedHealthUpdates, 2)
+
+		countAfterFirst := receivedHealthUpdates
+		sendUpdate(attrsV1)
+		require.Equal(t, countAfterFirst, receivedHealthUpdates)
+
+		attrsV2 := pcommon.NewMap()
+		attrsV2.PutStr("detail", "v2")
+		sendUpdate(attrsV2)
+		require.Equal(t, countAfterFirst+1, receivedHealthUpdates)
+
+		assert.NoError(t, o.Shutdown(t.Context()))
+		require.True(t, sa.unsubscribed)
+	})
+}
+
+// Component statuses can change without the top-level status changing, for
+// example when multiple components are in RecoverableError. Such changes should
+// be reported, while changes to timestamps alone should not.
+func TestHealthReportingComponentChangeWithSameTopLevelStatus(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := createDefaultConfig().(*Config)
+		set := extensiontest.NewNopSettings(extensiontest.NopType)
+
+		statusUpdateChannel := make(chan *status.AggregateStatus)
+		sa := &mockStatusAggregator{
+			statusChan: statusUpdateChannel,
+		}
+
+		var received []*protobufs.ComponentHealth
+		mockOpampClient := &mockOpAMPClient{
+			setHealthFunc: func(health *protobufs.ComponentHealth) error {
+				received = append(received, health)
+				return nil
+			},
+		}
+
+		o := newTestOpampAgent(cfg, set, mockOpampClient, sa)
+		o.initHealthReporting()
+		require.NoError(t, o.Start(t.Context(), componenttest.NewNopHost()))
+
+		event := func(st componentstatus.Status, err string, ts time.Time) *mockStatusEvent {
+			ev := &mockStatusEvent{status: st, timestamp: ts}
+			if err != "" {
+				ev.err = errors.New(err)
+			}
+			return ev
+		}
+		sendUpdate := func(ts time.Time, exporterStatus componentstatus.Status, exporterErr string) {
+			statusUpdateChannel <- &status.AggregateStatus{
+				Event: event(componentstatus.StatusRecoverableError, "receiver error", ts),
+				ComponentStatusMap: map[string]*status.AggregateStatus{
+					"test-receiver": {Event: event(componentstatus.StatusRecoverableError, "receiver error", ts)},
+					"test-exporter": {Event: event(exporterStatus, exporterErr, ts)},
+				},
+			}
+			synctest.Wait()
+		}
+
+		now := time.Now()
+
+		// Only the receiver is in RecoverableError.
+		sendUpdate(now, componentstatus.StatusOK, "")
+		// received[0] is the initial "unhealthy" report sent on start.
+		require.Len(t, received, 2)
+
+		// The exporter now also enters RecoverableError. The top-level status and
+		// error are unchanged, but the component statuses are not.
+		sendUpdate(now.Add(time.Second), componentstatus.StatusRecoverableError, "exporter error")
+		require.Len(t, received, 3, "component-level change was swallowed by deduplication")
+		assert.Equal(t, "exporter error", received[2].ComponentHealthMap["test-exporter"].LastError)
+
+		// The same statuses with only the timestamps changed are deduplicated.
+		sendUpdate(now.Add(2*time.Second), componentstatus.StatusRecoverableError, "exporter error")
+		require.Len(t, received, 3)
+
+		close(statusUpdateChannel)
+		assert.NoError(t, o.Shutdown(t.Context()))
+		require.True(t, sa.unsubscribed)
+	})
+}
+
+func TestHealthReportingDisabled(t *testing.T) {
+	cfg := createDefaultConfig()
+	set := extensiontest.NewNopSettings(extensiontest.NopType)
+	o, err := newOpampAgent(cfg.(*Config), set)
+	assert.NoError(t, err)
+
+	o.capabilities.ReportsHealth = false
+	o.opampClient = &mockOpAMPClient{
+		setHealthFunc: func(_ *protobufs.ComponentHealth) error {
+			t.Errorf("setHealth is not supposed to be called with deactivated ReportsHealth capability")
+			return nil
+		},
+	}
+
+	assert.NoError(t, o.Start(t.Context(), componenttest.NewNopHost()))
+	assert.NoError(t, o.Shutdown(t.Context()))
+}
+
+func TestParseInstanceIDString(t *testing.T) {
+	testCases := []struct {
+		name         string
+		in           string
+		expectedUUID uuid.UUID
+		expectedErr  string
+	}{
+		{
+			name:         "Parses ULID",
+			in:           "7RK6DW2K4V8RCSQBKZ02EJ84FC",
+			expectedUUID: uuid.MustParse("f8999bc1-4c9b-4619-9bae-7f009d2411ec"),
+		},
+		{
+			name:         "Parses UUID",
+			in:           "f8999bc1-4c9b-4619-9bae-7f009d2411ec",
+			expectedUUID: uuid.MustParse("f8999bc1-4c9b-4619-9bae-7f009d2411ec"),
+		},
+		{
+			name:        "Fails on invalid format",
+			in:          "not-a-valid-id",
+			expectedErr: "invalid UUID length: 14\nulid: bad data size when unmarshaling",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, err := parseInstanceIDString(tc.in)
+			if tc.expectedErr != "" {
+				require.ErrorContains(t, err, tc.expectedErr)
+				return
+			}
+
+			require.Equal(t, tc.expectedUUID, id)
+		})
+	}
+}
+
+func TestOpAMPAgent_Dependencies(t *testing.T) {
+	t.Run("No server specified", func(t *testing.T) {
+		o := opampAgent{
+			cfg: &Config{},
+		}
+
+		require.Nil(t, o.Dependencies())
+	})
+
+	t.Run("No auth extension specified", func(t *testing.T) {
+		o := opampAgent{
+			cfg: &Config{
+				Server: &OpAMPServer{
+					WS: &commonFields{},
+				},
+			},
+		}
+
+		require.Nil(t, o.Dependencies())
+	})
+
+	t.Run("auth extension specified", func(t *testing.T) {
+		authID := component.MustNewID("basicauth")
+		o := opampAgent{
+			cfg: &Config{
+				Server: &OpAMPServer{
+					WS: &commonFields{
+						Auth: authID,
+					},
+				},
+			},
+		}
+
+		require.Equal(t, []component.ID{authID}, o.Dependencies())
+	})
+}
+
+func TestOpAMPAgent_onCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping test on windows since SIGHUP isn't a recognized signal")
+	}
+
+	t.Run("restart capability not enabled", func(t *testing.T) {
+		agent := opampAgent{
+			logger: zaptest.NewLogger(t),
+			capabilities: Capabilities{
+				AcceptsRestartCommand: false,
+			},
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		t.Cleanup(cancel)
+
+		sighupReceived := make(chan bool, 1)
+		setupSignalHandler(ctx, t, func() {
+			sighupReceived <- true
+		})
+
+		require.NoError(t, agent.onCommand(ctx, &protobufs.ServerToAgentCommand{
+			Type: protobufs.CommandType_CommandType_Restart,
+		}))
+
+		select {
+		case <-sighupReceived:
+			t.Error("shouldn't have received SIGHUP")
+		case <-time.After(250 * time.Millisecond):
+			// success
+		}
+	})
+	t.Run("happy path - not restart command", func(t *testing.T) {
+		agent := opampAgent{
+			logger: zaptest.NewLogger(t),
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		t.Cleanup(cancel)
+
+		sighupReceived := make(chan bool, 1)
+		setupSignalHandler(ctx, t, func() {
+			sighupReceived <- true
+		})
+
+		require.NoError(t, agent.onCommand(ctx, &protobufs.ServerToAgentCommand{
+			Type: 13,
+		}))
+
+		select {
+		case <-sighupReceived:
+			t.Error("shouldn't have received SIGHUP")
+		case <-time.After(250 * time.Millisecond):
+			// success
+		}
+	})
+	t.Run("happy path", func(t *testing.T) {
+		agent := opampAgent{
+			logger: zaptest.NewLogger(t),
+			capabilities: Capabilities{
+				AcceptsRestartCommand: true,
+			},
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		t.Cleanup(cancel)
+
+		sighupReceived := make(chan bool, 1)
+		setupSignalHandler(ctx, t, func() {
+			sighupReceived <- true
+		})
+
+		require.NoError(t, agent.onCommand(ctx, &protobufs.ServerToAgentCommand{
+			Type: protobufs.CommandType_CommandType_Restart,
+		}))
+
+		select {
+		case <-sighupReceived:
+			// Success
+		case <-time.After(250 * time.Millisecond):
+			t.Error("should have received SIGHUP")
+		}
+	})
+}
+
+func setupSignalHandler(ctx context.Context, tb testing.TB, signalCallback func()) {
+	tb.Helper()
+
+	sigChan := make(chan os.Signal, 1)
+	// Notify sigChan when SIGHUP is received
+	signal.Notify(sigChan, syscall.SIGHUP)
+	tb.Cleanup(func() {
+		signal.Stop(sigChan)
+	})
+
+	go func() {
+		for {
+			select {
+			case sig := <-sigChan:
+				if sig == syscall.SIGHUP {
+					signalCallback()
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+type mockStatusAggregator struct {
+	statusChan     chan *status.AggregateStatus
+	receivedEvents []eventSourcePair
+	unsubscribed   bool
+	mtx            *sync.RWMutex
+}
+
+func (m *mockStatusAggregator) Subscribe(_ status.Scope, _ status.Verbosity) (<-chan *status.AggregateStatus, status.UnsubscribeFunc) {
+	return m.statusChan, func() {
+		m.unsubscribed = true
+	}
+}
+
+func (m *mockStatusAggregator) RecordStatus(source *componentstatus.InstanceID, event *componentstatus.Event) {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	m.receivedEvents = append(m.receivedEvents, eventSourcePair{
+		source: source,
+		event:  event,
+	})
+}
+
+type mockOpAMPClient struct {
+	setHealthFunc func(health *protobufs.ComponentHealth) error
+}
+
+func (mockOpAMPClient) SetCapabilities(*protobufs.AgentCapabilities) error {
+	return nil
+}
+
+func (mockOpAMPClient) SetConnectionSettingsStatus(*protobufs.ConnectionSettingsStatus) error {
+	return nil
+}
+
+func (mockOpAMPClient) Start(_ context.Context, _ types.StartSettings) error {
+	return nil
+}
+
+func (mockOpAMPClient) Stop(_ context.Context) error {
+	return nil
+}
+
+func (mockOpAMPClient) SetAgentDescription(_ *protobufs.AgentDescription) error {
+	return nil
+}
+
+func (mockOpAMPClient) AgentDescription() *protobufs.AgentDescription {
+	return nil
+}
+
+func (m mockOpAMPClient) SetHealth(health *protobufs.ComponentHealth) error {
+	return m.setHealthFunc(health)
+}
+
+func (mockOpAMPClient) UpdateEffectiveConfig(context.Context) error {
+	return nil
+}
+
+func (mockOpAMPClient) SetRemoteConfigStatus(*protobufs.RemoteConfigStatus) error {
+	return nil
+}
+
+func (mockOpAMPClient) SetPackageStatuses(*protobufs.PackageStatuses) error {
+	return nil
+}
+
+func (mockOpAMPClient) RequestConnectionSettings(*protobufs.ConnectionSettingsRequest) error {
+	return nil
+}
+
+func (mockOpAMPClient) SetCustomCapabilities(*protobufs.CustomCapabilities) error {
+	return nil
+}
+
+func (mockOpAMPClient) SendCustomMessage(*protobufs.CustomMessage) (messageSendingChannel chan struct{}, err error) {
+	return nil, nil
+}
+
+func (mockOpAMPClient) SetFlags(protobufs.AgentToServerFlags) {}
+
+func (mockOpAMPClient) SetAvailableComponents(*protobufs.AvailableComponents) error {
+	return nil
+}
+
+type mockStatusEvent struct {
+	status     componentstatus.Status
+	err        error
+	timestamp  time.Time
+	attributes *pcommon.Map
+}
+
+func (m *mockStatusEvent) Status() componentstatus.Status {
+	return m.status
+}
+
+func (m *mockStatusEvent) Err() error {
+	return m.err
+}
+
+func (m *mockStatusEvent) Timestamp() time.Time {
+	return m.timestamp
+}
+
+func (m *mockStatusEvent) Attributes() pcommon.Map {
+	if m.attributes == nil {
+		return pcommon.NewMap()
+	}
+	return *m.attributes
+}
+
+func newTestOpampAgent(cfg *Config, set extension.Settings, mockOpampClient *mockOpAMPClient, sa *mockStatusAggregator) *opampAgent {
+	uid := uuid.New()
+	o := &opampAgent{
+		cfg:                      cfg,
+		logger:                   set.Logger,
+		serviceName:              set.BuildInfo.Command,
+		serviceVersion:           set.BuildInfo.Version,
+		instanceUID:              uid,
+		capabilities:             cfg.Capabilities,
+		opampClient:              mockOpampClient,
+		statusSubscriptionWg:     &sync.WaitGroup{},
+		componentHealthWg:        &sync.WaitGroup{},
+		readyCh:                  make(chan struct{}),
+		customCapabilityRegistry: newCustomCapabilityRegistry(set.Logger, mockOpampClient),
+		statusAggregator:         sa,
+	}
+
+	o.lifetimeCtx, o.lifetimeCtxCancel = context.WithCancel(context.Background())
+	return o
+}

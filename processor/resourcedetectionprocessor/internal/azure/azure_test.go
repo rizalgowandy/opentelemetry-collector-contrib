@@ -1,42 +1,34 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package azure
 
 import (
-	"context"
-	"fmt"
+	"errors"
+	"regexp"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/translator/conventions"
+	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/processor/processortest"
 	"go.uber.org/zap"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/metadataproviders/azure"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/azure/internal/metadata"
 )
 
 func TestNewDetector(t *testing.T) {
-	d, err := NewDetector(component.ProcessorCreateSettings{Logger: zap.NewNop()}, nil)
+	dcfg := CreateDefaultConfig()
+	d, err := NewDetector(processortest.NewNopSettings(processortest.NopType), dcfg, false)
 	require.NoError(t, err)
 	assert.NotNil(t, d)
 }
 
 func TestDetectAzureAvailable(t *testing.T) {
-	mp := &MockProvider{}
-	mp.On("Metadata").Return(&ComputeMetadata{
+	mp := &azure.MockProvider{}
+	mp.On("Metadata").Return(&azure.ComputeMetadata{
 		Location:          "location",
 		Name:              "name",
 		VMID:              "vmID",
@@ -44,36 +36,187 @@ func TestDetectAzureAvailable(t *testing.T) {
 		SubscriptionID:    "subscriptionID",
 		ResourceGroupName: "resourceGroup",
 		VMScaleSetName:    "myScaleset",
+		AvailabilityZone:  "availabilityZone",
+		OSProfile: azure.OSProfile{
+			ComputerName: "computerName",
+		},
+		TagsList: []azure.ComputeTagsListMetadata{
+			{
+				Name:  "tag1key",
+				Value: "value1",
+			},
+			{
+				Name:  "tag2key",
+				Value: "value2",
+			},
+		},
 	}, nil)
 
-	detector := &Detector{provider: mp}
-	res, err := detector.Detect(context.Background())
+	detector := &Detector{
+		provider: mp,
+		tagKeyRegexes: []*regexp.Regexp{
+			regexp.MustCompile("^tag1key$"),
+		},
+		rb: metadata.NewResourceBuilder(metadata.DefaultResourceAttributesConfig()),
+	}
+	res, schemaURL, err := detector.Detect(t.Context())
+	require.NoError(t, err)
+	require.Contains(t, schemaURL, "https://opentelemetry.io/schemas/")
+	mp.AssertExpectations(t)
+
+	expected := map[string]any{
+		"cloud.provider":           "azure",
+		"cloud.platform":           "azure.vm",
+		"host.name":                "computerName",
+		"cloud.region":             "location",
+		"host.id":                  "vmID",
+		"cloud.account.id":         "subscriptionID",
+		"azure.vm.name":            "name",
+		"azure.vm.size":            "vmSize",
+		"azure.resourcegroup.name": "resourceGroup",
+		"azure.vm.scaleset.name":   "myScaleset",
+		"azure.tag.tag1key":        "value1",
+	}
+
+	notExpected := map[string]any{
+		"azure.tag.tag2key": "value2",
+	}
+
+	assert.Equal(t, expected, res.Attributes().AsRaw())
+	assert.NotEqual(t, notExpected, res.Attributes().AsRaw())
+}
+
+func TestDetectResourceGroupNameFeatureGate(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		gateEnabled bool
+		wantKey     string
+		notWantKey  string
+	}{
+		{
+			name:        "gate disabled emits the legacy attribute",
+			gateEnabled: false,
+			wantKey:     "azure.resourcegroup.name",
+			notWantKey:  "azure.resource_group.name",
+		},
+		{
+			name:        "gate enabled emits the semconv aligned attribute",
+			gateEnabled: true,
+			wantKey:     "azure.resource_group.name",
+			notWantKey:  "azure.resourcegroup.name",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			gateID := metadata.ProcessorAzuredetectorRenameResourceGroupAttributeFeatureGate.ID()
+			require.NoError(t, featuregate.GlobalRegistry().Set(gateID, tt.gateEnabled))
+			t.Cleanup(func() {
+				require.NoError(t, featuregate.GlobalRegistry().Set(gateID, false))
+			})
+
+			mp := &azure.MockProvider{}
+			mp.On("Metadata").Return(&azure.ComputeMetadata{
+				Location:          "location",
+				Name:              "name",
+				VMID:              "vmID",
+				VMSize:            "vmSize",
+				SubscriptionID:    "subscriptionID",
+				ResourceGroupName: "resourceGroup",
+				OSProfile: azure.OSProfile{
+					ComputerName: "computerName",
+				},
+			}, nil)
+
+			detector := &Detector{
+				provider: mp,
+				rb:       metadata.NewResourceBuilder(metadata.DefaultResourceAttributesConfig()),
+			}
+			res, _, err := detector.Detect(t.Context())
+			require.NoError(t, err)
+
+			got, ok := res.Attributes().Get(tt.wantKey)
+			require.True(t, ok, "expected %q to be present", tt.wantKey)
+			assert.Equal(t, "resourceGroup", got.Str())
+
+			_, ok = res.Attributes().Get(tt.notWantKey)
+			assert.False(t, ok, "expected %q to be absent", tt.notWantKey)
+
+			mp.AssertExpectations(t)
+		})
+	}
+}
+
+func TestDetectEmptyComputerNameFallsBackToVMName(t *testing.T) {
+	mp := &azure.MockProvider{}
+	mp.On("Metadata").Return(&azure.ComputeMetadata{
+		Location:          "location",
+		Name:              "vm-name",
+		VMID:              "vmID",
+		VMSize:            "vmSize",
+		SubscriptionID:    "subscriptionID",
+		ResourceGroupName: "resourceGroup",
+		OSProfile: azure.OSProfile{
+			ComputerName: "",
+		},
+	}, nil)
+
+	detector := &Detector{
+		provider: mp,
+		rb:       metadata.NewResourceBuilder(metadata.DefaultResourceAttributesConfig()),
+	}
+	res, _, err := detector.Detect(t.Context())
 	require.NoError(t, err)
 	mp.AssertExpectations(t)
-	res.Attributes().Sort()
 
-	expected := internal.NewResource(map[string]interface{}{
-		conventions.AttributeCloudProvider: conventions.AttributeCloudProviderAzure,
-		conventions.AttributeCloudPlatform: conventions.AttributeCloudPlatformAzureVM,
-		conventions.AttributeHostName:      "name",
-		conventions.AttributeCloudRegion:   "location",
-		conventions.AttributeHostID:        "vmID",
-		conventions.AttributeCloudAccount:  "subscriptionID",
-		"azure.vm.size":                    "vmSize",
-		"azure.resourcegroup.name":         "resourceGroup",
-		"azure.vm.scaleset.name":           "myScaleset",
-	})
-	expected.Attributes().Sort()
+	// host.name should fall back to compute.Name when computerName is empty
+	hostName, ok := res.Attributes().Get("host.name")
+	require.True(t, ok)
+	require.Equal(t, "vm-name", hostName.Str())
+}
 
-	assert.Equal(t, expected, res)
+func TestDetectEmptyFieldsOmitted(t *testing.T) {
+	mp := &azure.MockProvider{}
+	mp.On("Metadata").Return(&azure.ComputeMetadata{
+		Location:          "location",
+		Name:              "vm-name",
+		VMID:              "vmID",
+		VMSize:            "vmSize",
+		SubscriptionID:    "subscriptionID",
+		ResourceGroupName: "resourceGroup",
+		VMScaleSetName:    "",
+		AvailabilityZone:  "",
+		OSProfile: azure.OSProfile{
+			ComputerName: "computerName",
+		},
+	}, nil)
+
+	cfg := metadata.DefaultResourceAttributesConfig()
+	cfg.CloudAvailabilityZone.Enabled = true
+
+	detector := &Detector{
+		provider: mp,
+		rb:       metadata.NewResourceBuilder(cfg),
+	}
+	res, _, err := detector.Detect(t.Context())
+	require.NoError(t, err)
+	mp.AssertExpectations(t)
+
+	// Empty VMScaleSetName and AvailabilityZone should not be set
+	_, hasScaleSet := res.Attributes().Get("azure.vm.scaleset.name")
+	require.False(t, hasScaleSet, "empty azure.vm.scaleset.name should not be set")
+
+	_, hasZone := res.Attributes().Get("cloud.availability_zone")
+	require.False(t, hasZone, "empty cloud.availability_zone should not be set")
 }
 
 func TestDetectError(t *testing.T) {
-	mp := &MockProvider{}
-	mp.On("Metadata").Return(&ComputeMetadata{}, fmt.Errorf("mock error"))
-
-	detector := &Detector{provider: mp, logger: zap.NewNop()}
-	res, err := detector.Detect(context.Background())
+	mp := &azure.MockProvider{}
+	mp.On("Metadata").Return(&azure.ComputeMetadata{}, errors.New("mock error"))
+	detector := &Detector{
+		provider: mp,
+		logger:   zap.NewNop(),
+		rb:       metadata.NewResourceBuilder(metadata.DefaultResourceAttributesConfig()),
+	}
+	res, _, err := detector.Detect(t.Context())
 	assert.NoError(t, err)
 	assert.True(t, internal.IsEmptyResource(res))
 }

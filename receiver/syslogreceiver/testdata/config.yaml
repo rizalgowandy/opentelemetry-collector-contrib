@@ -1,21 +1,10 @@
-receivers:
-  syslog:
-    tcp:
-      listen_address: "0.0.0.0:29018"
-    protocol: rfc5424
-    converter:
-      flush_interval: 100ms
-      worker_count: 1
-
-processors:
-  nop:
-
-exporters:
-  nop:
-
-service:
-  pipelines:
-    logs:
-      receivers: [syslog]
-      processors: [ nop ]
-      exporters: [ nop ]
+syslog:
+  tcp:
+    listen_address: "127.0.0.1:29018"
+  protocol: rfc5424
+syslog/udp_resolve_names_false:
+  protocol: rfc5424
+  udp:
+    listen_address: "127.0.0.1:29022"
+    add_attributes: true
+    resolve_names: false

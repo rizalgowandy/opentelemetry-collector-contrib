@@ -1,0 +1,26 @@
+description: Config defines configuration for simple prometheus receiver.
+type: object
+properties:
+  collection_interval:
+    description: CollectionInterval is the interval at which metrics should be collected
+    type: string
+    format: duration
+  job_name:
+    description: JobName allows users to customize the job name optionally.
+    type: string
+  labels:
+    description: Labels static labels
+    type: object
+    additionalProperties:
+      type: string
+  metrics_path:
+    description: MetricsPath the path to the metrics endpoint.
+    type: string
+  params:
+    description: Params the parameters to the metrics endpoint.
+    x-customType: net/url.values
+  use_service_account:
+    description: Whether or not to use pod service account to authenticate.
+    type: boolean
+allOf:
+  - $ref: go.opentelemetry.io/collector/config/confighttp.client_config

@@ -1,91 +1,289 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package env
 
 import (
-	"context"
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/processor/processortest"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal"
 )
 
 func TestNewDetector(t *testing.T) {
-	d, err := NewDetector(component.ProcessorCreateSettings{Logger: zap.NewNop()}, nil)
+	d, err := NewDetector(processortest.NewNopSettings(processortest.NopType), nil, false)
 	assert.NotNil(t, d)
 	assert.NoError(t, err)
 }
 
 func TestDetectTrue(t *testing.T) {
-	os.Setenv(envVar, "key=value")
+	t.Setenv(envVar, "key=value")
 
 	detector := &Detector{}
-	res, err := detector.Detect(context.Background())
+	res, schemaURL, err := detector.Detect(t.Context())
+	assert.Empty(t, schemaURL)
 	require.NoError(t, err)
-	assert.Equal(t, internal.NewResource(map[string]interface{}{"key": "value"}), res)
+	assert.Equal(t, map[string]any{"key": "value"}, res.Attributes().AsRaw())
 }
 
 func TestDetectFalse(t *testing.T) {
-	os.Setenv(envVar, "")
+	t.Setenv(envVar, "")
 
 	detector := &Detector{}
-	res, err := detector.Detect(context.Background())
+	res, schemaURL, err := detector.Detect(t.Context())
 	require.NoError(t, err)
+	assert.Empty(t, schemaURL)
 	assert.True(t, internal.IsEmptyResource(res))
 }
 
 func TestDetectDeprecatedEnv(t *testing.T) {
-	os.Setenv(envVar, "")
-	os.Setenv(deprecatedEnvVar, "key=value")
+	t.Setenv(envVar, "")
+	t.Setenv(deprecatedEnvVar, "key=value")
 
 	detector := &Detector{}
-	res, err := detector.Detect(context.Background())
+	res, schemaURL, err := detector.Detect(t.Context())
 	require.NoError(t, err)
-	assert.Equal(t, internal.NewResource(map[string]interface{}{"key": "value"}), res)
+	assert.Empty(t, schemaURL)
+	assert.Equal(t, map[string]any{"key": "value"}, res.Attributes().AsRaw())
+}
+
+func TestDetectIncluded(t *testing.T) {
+	t.Setenv(envVar, "keep=1,drop=2,also_keep=3")
+
+	d, err := NewDetector(processortest.NewNopSettings(processortest.NopType), Config{
+		Attributes: AttributesConfig{Included: []string{"keep", "also_keep"}},
+	}, false)
+	require.NoError(t, err)
+	res, _, err := d.Detect(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"keep": "1", "also_keep": "3"}, res.Attributes().AsRaw())
+}
+
+func TestDetectIncludedWildcard(t *testing.T) {
+	t.Setenv(envVar, "k8s.cluster.name=c,k8s.cluster.uid=u,k8s.pod.name=p,other=1")
+
+	d, err := NewDetector(processortest.NewNopSettings(processortest.NopType), Config{
+		Attributes: AttributesConfig{
+			Included: []string{"k8s.cluster.*"},
+		},
+	}, false)
+	require.NoError(t, err)
+	res, _, err := d.Detect(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"k8s.cluster.name": "c", "k8s.cluster.uid": "u"}, res.Attributes().AsRaw())
+}
+
+func TestDetectExcludedAppliesAfterIncluded(t *testing.T) {
+	t.Setenv(envVar, "k8s.cluster.name=c,k8s.pod.name=p,k8s.namespace.name=n,other=1")
+
+	d, err := NewDetector(processortest.NewNopSettings(processortest.NopType), Config{
+		Attributes: AttributesConfig{
+			Included: []string{"k8s.*"},
+			Excluded: []string{"k8s.pod.name"},
+		},
+	}, false)
+	require.NoError(t, err)
+	res, _, err := d.Detect(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"k8s.cluster.name": "c", "k8s.namespace.name": "n"}, res.Attributes().AsRaw())
+}
+
+func TestDetectExcludedOnly(t *testing.T) {
+	t.Setenv(envVar, "a=1,b=2,c=3")
+
+	d, err := NewDetector(processortest.NewNopSettings(processortest.NopType), Config{
+		Attributes: AttributesConfig{Excluded: []string{"b"}},
+	}, false)
+	require.NoError(t, err)
+	res, _, err := d.Detect(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"a": "1", "c": "3"}, res.Attributes().AsRaw())
+}
+
+func TestDetectDefaultConfigAllowsAll(t *testing.T) {
+	t.Setenv(envVar, "a=1,b=2")
+
+	d, err := NewDetector(processortest.NewNopSettings(processortest.NopType), CreateDefaultConfig(), false)
+	require.NoError(t, err)
+	res, _, err := d.Detect(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"a": "1", "b": "2"}, res.Attributes().AsRaw())
 }
 
 func TestDetectError(t *testing.T) {
-	os.Setenv(envVar, "key=value,key")
+	t.Setenv(envVar, "key=value,key")
 
 	detector := &Detector{}
-	res, err := detector.Detect(context.Background())
+	res, schemaURL, err := detector.Detect(t.Context())
 	assert.Error(t, err)
+	assert.Empty(t, schemaURL)
 	assert.True(t, internal.IsEmptyResource(res))
+}
+
+func TestCompilePatterns(t *testing.T) {
+	cases := []struct {
+		name     string
+		patterns []string
+		matches  map[string]bool
+	}{
+		{
+			name:     "nil returns nil",
+			patterns: nil,
+			matches:  nil,
+		},
+		{
+			name:     "empty slice returns nil",
+			patterns: []string{},
+			matches:  nil,
+		},
+		{
+			name:     "exact match",
+			patterns: []string{"k8s.cluster.name"},
+			matches: map[string]bool{
+				"k8s.cluster.name":  true,
+				"k8s.cluster.names": false,
+				"k8s.cluster":       false,
+				"":                  false,
+			},
+		},
+		{
+			name:     "trailing star wildcard",
+			patterns: []string{"k8s.cluster.*"},
+			matches: map[string]bool{
+				"k8s.cluster.":     true,
+				"k8s.cluster.name": true,
+				"k8s.cluster.uid":  true,
+				"k8s.cluster":      false,
+				"k8s.pod.name":     false,
+			},
+		},
+		{
+			name:     "leading and middle star wildcard",
+			patterns: []string{"*.name", "k8s.*.uid"},
+			matches: map[string]bool{
+				"host.name":       true,
+				"k8s.cluster.uid": true,
+				"k8s.pod.uid":     true,
+				"other":           false,
+			},
+		},
+		{
+			name:     "question mark matches single char",
+			patterns: []string{"host?name", "k8s.pod.uid.?"},
+			matches: map[string]bool{
+				"host.name":       true,
+				"host_name":       true,
+				"hostname":        false,
+				"host--name":      false,
+				"k8s.pod.uid.a":   true,
+				"k8s.pod.uid.":    false,
+				"k8s.pod.uid.abc": false,
+			},
+		},
+		{
+			name:     "mixed wildcards",
+			patterns: []string{"k8s.*.uid.?"},
+			matches: map[string]bool{
+				"k8s.pod.uid.a":     true,
+				"k8s.cluster.uid.x": true,
+				"k8s.pod.uid.":      false,
+				"k8s.pod.uid.abc":   false,
+			},
+		},
+		{
+			name:     "regex metacharacters are escaped",
+			patterns: []string{"a.b"},
+			matches: map[string]bool{
+				"a.b": true,
+				"aXb": false,
+			},
+		},
+		{
+			name:     "multiple patterns any-match",
+			patterns: []string{"foo", "bar.*"},
+			matches: map[string]bool{
+				"foo":     true,
+				"bar.baz": true,
+				"baz":     false,
+			},
+		},
+		{
+			name:     "case-sensitive",
+			patterns: []string{"Foo"},
+			matches: map[string]bool{
+				"Foo": true,
+				"foo": false,
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			compiled, err := compilePatterns(c.patterns)
+			require.NoError(t, err)
+			if c.matches == nil {
+				assert.Nil(t, compiled)
+				return
+			}
+			assert.Len(t, compiled, len(c.patterns))
+			for key, want := range c.matches {
+				assert.Equalf(t, want, matchAny(compiled, key), "match(%q)", key)
+			}
+		})
+	}
+}
+
+func TestConfigValidate(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     Config
+		wantErr string
+	}{
+		{name: "zero value ok", cfg: Config{}},
+		{name: "nil slices ok", cfg: Config{Attributes: AttributesConfig{}}},
+		{name: "populated ok", cfg: Config{Attributes: AttributesConfig{Included: []string{"k8s.*"}, Excluded: []string{"k8s.pod.name"}}}},
+		{
+			name:    "empty included rejected",
+			cfg:     Config{Attributes: AttributesConfig{Included: []string{}}},
+			wantErr: "attributes.included must contain at least one entry when set",
+		},
+		{
+			name:    "empty excluded rejected",
+			cfg:     Config{Attributes: AttributesConfig{Excluded: []string{}}},
+			wantErr: "attributes.excluded must contain at least one entry when set",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := c.cfg.Validate()
+			if c.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, c.wantErr)
+			}
+		})
+	}
 }
 
 func TestInitializeAttributeMap(t *testing.T) {
 	cases := []struct {
 		name               string
 		encoded            string
-		expectedAttributes pdata.AttributeMap
+		expectedAttributes map[string]any
 		expectedError      string
 	}{
 		{
 			name:               "multiple valid attributes",
 			encoded:            ` example.org/test-1 =  test $ %3A \" ,  Abc=Def  `,
-			expectedAttributes: internal.NewAttributeMap(map[string]interface{}{"example.org/test-1": `test $ : \"`, "Abc": "Def"}),
+			expectedAttributes: map[string]any{"example.org/test-1": `test $ : \"`, "Abc": "Def"},
 		}, {
 			name:               "single valid attribute",
 			encoded:            `single=key`,
-			expectedAttributes: internal.NewAttributeMap(map[string]interface{}{"single": "key"}),
+			expectedAttributes: map[string]any{"single": "key"},
 		}, {
 			name:          "invalid url escape sequence in value",
 			encoded:       `invalid=url-%3-encoding`,
@@ -111,14 +309,14 @@ func TestInitializeAttributeMap(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			am := pdata.NewAttributeMap()
+			am := pcommon.NewMap()
 			err := initializeAttributeMap(am, c.encoded)
 
 			if c.expectedError != "" {
 				assert.EqualError(t, err, c.expectedError)
 			} else {
 				assert.NoError(t, err)
-				assert.Equal(t, c.expectedAttributes.Sort(), am.Sort())
+				assert.Equal(t, c.expectedAttributes, am.AsRaw())
 			}
 		})
 	}

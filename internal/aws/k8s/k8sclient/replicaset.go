@@ -1,18 +1,7 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package k8sclient
+package k8sclient // import "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/k8s/k8sclient"
 
 import (
 	"context"
@@ -36,19 +25,15 @@ const (
 type ReplicaSetClient interface {
 	// Get the mapping between replica set and deployment
 	ReplicaSetToDeployment() map[string]string
-
-	// shutdown is only used internally by clientset to stop the ReplicaSetClient
-	shutdown()
 }
 
-type noOpReplicaSetClient struct {
-}
+type noOpReplicaSetClient struct{}
 
-func (nc *noOpReplicaSetClient) ReplicaSetToDeployment() map[string]string {
+func (*noOpReplicaSetClient) ReplicaSetToDeployment() map[string]string {
 	return map[string]string{}
 }
 
-func (nc *noOpReplicaSetClient) shutdown() {
+func (*noOpReplicaSetClient) shutdown() {
 }
 
 type replicaSetClientOption func(*replicaSetClient)
@@ -89,11 +74,10 @@ func (c *replicaSetClient) refresh() {
 	tmpMap := make(map[string]string)
 	for _, obj := range objsList {
 		replicaSet := obj.(*replicaSetInfo)
-	ownerLoop:
 		for _, owner := range replicaSet.owners {
 			if owner.kind == deployment && owner.name != "" {
 				tmpMap[replicaSet.name] = owner.name
-				break ownerLoop
+				break
 			}
 		}
 	}
@@ -126,7 +110,7 @@ func newReplicaSetClient(clientSet kubernetes.Interface, logger *zap.Logger, opt
 
 	ctx := context.Background()
 	if _, err := clientSet.AppsV1().ReplicaSets(metav1.NamespaceAll).List(ctx, metav1.ListOptions{}); err != nil {
-		return nil, fmt.Errorf("cannot list ReplicaSet. err: %v", err)
+		return nil, fmt.Errorf("cannot list ReplicaSet. err: %w", err)
 	}
 
 	c.stopChan = make(chan struct{})
@@ -153,7 +137,7 @@ func (c *replicaSetClient) shutdown() {
 	c.stopped = true
 }
 
-func transformFuncReplicaSet(obj interface{}) (interface{}, error) {
+func transformFuncReplicaSet(obj any) (any, error) {
 	replicaSet, ok := obj.(*appsv1.ReplicaSet)
 	if !ok {
 		return nil, fmt.Errorf("input obj %v is not ReplicaSet type", obj)
@@ -168,12 +152,11 @@ func transformFuncReplicaSet(obj interface{}) (interface{}, error) {
 }
 
 func createReplicaSetListWatch(client kubernetes.Interface, ns string) cache.ListerWatcher {
-	ctx := context.Background()
 	return &cache.ListWatch{
-		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
+		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 			return client.AppsV1().ReplicaSets(ns).List(ctx, opts)
 		},
-		WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
 			return client.AppsV1().ReplicaSets(ns).Watch(ctx, opts)
 		},
 	}

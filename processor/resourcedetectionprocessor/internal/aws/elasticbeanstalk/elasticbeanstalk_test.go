@@ -1,112 +1,217 @@
-// Copyright -c OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package elasticbeanstalk
 
 import (
 	"context"
 	"errors"
-	"io"
-	"io/ioutil"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.uber.org/zap"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/processor/processortest"
+	"go.opentelemetry.io/otel/attribute"
+	sdkresource "go.opentelemetry.io/otel/sdk/resource"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/aws/elasticbeanstalk/internal/metadata"
 )
 
-const xrayConf = "{\"deployment_id\":23,\"version_label\":\"env-version-1234\",\"environment_name\":\"BETA\"}"
+const (
+	deploymentID    = "23"
+	environmentName = "BETA"
+	versionLabel    = "env-version-1234"
+)
 
-type mockFileSystem struct {
-	windows  bool
-	exists   bool
-	path     string
-	contents string
+// fakeDetector stands in for the upstream SDK detector, whose configuration file
+// path is not injectable.
+type fakeDetector struct {
+	res *sdkresource.Resource
+	err error
 }
 
-func (mfs *mockFileSystem) Open(path string) (io.ReadCloser, error) {
-	if !mfs.exists {
-		return nil, errors.New("file not found")
+func (f fakeDetector) Detect(context.Context) (*sdkresource.Resource, error) {
+	return f.res, f.err
+}
+
+func withFakeDetector(t *testing.T, res *sdkresource.Resource, err error) {
+	t.Helper()
+
+	orig := newResourceDetector
+	newResourceDetector = func() sdkresource.Detector {
+		return fakeDetector{res: res, err: err}
 	}
-	mfs.path = path
-	f := ioutil.NopCloser(strings.NewReader(mfs.contents))
-	return f, nil
+	t.Cleanup(func() { newResourceDetector = orig })
 }
 
-func (mfs *mockFileSystem) IsWindows() bool {
-	return mfs.windows
+func setGate(t *testing.T, gate *featuregate.Gate, enabled bool) {
+	t.Helper()
+
+	original := gate.IsEnabled()
+	require.NoError(t, featuregate.GlobalRegistry().Set(gate.ID(), enabled))
+	t.Cleanup(func() {
+		require.NoError(t, featuregate.GlobalRegistry().Set(gate.ID(), original))
+	})
 }
 
-func Test_newDetector(t *testing.T) {
-	d, err := NewDetector(component.ProcessorCreateSettings{Logger: zap.NewNop()}, nil)
-
-	assert.Nil(t, err)
-	assert.NotNil(t, d)
+func setEmitV1(t *testing.T, enabled bool) {
+	t.Helper()
+	setGate(t, metadata.ProcessorResourcedetectionElasticbeanstalkEmitV1DeploymentConventionsFeatureGate, enabled)
 }
 
-func Test_windowsPath(t *testing.T) {
-	mfs := &mockFileSystem{windows: true, exists: true, contents: xrayConf}
-	d := Detector{fs: mfs}
-
-	r, err := d.Detect(context.TODO())
-
-	assert.Nil(t, err)
-	assert.NotNil(t, r)
-	assert.Equal(t, windowsPath, mfs.path)
+func setDontEmitV0(t *testing.T, enabled bool) {
+	t.Helper()
+	setGate(t, metadata.ProcessorResourcedetectionElasticbeanstalkDontEmitV0DeploymentConventionsFeatureGate, enabled)
 }
 
-func Test_fileNotExists(t *testing.T) {
-	mfs := &mockFileSystem{exists: false}
-	d := Detector{fs: mfs}
-
-	r, err := d.Detect(context.TODO())
-
-	assert.Nil(t, err)
-	assert.NotNil(t, r)
-	assert.Equal(t, 0, r.Attributes().Len())
+func fullResource() *sdkresource.Resource {
+	return sdkresource.NewSchemaless(
+		attribute.String("cloud.provider", "aws"),
+		attribute.String("cloud.platform", "aws_elastic_beanstalk"),
+		attribute.String("deployment.id", deploymentID),
+		attribute.String("deployment.environment.name", environmentName),
+		attribute.String("service.version", versionLabel),
+	)
 }
 
-func Test_fileMalformed(t *testing.T) {
-	mfs := &mockFileSystem{exists: true, contents: "some overwritten value"}
-	d := Detector{fs: mfs}
+func newTestDetector(t *testing.T, failOnMissingMetadata bool) internal.Detector {
+	t.Helper()
 
-	r, err := d.Detect(context.TODO())
-
-	assert.NotNil(t, err)
-	assert.NotNil(t, r)
-	assert.Equal(t, 0, r.Attributes().Len())
+	d, err := NewDetector(processortest.NewNopSettings(processortest.NopType), CreateDefaultConfig(), failOnMissingMetadata)
+	require.NoError(t, err)
+	return d
 }
 
-func Test_AttributesDetectedSuccessfully(t *testing.T) {
-	mfs := &mockFileSystem{exists: true, contents: xrayConf}
-	d := Detector{fs: mfs}
+// Default gates must report what the detector reported before delegating to the SDK.
+func TestDetect_DefaultGates(t *testing.T) {
+	withFakeDetector(t, fullResource(), nil)
 
-	want := pdata.NewResource()
-	attr := want.Attributes()
-	attr.InsertString("cloud.provider", "aws")
-	attr.InsertString("cloud.platform", "aws_elastic_beanstalk")
-	attr.InsertString("deployment.environment", "BETA")
-	attr.InsertString("service.instance.id", "23")
-	attr.InsertString("service.version", "env-version-1234")
+	d := newTestDetector(t, false)
+	res, schemaURL, err := d.Detect(t.Context())
+	require.NoError(t, err)
 
-	r, err := d.Detect(context.TODO())
+	assert.Equal(t, map[string]any{
+		"cloud.provider":         "aws",
+		"cloud.platform":         "aws_elastic_beanstalk",
+		"deployment.environment": environmentName,
+		"service.instance.id":    deploymentID,
+		"service.version":        versionLabel,
+	}, res.Attributes().AsRaw())
+	assert.Equal(t, "https://opentelemetry.io/schemas/1.43.0", schemaURL)
+}
 
-	assert.Nil(t, err)
-	assert.NotNil(t, r)
-	assert.Equal(t, internal.AttributesToMap(want.Attributes()), internal.AttributesToMap(r.Attributes()))
+func TestDetect_EmitV1Only(t *testing.T) {
+	withFakeDetector(t, fullResource(), nil)
+	setEmitV1(t, true)
+
+	d := newTestDetector(t, false)
+	res, _, err := d.Detect(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]any{
+		"cloud.provider":              "aws",
+		"cloud.platform":              "aws_elastic_beanstalk",
+		"deployment.environment":      environmentName,
+		"deployment.environment.name": environmentName,
+		"deployment.id":               deploymentID,
+		"service.instance.id":         deploymentID,
+		"service.version":             versionLabel,
+	}, res.Attributes().AsRaw())
+}
+
+func TestDetect_BothGates(t *testing.T) {
+	withFakeDetector(t, fullResource(), nil)
+	setEmitV1(t, true)
+	setDontEmitV0(t, true)
+
+	d := newTestDetector(t, false)
+	res, _, err := d.Detect(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]any{
+		"cloud.provider":              "aws",
+		"cloud.platform":              "aws_elastic_beanstalk",
+		"deployment.environment.name": environmentName,
+		"deployment.id":               deploymentID,
+		"service.version":             versionLabel,
+	}, res.Attributes().AsRaw())
+}
+
+func TestNewDetector_DontEmitV0WithoutEmitV1(t *testing.T) {
+	withFakeDetector(t, fullResource(), nil)
+	setDontEmitV0(t, true)
+
+	_, err := NewDetector(processortest.NewNopSettings(processortest.NopType), CreateDefaultConfig(), false)
+	require.ErrorContains(t, err, "DontEmitV0DeploymentConventions requires")
+}
+
+func TestDetect_ResourceAttributesDisabled(t *testing.T) {
+	withFakeDetector(t, fullResource(), nil)
+
+	cfg := CreateDefaultConfig()
+	cfg.ResourceAttributes.DeploymentEnvironment.Enabled = false
+	cfg.ResourceAttributes.ServiceVersion.Enabled = false
+
+	d, err := NewDetector(processortest.NewNopSettings(processortest.NopType), cfg, false)
+	require.NoError(t, err)
+
+	res, _, err := d.Detect(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]any{
+		"cloud.provider":      "aws",
+		"cloud.platform":      "aws_elastic_beanstalk",
+		"service.instance.id": deploymentID,
+	}, res.Attributes().AsRaw())
+}
+
+func TestDetect_NotOnElasticBeanstalk(t *testing.T) {
+	withFakeDetector(t, sdkresource.Empty(), nil)
+
+	d := newTestDetector(t, false)
+	res, schemaURL, err := d.Detect(t.Context())
+
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.Attributes().Len())
+	assert.Empty(t, schemaURL)
+}
+
+func TestDetect_NotOnElasticBeanstalkFailOnMissingMetadata(t *testing.T) {
+	withFakeDetector(t, sdkresource.Empty(), nil)
+
+	d := newTestDetector(t, true)
+	res, _, err := d.Detect(t.Context())
+
+	require.ErrorContains(t, err, "elastic_beanstalk metadata unavailable")
+	assert.Equal(t, 0, res.Attributes().Len())
+}
+
+func TestDetect_Error(t *testing.T) {
+	detectErr := errors.New("elasticbeanstalk: invalid character 's'")
+	withFakeDetector(t, sdkresource.Empty(), detectErr)
+
+	d := newTestDetector(t, false)
+	res, _, err := d.Detect(t.Context())
+
+	require.ErrorIs(t, err, detectErr)
+	assert.Equal(t, 0, res.Attributes().Len())
+}
+
+func TestDetect_PartialResource(t *testing.T) {
+	partial := sdkresource.NewSchemaless(
+		attribute.String("cloud.provider", "aws"),
+		attribute.String("cloud.platform", "aws_elastic_beanstalk"),
+	)
+	withFakeDetector(t, partial, sdkresource.ErrPartialResource)
+
+	d := newTestDetector(t, false)
+	res, _, err := d.Detect(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]any{
+		"cloud.provider": "aws",
+		"cloud.platform": "aws_elastic_beanstalk",
+	}, res.Attributes().AsRaw())
 }

@@ -1,54 +1,74 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package fluentforwardreceiver
+package fluentforwardreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/fluentforwardreceiver"
 
 import (
 	"context"
 	"net"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/receiver/receiverhelper"
 	"go.uber.org/zap"
+	"golang.org/x/net/netutil"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/fluentforwardreceiver/internal/metadata"
 )
 
 // Give the event channel a bit of buffer to help reduce backpressure on
 // FluentBit and increase throughput.
 const eventChannelLength = 100
 
+const (
+	defaultACKWaitTimeout = 30 * time.Second
+	// defaultMaxConnections bounds the number of simultaneously accepted
+	// connections. Each connection acknowledges its chunks serially (it blocks
+	// until the pipeline responds before reading the next event), so limiting
+	// connections also bounds the number of in-flight chunk acknowledgments and
+	// keeps memory use bounded when clients delay behind pipeline backpressure.
+	defaultMaxConnections = 100
+)
+
 type fluentReceiver struct {
-	collector *Collector
-	listener  net.Listener
-	conf      *Config
-	logger    *zap.Logger
-	server    *server
-	cancel    context.CancelFunc
+	collector      *collector
+	listener       net.Listener
+	conf           *Config
+	logger         *zap.Logger
+	server         *server
+	cancel         context.CancelFunc
+	maxConnections int
 }
 
-func newFluentReceiver(logger *zap.Logger, conf *Config, next consumer.Logs) (component.LogsReceiver, error) {
-	eventCh := make(chan Event, eventChannelLength)
+func newFluentReceiver(set receiver.Settings, conf *Config, next consumer.Logs) (receiver.Logs, error) {
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{
+		ReceiverID:             set.ID,
+		Transport:              "http",
+		ReceiverCreateSettings: set,
+	})
+	if err != nil {
+		return nil, err
+	}
 
-	collector := newCollector(eventCh, next, logger)
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(set.TelemetrySettings)
+	if err != nil {
+		return nil, err
+	}
 
-	server := newServer(eventCh, logger)
+	eventCh := make(chan eventWithACK, eventChannelLength)
+	collector := newCollector(eventCh, next, defaultACKWaitTimeout, set.Logger, obsrecv, telemetryBuilder)
+
+	server := newServer(eventCh, defaultACKWaitTimeout, set.Logger, telemetryBuilder)
 
 	return &fluentReceiver{
-		collector: collector,
-		server:    server,
-		conf:      conf,
-		logger:    logger,
+		collector:      collector,
+		server:         server,
+		conf:           conf,
+		logger:         set.Logger,
+		maxConnections: defaultMaxConnections,
 	}, nil
 }
 
@@ -76,6 +96,13 @@ func (r *fluentReceiver) Start(ctx context.Context, _ component.Host) error {
 		return err
 	}
 
+	// Bound the number of simultaneously accepted connections. Excess
+	// connections wait in the accept backlog until a slot frees, which keeps
+	// the number of in-flight chunk acknowledgments bounded under load.
+	if r.maxConnections > 0 {
+		listener = netutil.LimitListener(listener, r.maxConnections)
+	}
+
 	r.listener = listener
 
 	r.server.Start(receiverCtx, listener)
@@ -88,6 +115,12 @@ func (r *fluentReceiver) Start(ctx context.Context, _ component.Host) error {
 }
 
 func (r *fluentReceiver) Shutdown(context.Context) error {
+	if r.listener == nil {
+		return nil
+	}
+	// Close the listener to stop accepting new connections
+	_ = r.listener.Close()
+	r.server.closeAllConns()
 	r.cancel()
 	return nil
 }

@@ -1,0 +1,337 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package awsecscontainermetrics
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/ecsutil"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awsecscontainermetricsreceiver/internal/metadata"
+)
+
+func TestContainerResource(t *testing.T) {
+	cm := &ecsutil.ContainerMetadata{
+		ContainerName: "container-1",
+		DockerID:      "001",
+		DockerName:    "docker-container-1",
+		Image:         "nginx:v1.0",
+		ImageID:       "sha256:8cf1bfb43ff5d9b05af9b6b63983440f137",
+		CreatedAt:     "2020-07-30T22:12:29.837074927Z",
+		StartedAt:     "2020-07-30T22:12:31.153459485Z",
+		KnownStatus:   "RUNNING",
+	}
+
+	r := containerResource(cm, zap.NewNop())
+	require.NotNil(t, r)
+	attrMap := r.Attributes()
+	require.Equal(t, 9, attrMap.Len())
+	expected := map[string]any{
+		"container.name":              "container-1",
+		"container.id":                "001",
+		attributeECSDockerName:        "docker-container-1",
+		"container.image.name":        "nginx",
+		attributeContainerImageID:     "sha256:8cf1bfb43ff5d9b05af9b6b63983440f137",
+		"container.image.tag":         "v1.0",
+		attributeContainerCreatedAt:   "2020-07-30T22:12:29.837074927Z",
+		attributeContainerStartedAt:   "2020-07-30T22:12:31.153459485Z",
+		attributeContainerKnownStatus: "RUNNING",
+	}
+
+	verifyAttributeMap(t, expected, attrMap)
+}
+
+func TestContainerResourceFeatureGates(t *testing.T) {
+	cm := &ecsutil.ContainerMetadata{
+		ContainerName: "container-1",
+		DockerID:      "001",
+		DockerName:    "docker-container-1",
+		Image:         "nginx:v1.0",
+		ImageID:       "sha256:8cf1bfb43ff5d9b05af9b6b63983440f137",
+		CreatedAt:     "2020-07-30T22:12:29.837074927Z",
+		StartedAt:     "2020-07-30T22:12:31.153459485Z",
+		KnownStatus:   "RUNNING",
+	}
+
+	tests := []struct {
+		name       string
+		emitV1     bool
+		dontEmitV0 bool
+		expected   map[string]any
+	}{
+		{
+			name:       "default (both false)",
+			emitV1:     false,
+			dontEmitV0: false,
+			expected: map[string]any{
+				"container.name":              "container-1",
+				"container.id":                "001",
+				attributeECSDockerName:        "docker-container-1",
+				"container.image.name":        "nginx",
+				attributeContainerImageID:     "sha256:8cf1bfb43ff5d9b05af9b6b63983440f137",
+				"container.image.tag":         "v1.0",
+				attributeContainerCreatedAt:   "2020-07-30T22:12:29.837074927Z",
+				attributeContainerStartedAt:   "2020-07-30T22:12:31.153459485Z",
+				attributeContainerKnownStatus: "RUNNING",
+			},
+		},
+		{
+			name:       "emit both (emitV1 true, dontEmitV0 false)",
+			emitV1:     true,
+			dontEmitV0: false,
+			expected: map[string]any{
+				"container.name":              "container-1",
+				"container.id":                "001",
+				attributeECSDockerName:        "docker-container-1",
+				"container.image.name":        "nginx",
+				attributeContainerImageID:     "sha256:8cf1bfb43ff5d9b05af9b6b63983440f137",
+				"container.image.tag":         "v1.0",
+				"container.image.tags":        []string{"v1.0"},
+				attributeContainerCreatedAt:   "2020-07-30T22:12:29.837074927Z",
+				attributeContainerStartedAt:   "2020-07-30T22:12:31.153459485Z",
+				attributeContainerKnownStatus: "RUNNING",
+			},
+		},
+		{
+			name:       "emit new only (emitV1 true, dontEmitV0 true)",
+			emitV1:     true,
+			dontEmitV0: true,
+			expected: map[string]any{
+				"container.name":              "container-1",
+				"container.id":                "001",
+				attributeECSDockerName:        "docker-container-1",
+				"container.image.name":        "nginx",
+				attributeContainerImageID:     "sha256:8cf1bfb43ff5d9b05af9b6b63983440f137",
+				"container.image.tags":        []string{"v1.0"},
+				attributeContainerCreatedAt:   "2020-07-30T22:12:29.837074927Z",
+				attributeContainerStartedAt:   "2020-07-30T22:12:31.153459485Z",
+				attributeContainerKnownStatus: "RUNNING",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := featuregate.GlobalRegistry().Set(metadata.ReceiverAwsecscontainermetricsEmitV1ContainerConventionsFeatureGate.ID(), tt.emitV1)
+			require.NoError(t, err)
+			err = featuregate.GlobalRegistry().Set(metadata.ReceiverAwsecscontainermetricsDontEmitV0ContainerConventionsFeatureGate.ID(), tt.dontEmitV0)
+			require.NoError(t, err)
+
+			defer func() {
+				_ = featuregate.GlobalRegistry().Set(metadata.ReceiverAwsecscontainermetricsEmitV1ContainerConventionsFeatureGate.ID(), false)
+				_ = featuregate.GlobalRegistry().Set(metadata.ReceiverAwsecscontainermetricsDontEmitV0ContainerConventionsFeatureGate.ID(), false)
+			}()
+
+			r := containerResource(cm, zap.NewNop())
+			require.NotNil(t, r)
+			attrMap := r.Attributes()
+			require.Equal(t, len(tt.expected), attrMap.Len())
+
+			verifyAttributeMap(t, tt.expected, attrMap)
+		})
+	}
+}
+
+func TestContainerResourceForStoppedContainer(t *testing.T) {
+	var exitCode int64 = 2
+	cm := &ecsutil.ContainerMetadata{
+		ContainerName: "container-1",
+		DockerID:      "001",
+		DockerName:    "docker-container-1",
+		Image:         "nginx:v1.0",
+		ImageID:       "sha256:8cf1bfb43ff5d9b05af9b6b63983440f137",
+		CreatedAt:     "2020-07-30T22:12:29.837074927Z",
+		StartedAt:     "2020-07-30T22:12:31.153459485Z",
+		FinishedAt:    "2020-07-31T22:12:29.837074927Z",
+		KnownStatus:   "STOPPED",
+		ExitCode:      &exitCode,
+	}
+
+	r := containerResource(cm, zap.NewNop())
+	require.NotNil(t, r)
+	attrMap := r.Attributes()
+	getExitCodeAd, found := attrMap.Get(attributeContainerExitCode)
+	require.True(t, found)
+	require.EqualValues(t, 2, getExitCodeAd.Int())
+	require.Equal(t, 11, attrMap.Len())
+	expected := map[string]any{
+		"container.name":              "container-1",
+		"container.id":                "001",
+		attributeECSDockerName:        "docker-container-1",
+		"container.image.name":        "nginx",
+		attributeContainerImageID:     "sha256:8cf1bfb43ff5d9b05af9b6b63983440f137",
+		"container.image.tag":         "v1.0",
+		attributeContainerCreatedAt:   "2020-07-30T22:12:29.837074927Z",
+		attributeContainerStartedAt:   "2020-07-30T22:12:31.153459485Z",
+		attributeContainerFinishedAt:  "2020-07-31T22:12:29.837074927Z",
+		attributeContainerKnownStatus: "STOPPED",
+	}
+
+	verifyAttributeMap(t, expected, attrMap)
+}
+
+func TestTaskResource(t *testing.T) {
+	tm := ecsutil.TaskMetadata{
+		Cluster:          "cluster-1",
+		TaskARN:          "arn:aws:ecs:us-west-2:111122223333:task/default/158d1c8083dd49d6b527399fd6414f5c",
+		Family:           "task-def-family-1",
+		Revision:         "v1.2",
+		AvailabilityZone: "us-west-2d",
+		PullStartedAt:    "2020-10-02T00:43:06.202617438Z",
+		PullStoppedAt:    "2020-10-02T00:43:06.31288465Z",
+		KnownStatus:      "RUNNING",
+		LaunchType:       "EC2",
+		ServiceName:      "MyService",
+	}
+	r := taskResource(tm)
+	require.NotNil(t, r)
+
+	attrMap := r.Attributes()
+	require.Equal(t, 15, attrMap.Len())
+	expected := map[string]any{
+		attributeECSCluster:           "cluster-1",
+		"aws.ecs.task.arn":            "arn:aws:ecs:us-west-2:111122223333:task/default/158d1c8083dd49d6b527399fd6414f5c",
+		attributeECSTaskID:            "158d1c8083dd49d6b527399fd6414f5c",
+		"aws.ecs.task.family":         "task-def-family-1",
+		attributeECSTaskRevision:      "v1.2",
+		"aws.ecs.task.revision":       "v1.2",
+		"cloud.availability_zone":     "us-west-2d",
+		attributeECSTaskPullStartedAt: "2020-10-02T00:43:06.202617438Z",
+		attributeECSTaskPullStoppedAt: "2020-10-02T00:43:06.31288465Z",
+		attributeECSTaskKnownStatus:   "RUNNING",
+		attributeECSTaskLaunchType:    "EC2",
+		"aws.ecs.launchtype":          "ec2",
+		"cloud.region":                "us-west-2",
+		"cloud.account.id":            "111122223333",
+		attributeECSServiceName:       "MyService",
+	}
+
+	verifyAttributeMap(t, expected, attrMap)
+}
+
+func TestTaskResourceWithClusterARN(t *testing.T) {
+	tm := ecsutil.TaskMetadata{
+		Cluster:          "arn:aws:ecs:us-west-2:803860917211:cluster/main-cluster",
+		TaskARN:          "arn:aws:ecs:us-west-2:803860917211:cluster/main-cluster/c8083dd49d6b527399fd6414",
+		Family:           "task-def-family-1",
+		Revision:         "v1.2",
+		AvailabilityZone: "us-west-2d",
+		PullStartedAt:    "2020-10-02T00:43:06.202617438Z",
+		PullStoppedAt:    "2020-10-02T00:43:06.31288465Z",
+		KnownStatus:      "RUNNING",
+		LaunchType:       "EC2",
+		ServiceName:      "MyService",
+	}
+	r := taskResource(tm)
+	require.NotNil(t, r)
+
+	attrMap := r.Attributes()
+	require.Equal(t, 15, attrMap.Len())
+
+	expected := map[string]any{
+		attributeECSCluster:           "main-cluster",
+		"aws.ecs.task.arn":            "arn:aws:ecs:us-west-2:803860917211:cluster/main-cluster/c8083dd49d6b527399fd6414",
+		attributeECSTaskID:            "c8083dd49d6b527399fd6414",
+		"aws.ecs.task.family":         "task-def-family-1",
+		attributeECSTaskRevision:      "v1.2",
+		"aws.ecs.task.revision":       "v1.2",
+		"cloud.availability_zone":     "us-west-2d",
+		attributeECSTaskPullStartedAt: "2020-10-02T00:43:06.202617438Z",
+		attributeECSTaskPullStoppedAt: "2020-10-02T00:43:06.31288465Z",
+		attributeECSTaskKnownStatus:   "RUNNING",
+		attributeECSTaskLaunchType:    "EC2",
+		"aws.ecs.launchtype":          "ec2",
+		"cloud.region":                "us-west-2",
+		"cloud.account.id":            "803860917211",
+		attributeECSServiceName:       "MyService",
+	}
+
+	verifyAttributeMap(t, expected, attrMap)
+}
+
+func verifyAttributeMap(t *testing.T, expected map[string]any, found pcommon.Map) {
+	for key, val := range expected {
+		attributeVal, found := found.Get(key)
+		require.True(t, found)
+
+		switch expectedVal := val.(type) {
+		case string:
+			require.Equal(t, expectedVal, attributeVal.Str())
+		case []string:
+			require.Equal(t, pcommon.ValueTypeSlice, attributeVal.Type())
+			require.Equal(t, len(expectedVal), attributeVal.Slice().Len())
+			for i, v := range expectedVal {
+				require.Equal(t, v, attributeVal.Slice().At(i).Str())
+			}
+		default:
+			t.Fatalf("unsupported type %T", expectedVal)
+		}
+	}
+}
+
+func TestGetResourceFromARN(t *testing.T) {
+	tests := []struct {
+		name            string
+		arn             string
+		expectedRegion  string
+		expectedAccount string
+		expectedTaskID  string
+	}{
+		{
+			name:            "new task arn format",
+			arn:             "arn:aws:ecs:us-west-2:803860917211:task/test200/d22aaa11bf0e4ab19c2c940a1cbabbee",
+			expectedRegion:  "us-west-2",
+			expectedAccount: "803860917211",
+			expectedTaskID:  "d22aaa11bf0e4ab19c2c940a1cbabbee",
+		},
+		{
+			name:            "old task arn format",
+			arn:             "arn:aws:ecs:us-west-2:803860917211:task/d22aaa11bf0e4ab19c2c940a1cbabbee",
+			expectedRegion:  "us-west-2",
+			expectedAccount: "803860917211",
+			expectedTaskID:  "d22aaa11bf0e4ab19c2c940a1cbabbee",
+		},
+		{
+			name: "empty arn",
+			arn:  "",
+		},
+		{
+			name: "non-ecs arn",
+			arn:  "notarn:aws:ecs:us-west-2:803860917211:task/test2",
+		},
+		{
+			// Regression test for #51810: an ARN with fewer than 5
+			// colon-separated segments must not panic.
+			name: "malformed arn with too few segments",
+			arn:  "arn:aws:ecs:us-east-1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var region, accountID, taskID string
+			require.NotPanics(t, func() {
+				region, accountID, taskID = getResourceFromARN(tt.arn)
+			})
+			require.Equal(t, tt.expectedRegion, region)
+			require.Equal(t, tt.expectedAccount, accountID)
+			require.Equal(t, tt.expectedTaskID, taskID)
+		})
+	}
+}
+
+func TestGetNameFromCluster(t *testing.T) {
+	clusterName := getNameFromCluster("arn:aws:ecs:region:012345678910:cluster/test")
+	require.Equal(t, "test", clusterName)
+
+	clusterName = getNameFromCluster("not-arn:aws:something/001")
+	require.Equal(t, "not-arn:aws:something/001", clusterName)
+
+	clusterName = getNameFromCluster("")
+	require.Empty(t, clusterName)
+}

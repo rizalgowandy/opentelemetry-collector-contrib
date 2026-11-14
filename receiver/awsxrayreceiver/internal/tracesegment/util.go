@@ -1,18 +1,7 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package tracesegment
+package tracesegment // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awsxrayreceiver/internal/tracesegment"
 
 import (
 	"bytes"
@@ -39,14 +28,14 @@ func SplitHeaderBody(buf []byte) (*Header, []byte, error) {
 	}
 
 	var headerBytes, bodyBytes []byte
-	loc := bytes.IndexByte(buf, byte(ProtocolSeparator))
-	if loc == -1 {
+	before, after, ok := bytes.Cut(buf, []byte{byte(ProtocolSeparator)})
+	if !ok {
 		return nil, nil, &recvErr.ErrRecoverable{
 			Err: fmt.Errorf("unable to split incoming data as header and segment, incoming bytes: %v", buf),
 		}
 	}
-	headerBytes = buf[0:loc]
-	bodyBytes = buf[loc+1:]
+	headerBytes = before
+	bodyBytes = after
 
 	header := Header{}
 	err := json.Unmarshal(headerBytes, &header)

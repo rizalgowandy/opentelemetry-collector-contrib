@@ -1,25 +1,14 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package splunk
+package splunk // import "github.com/open-telemetry/opentelemetry-collector-contrib/internal/splunk"
 
 import (
 	"fmt"
 	"strings"
 
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/conventions"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	conventions "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
 // HostIDKey represents a host identifier.
@@ -33,7 +22,7 @@ const (
 	// HostIDKeyAzure Azure HostIDKey.
 	HostIDKeyAzure HostIDKey = "azure_resource_id"
 	// HostIDKeyHost Host HostIDKey.
-	HostIDKeyHost HostIDKey = conventions.AttributeHostName
+	HostIDKeyHost HostIDKey = "host.name"
 )
 
 // HostID is a unique key and value (usually used as a dimension) to uniquely identify a host
@@ -47,7 +36,7 @@ type HostID struct {
 
 // ResourceToHostID returns a boolean determining whether or not a HostID was able to be
 // computed or not.
-func ResourceToHostID(res pdata.Resource) (HostID, bool) {
+func ResourceToHostID(res pcommon.Resource) (HostID, bool) {
 	var cloudAccount, hostID, provider string
 
 	attrs := res.Attributes()
@@ -56,23 +45,23 @@ func ResourceToHostID(res pdata.Resource) (HostID, bool) {
 		return HostID{}, false
 	}
 
-	if attr, ok := attrs.Get(conventions.AttributeCloudAccount); ok {
-		cloudAccount = attr.StringVal()
+	if attr, ok := attrs.Get(string(conventions.CloudAccountIDKey)); ok {
+		cloudAccount = attr.Str()
 	}
 
-	if attr, ok := attrs.Get(conventions.AttributeHostID); ok {
-		hostID = attr.StringVal()
+	if attr, ok := attrs.Get(string(conventions.HostIDKey)); ok {
+		hostID = attr.Str()
 	}
 
-	if attr, ok := attrs.Get(conventions.AttributeCloudProvider); ok {
-		provider = attr.StringVal()
+	if attr, ok := attrs.Get(string(conventions.CloudProviderKey)); ok {
+		provider = attr.Str()
 	}
 
 	switch provider {
-	case conventions.AttributeCloudProviderAWS:
+	case conventions.CloudProviderAWS.Value.AsString():
 		var region string
-		if attr, ok := attrs.Get(conventions.AttributeCloudRegion); ok {
-			region = attr.StringVal()
+		if attr, ok := attrs.Get(string(conventions.CloudRegionKey)); ok {
+			region = attr.Str()
 		}
 		if hostID == "" || region == "" || cloudAccount == "" {
 			break
@@ -81,7 +70,7 @@ func ResourceToHostID(res pdata.Resource) (HostID, bool) {
 			Key: HostIDKeyAWS,
 			ID:  fmt.Sprintf("%s_%s_%s", hostID, region, cloudAccount),
 		}, true
-	case conventions.AttributeCloudProviderGCP:
+	case conventions.CloudProviderGCP.Value.AsString():
 		if cloudAccount == "" || hostID == "" {
 			break
 		}
@@ -89,7 +78,7 @@ func ResourceToHostID(res pdata.Resource) (HostID, bool) {
 			Key: HostIDKeyGCP,
 			ID:  fmt.Sprintf("%s_%s", cloudAccount, hostID),
 		}, true
-	case conventions.AttributeCloudProviderAzure:
+	case conventions.CloudProviderAzure.Value.AsString():
 		if cloudAccount == "" {
 			break
 		}
@@ -103,28 +92,32 @@ func ResourceToHostID(res pdata.Resource) (HostID, bool) {
 		}, true
 	}
 
-	if attr, ok := attrs.Get(conventions.AttributeHostName); ok {
+	if attr, ok := attrs.Get(string(conventions.HostNameKey)); ok {
 		return HostID{
 			Key: HostIDKeyHost,
-			ID:  attr.StringVal(),
+			ID:  attr.Str(),
 		}, true
 	}
 
 	return HostID{}, false
 }
 
-func azureID(attrs pdata.AttributeMap, cloudAccount string) string {
+func azureID(attrs pcommon.Map, cloudAccount string) string {
+	// The azure detector emits either attribute name depending on whether the
+	// processor.azuredetector.RenameResourceGroupAttribute feature gate is enabled.
 	var resourceGroupName string
-	if attr, ok := attrs.Get("azure.resourcegroup.name"); ok {
-		resourceGroupName = attr.StringVal()
+	if attr, ok := attrs.Get("azure.resource_group.name"); ok {
+		resourceGroupName = attr.Str()
+	} else if attr, ok := attrs.Get("azure.resourcegroup.name"); ok {
+		resourceGroupName = attr.Str()
 	}
 	if resourceGroupName == "" {
 		return ""
 	}
 
 	var hostname string
-	if attr, ok := attrs.Get(conventions.AttributeHostName); ok {
-		hostname = attr.StringVal()
+	if attr, ok := attrs.Get("azure.vm.name"); ok {
+		hostname = attr.Str()
 	}
 	if hostname == "" {
 		return ""
@@ -132,7 +125,7 @@ func azureID(attrs pdata.AttributeMap, cloudAccount string) string {
 
 	var vmScaleSetName string
 	if attr, ok := attrs.Get("azure.vm.scaleset.name"); ok {
-		vmScaleSetName = attr.StringVal()
+		vmScaleSetName = attr.Str()
 	}
 	if vmScaleSetName == "" {
 		return strings.ToLower(fmt.Sprintf(

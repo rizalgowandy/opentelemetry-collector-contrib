@@ -1,0 +1,443 @@
+resourceMetrics:
+  - resource:
+      attributes:
+        - key: azuremonitor.subscription_id
+          value:
+            stringValue: subscriptionId1
+        - key: azuremonitor.tenant_id
+          value:
+            stringValue: fake-tenant-id
+    scopeMetrics:
+      - metrics:
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId1
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric1_total
+            unit: "%"
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId1
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric2_count
+            unit: "{count}"
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId1
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric2_total
+            unit: "{count}"
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId2
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric3_minimum
+            unit: By
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId2
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric3_total
+            unit: By
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId2
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric3_maximum
+            unit: By
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId1
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric1_average
+            unit: "%"
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId1
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric1_maximum
+            unit: "%"
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId1
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric2_average
+            unit: "{count}"
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId1
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric2_maximum
+            unit: "{count}"
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId2
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric3_count
+            unit: By
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId1
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric1_count
+            unit: "%"
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId1
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric1_minimum
+            unit: "%"
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId1
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric2_minimum
+            unit: "{count}"
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId1/resourceGroups/group1/resourceId2
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric3_average
+            unit: By
+        scope:
+          name: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/azuremonitorreceiver
+          version: latest
+  - resource:
+      attributes:
+        - key: azuremonitor.subscription_id
+          value:
+            stringValue: subscriptionId3
+        - key: azuremonitor.tenant_id
+          value:
+            stringValue: fake-tenant-id
+    scopeMetrics:
+      - metrics:
+          - gauge:
+              dataPoints:
+                - asDouble: 1
+                  attributes:
+                    - key: azuremonitor.resource_id
+                      value:
+                        stringValue: /subscriptions/subscriptionId3/resourceGroups/group1/resourceId1
+                    - key: location
+                      value:
+                        stringValue: location1
+                    - key: name
+                      value:
+                        stringValue: name1
+                    - key: resource_group
+                      value:
+                        stringValue: group1
+                    - key: timegrain
+                      value:
+                        stringValue: PT1M
+                    - key: type
+                      value:
+                        stringValue: type1
+                  startTimeUnixNano: "2000000"
+                  timeUnixNano: "1000000"
+            name: azure_metric7_total
+            unit: bit/s
+        scope:
+          name: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/azuremonitorreceiver
+          version: latest

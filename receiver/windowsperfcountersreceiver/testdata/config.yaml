@@ -1,29 +1,135 @@
-receivers:
-  windowsperfcounters:
-    perfcounters:
-      - object: "object"
-        counters:
-          - "counter"
-  windowsperfcounters/customname:
-    collection_interval: 30s
-    perfcounters:
-      - object: "object1"
-        counters:
-          - "counter1"
-      - object: "object2"
-        counters:
-          - "counter1"
-          - "counter2"
+windows_perf_counters:
+  metrics:
+    metric:
+      description: desc
+      unit: "1"
+      gauge:
+  perfcounters:
+    - object: "object"
+      counters:
+        - name: counter1
+          metric: metric
 
-processors:
-  nop:
+windows_perf_counters/customname:
+  metrics:
+    metric:
+      description: desc
+      unit: "1"
+      gauge:
+    metric2:
+      description: desc
+      unit: "1"
+      gauge:
+  collection_interval: 30s
+  perfcounters:
+    - object: object1
+      instances: ["*", "_Global_"]
+      aggregation_name: "_Global_"
+      counters:
+        - name: counter1
+          metric: metric
+    - object: object2
+      counters:
+        - name: counter1
+          metric: metric
+        - name: counter2
+          metric: metric2
 
-exporters:
-  nop:
+windows_perf_counters/nometricspecified:
+  metrics:
+    metric:
+      description: desc
+      unit: "1"
+      gauge:
+  perfcounters:
+    - object: "object"
+      counters:
+        - name: counter1
 
-service:
-  pipelines:
-    metrics:
-      receivers: [windowsperfcounters]
-      processors: [nop]
-      exporters: [nop]
+windows_perf_counters/unspecifiedmetrictype:
+  metrics:
+    metric:
+      description: desc
+      unit: "1"
+  perfcounters:
+    - object: "object"
+      counters:
+        - name: counter1
+          metric: metric
+
+windows_perf_counters/summetric:
+  metrics:
+    metric:
+      description: desc
+      unit: "1"
+      sum:
+        aggregation: cumulative
+  perfcounters:
+    - object: "object"
+      counters:
+        - name: counter1
+          metric: metric
+
+windows_perf_counters/nometrics:
+  perfcounters:
+    - object: "object"
+      counters:
+        - name: counter1
+
+windows_perf_counters/allerrors:
+  collection_interval: -1m
+  perfcounters:
+    -
+    - object: "object"
+      instances: [ "instance", "", "*" ]
+
+windows_perf_counters/emptyinstance:
+  metrics:
+    metric:
+      description: desc
+      unit: "1"
+      gauge:
+  perfcounters:
+    - object: "object"
+      instances: [ "" ]
+      counters:
+        - name: counter
+          metric: metric
+
+windows_perf_counters/negative-collection-interval:
+  metrics:
+    metric:
+      description: desc
+      unit: "1"
+      gauge:
+  collection_interval: -1m
+  perfcounters:
+    - object: "object"
+      counters:
+        - name: counter1
+          metric: metric
+
+windows_perf_counters/nocounters:
+  metrics:
+    metric:
+      description: desc
+      unit: "1"
+      gauge:
+  perfcounters:
+    - object: "object"
+
+windows_perf_counters/noobjectname:
+  metrics:
+    metric:
+      description: desc
+      unit: "1"
+      gauge:
+  perfcounters:
+    - counters:
+
+windows_perf_counters/noperfcounters:
+  metrics:
+    metric:
+      description: desc
+      unit: "1"
+      gauge:

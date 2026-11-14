@@ -1,0 +1,37 @@
+default:
+all_set:
+  metrics:
+    tlscheck.time_left:
+      enabled: true
+      attributes: ["tlscheck.x509.issuer","tlscheck.x509.cn","tlscheck.x509.san","tlscheck.x509.fingerprint"]
+  resource_attributes:
+    tlscheck.target:
+      enabled: true
+reaggregate_set:
+  metrics:
+    tlscheck.time_left:
+      enabled: true
+      attributes: []
+  resource_attributes:
+    tlscheck.target:
+      enabled: true
+none_set:
+  metrics:
+    tlscheck.time_left:
+      enabled: false
+      attributes: ["tlscheck.x509.issuer","tlscheck.x509.cn","tlscheck.x509.san","tlscheck.x509.fingerprint"]
+  resource_attributes:
+    tlscheck.target:
+      enabled: false
+filter_set_include:
+  resource_attributes:
+    tlscheck.target:
+      enabled: true
+      metrics_include:
+        - regexp: ".*"
+filter_set_exclude:
+  resource_attributes:
+    tlscheck.target:
+      enabled: true
+      metrics_exclude:
+        - strict: "tlscheck.target-val"

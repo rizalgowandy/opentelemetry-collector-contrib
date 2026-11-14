@@ -1,0 +1,939 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package cloudflarereceiver
+
+import (
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/textproto"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/config/configtls"
+	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/consumer/consumererror"
+	"go.opentelemetry.io/collector/consumer/consumertest"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/receiver/receivertest"
+	"go.uber.org/zap/zaptest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/common/testutil"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatatest/plogtest"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/cloudflarereceiver/internal/metadata"
+)
+
+func TestPayloadToLogRecord(t *testing.T) {
+	now := time.Time{}
+
+	testCases := []struct {
+		name            string
+		payload         string
+		timestampFormat string
+		expectedLogs    func(*testing.T, string) plog.Logs
+		expectedErr     string
+	}{
+		{
+			name: "limited records",
+			payload: `{ "ClientIP": "89.163.253.200", "ClientRequestHost": "www.theburritobot0.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "2023-03-03T05:30:05Z", "EdgeResponseBytes": 69045, "EdgeResponseStatus": 200, "EdgeStartTimestamp": "2023-03-03T05:29:05Z", "RayID": "3a6050bcbe121a87" }
+{ "ClientIP": "89.163.253.201", "ClientRequestHost": "www.theburritobot1.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "2023-03-03T05:30:05Z", "EdgeResponseBytes": 69045, "EdgeResponseStatus": 200, "EdgeStartTimestamp": "2023-03-03T05:29:05Z", "RayID": "3a6050bcbe121a87" }`,
+			timestampFormat: "rfc3339",
+			expectedLogs: func(t *testing.T, payload string) plog.Logs {
+				logs := plog.NewLogs()
+				rl := logs.ResourceLogs().AppendEmpty()
+				sl := rl.ScopeLogs().AppendEmpty()
+				sl.Scope().SetName("github.com/open-telemetry/opentelemetry-collector-contrib/receiver/cloudflarereceiver")
+
+				for idx, line := range strings.Split(payload, "\n") {
+					lr := sl.LogRecords().AppendEmpty()
+
+					require.NoError(t, lr.Attributes().FromRaw(map[string]any{
+						"http_request.client_ip": fmt.Sprintf("89.163.253.%d", 200+idx),
+					}))
+
+					lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(now))
+					ts, _ := time.Parse(time.RFC3339, "2023-03-03T05:29:05Z")
+					lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					lr.SetSeverityNumber(plog.SeverityNumberInfo)
+					lr.SetSeverityText(plog.SeverityNumberInfo.String())
+
+					var log map[string]any
+					err := json.Unmarshal([]byte(line), &log)
+					require.NoError(t, err)
+
+					payloadToExpectedBody(t, line, lr)
+				}
+
+				return logs
+			},
+		},
+
+		{
+			name:            "all fields",
+			payload:         `{"RayID":"7a1f7ad4df2f870a","EdgeStartTimestamp":"2023-03-03T05:29:06Z","CacheCacheStatus":"dynamic","CacheReserveUsed":false,"CacheResponseBytes":9247,"CacheResponseStatus":401,"CacheTieredFill":false,"ClientASN":20115,"ClientCountry":"us","ClientDeviceType":"desktop","ClientIP":"47.35.104.49","ClientIPClass":"noRecord","ClientMTLSAuthCertFingerprint":"","ClientMTLSAuthStatus":"unknown","ClientRegionCode":"MI","ClientRequestBytes":2667,"ClientRequestHost":"www.theburritobot2.com","ClientRequestMethod":"GET","ClientRequestPath":"/product/66VCHSJNUP","ClientRequestProtocol":"HTTP/2","ClientRequestReferer":"https://www.theburritobot2.com/","ClientRequestScheme":"https","ClientRequestSource":"eyeball","ClientRequestURI":"/product/66VCHSJNUP","ClientRequestUserAgent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36","ClientSSLCipher":"AEAD-AES128-GCM-SHA256","ClientSSLProtocol":"TLSv1.3","ClientSrcPort":49358,"ClientTCPRTTMs":18,"ClientXRequestedWith":"","ContentScanObjResults":[],"ContentScanObjTypes":[],"Cookies":{},"EdgeCFConnectingO2O":false,"EdgeColoCode":"ORD","EdgeColoID":398,"EdgeEndTimestamp":"2023-03-03T05:29:06Z","EdgePathingOp":"wl","EdgePathingSrc":"macro","EdgePathingStatus":"nr","EdgeRateLimitAction":"","EdgeRateLimitID":0,"EdgeRequestHost":"www.theburritobot2.com","EdgeResponseBodyBytes":1963,"EdgeResponseBytes":2301,"EdgeResponseCompressionRatio":2.54,"EdgeResponseContentType":"text/html","EdgeResponseStatus":401,"EdgeServerIP":"172.70.131.84","EdgeTimeToFirstByteMs":28,"FirewallMatchesActions":[],"FirewallMatchesRuleIDs":[],"FirewallMatchesSources":[],"OriginDNSResponseTimeMs":0,"OriginIP":"35.223.103.128","OriginRequestHeaderSendDurationMs":0,"OriginResponseBytes":0,"OriginResponseDurationMs":22,"OriginResponseHTTPExpires":"","OriginResponseHTTPLastModified":"","OriginResponseHeaderReceiveDurationMs":21,"OriginResponseStatus":401,"OriginResponseTime":22000000,"OriginSSLProtocol":"none","OriginTCPHandshakeDurationMs":0,"OriginTLSHandshakeDurationMs":0,"ParentRayID":"00","RequestHeaders":{},"ResponseHeaders":{},"SecurityLevel":"med","SmartRouteColoID":0,"UpperTierColoID":0,"WAFAction":"unknown","WAFAttackScore":0,"WAFFlags":"0","WAFMatchedVar":"","WAFProfile":"unknown","WAFRCEAttackScore":0,"WAFRuleID":"","WAFRuleMessage":"","WAFSQLiAttackScore":0,"WAFXSSAttackScore":0,"WorkerCPUTime":0,"WorkerStatus":"unknown","WorkerSubrequest":false,"WorkerSubrequestCount":0,"WorkerWallTimeUs":0,"ZoneName":"otlpdev.net"}`,
+			timestampFormat: "rfc3339",
+			expectedLogs: func(t *testing.T, payload string) plog.Logs {
+				logs := plog.NewLogs()
+				rl := logs.ResourceLogs().AppendEmpty()
+
+				require.NoError(t, rl.Resource().Attributes().FromRaw(map[string]any{
+					"cloudflare.zone": "otlpdev.net",
+				}))
+
+				sl := rl.ScopeLogs().AppendEmpty()
+				sl.Scope().SetName("github.com/open-telemetry/opentelemetry-collector-contrib/receiver/cloudflarereceiver")
+				lr := sl.LogRecords().AppendEmpty()
+
+				require.NoError(t, lr.Attributes().FromRaw(map[string]any{
+					"http_request.client_ip": "47.35.104.49",
+				}))
+
+				lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(now))
+				ts, _ := time.Parse(time.RFC3339, "2023-03-03T05:29:06Z")
+				lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+				lr.SetSeverityNumber(plog.SeverityNumberWarn)
+				lr.SetSeverityText(plog.SeverityNumberWarn.String())
+
+				var log map[string]any
+				err := json.Unmarshal([]byte(payload), &log)
+				require.NoError(t, err)
+
+				payloadToExpectedBody(t, payload, lr)
+
+				return logs
+			},
+		},
+		{
+			name: "limited records nanosecond precision",
+			payload: `{ "ClientIP": "89.163.253.200", "ClientRequestHost": "www.theburritobot0.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "1677831006123456789", "EdgeResponseBytes": 69045, "EdgeResponseStatus": 200, "EdgeStartTimestamp": "1677830946123456789", "RayID": "3a6050bcbe121a87" }
+{ "ClientIP": "89.163.253.201", "ClientRequestHost": "www.theburritobot1.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "1677831006123456789", "EdgeResponseBytes": 69045, "EdgeResponseStatus": 200, "EdgeStartTimestamp": "1677830946123456789", "RayID": "3a6050bcbe121a87" }`,
+			timestampFormat: "unixnano",
+			expectedLogs: func(t *testing.T, payload string) plog.Logs {
+				logs := plog.NewLogs()
+				rl := logs.ResourceLogs().AppendEmpty()
+				sl := rl.ScopeLogs().AppendEmpty()
+				sl.Scope().SetName("github.com/open-telemetry/opentelemetry-collector-contrib/receiver/cloudflarereceiver")
+
+				for idx, line := range strings.Split(payload, "\n") {
+					lr := sl.LogRecords().AppendEmpty()
+
+					require.NoError(t, lr.Attributes().FromRaw(map[string]any{
+						"http_request.client_ip": fmt.Sprintf("89.163.253.%d", 200+idx),
+					}))
+
+					lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(now))
+					ts := time.Unix(0, 1677830946123456789)
+					lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+					lr.SetSeverityNumber(plog.SeverityNumberInfo)
+					lr.SetSeverityText(plog.SeverityNumberInfo.String())
+
+					var log map[string]any
+					err := json.Unmarshal([]byte(line), &log)
+					require.NoError(t, err)
+
+					payloadToExpectedBody(t, line, lr)
+				}
+
+				return logs
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{
+				Logs: LogsConfig{
+					Endpoint:           "localhost:0",
+					MaxRequestBodySize: 1024,
+					TLS:                &configtls.ServerConfig{},
+					TimestampField:     "EdgeStartTimestamp",
+					TimestampFormat:    tc.timestampFormat,
+					Attributes: map[string]string{
+						"ClientIP": "http_request.client_ip",
+					},
+				},
+			}
+			recv := newReceiver(t, cfg, &consumertest.LogsSink{})
+			var logs plog.Logs
+			rawLogs, err := parsePayload([]byte(tc.payload))
+			if err == nil {
+				logs = recv.processLogs(pcommon.NewTimestampFromTime(time.Now()), rawLogs)
+			}
+			if tc.expectedErr != "" {
+				require.Error(t, err)
+				require.Nil(t, logs)
+				require.ErrorContains(t, err, tc.expectedErr)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, logs)
+				require.NoError(t, plogtest.CompareLogs(tc.expectedLogs(t, tc.payload), logs, plogtest.IgnoreObservedTimestamp()))
+			}
+		})
+	}
+}
+
+func payloadToExpectedBody(t *testing.T, payload string, lr plog.LogRecord) {
+	var body map[string]any
+	err := json.Unmarshal([]byte(payload), &body)
+	require.NoError(t, err)
+	require.NoError(t, lr.Body().SetEmptyMap().FromRaw(body))
+}
+
+func TestSeverityParsing(t *testing.T) {
+	testCases := []struct {
+		statusCode int64
+		s          plog.SeverityNumber
+	}{
+		{
+			statusCode: 200,
+			s:          plog.SeverityNumberInfo,
+		},
+		{
+			statusCode: 300,
+			s:          plog.SeverityNumberInfo2,
+		},
+		{
+			statusCode: 400,
+			s:          plog.SeverityNumberWarn,
+		},
+		{
+			statusCode: 501,
+			s:          plog.SeverityNumberError,
+		},
+		{
+			statusCode: 999,
+			s:          plog.SeverityNumberUnspecified,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%d -> %s", tc.statusCode, tc.s.String()), func(t *testing.T) {
+			require.Equal(t, tc.s, severityFromStatusCode(tc.statusCode))
+		})
+	}
+}
+
+func TestHandleRequest(t *testing.T) {
+	testCases := []struct {
+		name               string
+		cfg                *Config
+		request            *http.Request
+		expectedStatusCode int
+		logExpected        bool
+		consumerFailure    bool
+		permanentFailure   bool // indicates a permanent error
+	}{
+		{
+			name: "No secret provided",
+			request: &http.Request{
+				Method: http.MethodPost,
+				URL:    &url.URL{},
+				Body:   io.NopCloser(bytes.NewBufferString(`{"ClientIP": "127.0.0.1"}`)),
+			},
+			logExpected:        false,
+			consumerFailure:    false,
+			expectedStatusCode: http.StatusUnauthorized,
+		},
+		{
+			name: "Invalid payload",
+			request: &http.Request{
+				Method: http.MethodPost,
+				URL:    &url.URL{},
+				Body:   io.NopCloser(bytes.NewBufferString(`{"ClientIP": "127.0.0.1"`)),
+				Header: map[string][]string{
+					textproto.CanonicalMIMEHeaderKey(secretHeaderName): {"abc123"},
+				},
+			},
+			logExpected:        false,
+			consumerFailure:    false,
+			expectedStatusCode: http.StatusUnprocessableEntity,
+		},
+		{
+			name: "Consumer fails",
+			request: &http.Request{
+				Method: http.MethodPost,
+				URL:    &url.URL{},
+				Body:   io.NopCloser(bytes.NewBufferString(`{"ClientIP": "127.0.0.1"}`)),
+				Header: map[string][]string{
+					textproto.CanonicalMIMEHeaderKey(secretHeaderName): {"abc123"},
+				},
+			},
+			logExpected:        false,
+			consumerFailure:    true,
+			expectedStatusCode: http.StatusServiceUnavailable,
+		},
+		{
+			name: "Consumer fails - permanent error",
+			request: &http.Request{
+				Method: http.MethodPost,
+				URL:    &url.URL{},
+				Body:   io.NopCloser(bytes.NewBufferString(`{"ClientIP": "127.0.0.1"}`)),
+				Header: map[string][]string{
+					textproto.CanonicalMIMEHeaderKey(secretHeaderName): {"abc123"},
+				},
+			},
+			logExpected:        false,
+			consumerFailure:    true,
+			permanentFailure:   true,
+			expectedStatusCode: http.StatusBadRequest,
+		},
+		{
+			name: "Request succeeds",
+			request: &http.Request{
+				Method: http.MethodPost,
+				URL:    &url.URL{},
+				Body:   io.NopCloser(bytes.NewBufferString(`{"ClientIP": "127.0.0.1", "MyTimestamp": "2023-03-03T05:29:06Z"}`)),
+				Header: map[string][]string{
+					textproto.CanonicalMIMEHeaderKey(secretHeaderName): {"abc123"},
+				},
+			},
+			logExpected:        true,
+			consumerFailure:    false,
+			expectedStatusCode: http.StatusOK,
+		},
+		{
+			name: "Request succeeds with gzip",
+			request: &http.Request{
+				Method: http.MethodPost,
+				URL:    &url.URL{},
+				Body:   io.NopCloser(bytes.NewBufferString(gzippedMessage(`{"ClientIP": "127.0.0.1", "MyTimestamp": "2023-03-03T05:29:06Z"}`))),
+				Header: map[string][]string{
+					textproto.CanonicalMIMEHeaderKey(secretHeaderName):   {"abc123"},
+					textproto.CanonicalMIMEHeaderKey("Content-Encoding"): {"gzip"},
+					textproto.CanonicalMIMEHeaderKey("Content-Type"):     {"text/plain; charset=utf-8"},
+				},
+			},
+			logExpected:        true,
+			consumerFailure:    false,
+			expectedStatusCode: http.StatusOK,
+		},
+		{
+			name: "Request fails to unzip gzip",
+			request: &http.Request{
+				Method: http.MethodPost,
+				URL:    &url.URL{},
+				Body:   io.NopCloser(bytes.NewBufferString(`thisisnotvalidzippedcontent`)),
+				Header: map[string][]string{
+					textproto.CanonicalMIMEHeaderKey(secretHeaderName):   {"abc123"},
+					textproto.CanonicalMIMEHeaderKey("Content-Encoding"): {"gzip"},
+					textproto.CanonicalMIMEHeaderKey("Content-Type"):     {"text/plain; charset=utf-8"},
+				},
+			},
+			logExpected:        false,
+			consumerFailure:    false,
+			expectedStatusCode: http.StatusUnprocessableEntity,
+		},
+		{
+			name: "test message passes",
+			request: &http.Request{
+				Method: http.MethodPost,
+				URL:    &url.URL{},
+				Body:   io.NopCloser(bytes.NewBufferString(`test`)),
+				Header: map[string][]string{
+					textproto.CanonicalMIMEHeaderKey(secretHeaderName): {"abc123"},
+				},
+			},
+			logExpected:        false,
+			consumerFailure:    false,
+			expectedStatusCode: http.StatusOK,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var consumer consumer.Logs
+			if tc.consumerFailure {
+				consumer = consumertest.NewErr(errors.New("consumer failed"))
+				if tc.permanentFailure {
+					consumer = consumertest.NewErr(consumererror.NewPermanent(errors.New("consumer failed")))
+				}
+			} else {
+				consumer = &consumertest.LogsSink{}
+			}
+
+			r := newReceiver(t, &Config{
+				Logs: LogsConfig{
+					Endpoint:       "localhost:0",
+					Secret:         "abc123",
+					TimestampField: "MyTimestamp",
+					Attributes: map[string]string{
+						"ClientIP": "http_request.client_ip",
+					},
+					TLS:                &configtls.ServerConfig{},
+					MaxRequestBodySize: 1024,
+				},
+			},
+				consumer,
+			)
+
+			rec := httptest.NewRecorder()
+			r.handleRequest(rec, tc.request)
+
+			assert.Equal(t, tc.expectedStatusCode, rec.Code, "Status codes are not equal")
+
+			if !tc.consumerFailure {
+				if tc.logExpected {
+					assert.Equal(t, 1, consumer.(*consumertest.LogsSink).LogRecordCount(), "Did not receive log record")
+				} else {
+					assert.Equal(t, 0, consumer.(*consumertest.LogsSink).LogRecordCount(), "Received log record when it should have been dropped")
+				}
+			}
+		})
+	}
+}
+
+func TestEmptyAttributes(t *testing.T) {
+	now := time.Time{}
+
+	testCases := []struct {
+		name       string
+		payload    string
+		attributes map[string]string
+	}{
+		{
+			name: "Empty Attributes Map",
+			payload: `{ "ClientIP": "89.163.253.200", "ClientRequestHost": "www.theburritobot0.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "2023-03-03T05:30:05Z", "EdgeResponseBytes": "69045", "EdgeResponseStatus": "200", "EdgeStartTimestamp": "2023-03-03T05:29:05Z", "RayID": "3a6050bcbe121a87", "RequestHeaders": { "Content-Type": "application/json" } }
+{ "ClientIP" : "89.163.253.201", "ClientRequestHost": "www.theburritobot1.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "2023-03-03T05:30:05Z", "EdgeResponseBytes": "69045", "EdgeResponseStatus": "200", "EdgeStartTimestamp": "2023-03-03T05:29:05Z", "RayID": "3a6050bcbe121a87", "RequestHeaders": { "Content-Type": "application/json" } }`,
+			attributes: map[string]string{},
+		},
+		{
+			name: "nil Attributes",
+			payload: `{ "ClientIP": "89.163.253.200", "ClientRequestHost": "www.theburritobot0.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "2023-03-03T05:30:05Z", "EdgeResponseBytes": "69045", "EdgeResponseStatus": "200", "EdgeStartTimestamp": "2023-03-03T05:29:05Z", "RayID": "3a6050bcbe121a87", "RequestHeaders": { "Content-Type": "application/json" } }
+{ "ClientIP" : "89.163.253.201", "ClientRequestHost": "www.theburritobot1.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "2023-03-03T05:30:05Z", "EdgeResponseBytes": "69045", "EdgeResponseStatus": "200", "EdgeStartTimestamp": "2023-03-03T05:29:05Z", "RayID": "3a6050bcbe121a87", "RequestHeaders": { "Content-Type": "application/json" } }`,
+			attributes: nil,
+		},
+	}
+
+	expectedLogs := func(t *testing.T, payload string) plog.Logs {
+		logs := plog.NewLogs()
+		rl := logs.ResourceLogs().AppendEmpty()
+		sl := rl.ScopeLogs().AppendEmpty()
+		sl.Scope().SetName("github.com/open-telemetry/opentelemetry-collector-contrib/receiver/cloudflarereceiver")
+
+		for idx, line := range strings.Split(payload, "\n") {
+			lr := sl.LogRecords().AppendEmpty()
+
+			require.NoError(t, lr.Attributes().FromRaw(map[string]any{
+				"ClientIP":                    fmt.Sprintf("89.163.253.%d", 200+idx),
+				"ClientRequestHost":           fmt.Sprintf("www.theburritobot%d.com", idx),
+				"ClientRequestMethod":         "GET",
+				"ClientRequestURI":            "/static/img/testimonial-hipster.png",
+				"EdgeEndTimestamp":            "2023-03-03T05:30:05Z",
+				"EdgeResponseBytes":           "69045",
+				"EdgeResponseStatus":          "200",
+				"EdgeStartTimestamp":          "2023-03-03T05:29:05Z",
+				"RayID":                       "3a6050bcbe121a87",
+				"RequestHeaders.Content_Type": "application/json",
+			}))
+
+			lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(now))
+			ts, err := time.Parse(time.RFC3339, "2023-03-03T05:29:05Z")
+			require.NoError(t, err)
+			lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+			lr.SetSeverityNumber(plog.SeverityNumberInfo)
+			lr.SetSeverityText(plog.SeverityNumberInfo.String())
+
+			var log map[string]any
+			err = json.Unmarshal([]byte(line), &log)
+			require.NoError(t, err)
+
+			payloadToExpectedBody(t, line, lr)
+		}
+		return logs
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			recv := newReceiver(t, &Config{
+				Logs: LogsConfig{
+					Endpoint:           "localhost:0",
+					TLS:                &configtls.ServerConfig{},
+					MaxRequestBodySize: 1024,
+					TimestampField:     "EdgeStartTimestamp",
+					Attributes:         tc.attributes,
+					Separator:          ".",
+				},
+			},
+				&consumertest.LogsSink{},
+			)
+			var logs plog.Logs
+			rawLogs, err := parsePayload([]byte(tc.payload))
+			if err == nil {
+				logs = recv.processLogs(pcommon.NewTimestampFromTime(time.Now()), rawLogs)
+			}
+			require.NoError(t, err)
+			require.NotNil(t, logs)
+			require.NoError(t, plogtest.CompareLogs(expectedLogs(t, tc.payload), logs, plogtest.IgnoreObservedTimestamp()))
+		})
+	}
+}
+
+func TestAttributesWithSeparator(t *testing.T) {
+	now := time.Time{}
+
+	testCases := []struct {
+		name       string
+		payload    string
+		attributes map[string]string
+		separator  string
+	}{
+		{
+			name: "Empty Attributes Map",
+			payload: `{ "ClientIP": "89.163.253.200", "ClientRequestHost": "www.theburritobot0.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "2023-03-03T05:30:05Z", "EdgeResponseBytes": "69045", "EdgeResponseStatus": "200", "EdgeStartTimestamp": "2023-03-03T05:29:05Z", "RayID": "3a6050bcbe121a87", "RequestHeaders": { "Content-Type": "application/json" } }
+{ "ClientIP" : "89.163.253.201", "ClientRequestHost": "www.theburritobot1.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "2023-03-03T05:30:05Z", "EdgeResponseBytes": "69045", "EdgeResponseStatus": "200", "EdgeStartTimestamp": "2023-03-03T05:29:05Z", "RayID": "3a6050bcbe121a87", "RequestHeaders": { "Content-Type": "application/json" } }`,
+			attributes: map[string]string{},
+			separator:  ".",
+		},
+		{
+			name: "nil Attributes",
+			payload: `{ "ClientIP": "89.163.253.200", "ClientRequestHost": "www.theburritobot0.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "2023-03-03T05:30:05Z", "EdgeResponseBytes": "69045", "EdgeResponseStatus": "200", "EdgeStartTimestamp": "2023-03-03T05:29:05Z", "RayID": "3a6050bcbe121a87", "RequestHeaders": { "Content-Type": "application/json" } }
+{ "ClientIP" : "89.163.253.201", "ClientRequestHost": "www.theburritobot1.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "2023-03-03T05:30:05Z", "EdgeResponseBytes": "69045", "EdgeResponseStatus": "200", "EdgeStartTimestamp": "2023-03-03T05:29:05Z", "RayID": "3a6050bcbe121a87", "RequestHeaders": { "Content-Type": "application/json" } }`,
+			attributes: nil,
+			separator:  "_test_",
+		},
+	}
+
+	expectedLogs := func(t *testing.T, payload, separator string) plog.Logs {
+		logs := plog.NewLogs()
+		rl := logs.ResourceLogs().AppendEmpty()
+		sl := rl.ScopeLogs().AppendEmpty()
+		sl.Scope().SetName("github.com/open-telemetry/opentelemetry-collector-contrib/receiver/cloudflarereceiver")
+
+		for idx, line := range strings.Split(payload, "\n") {
+			lr := sl.LogRecords().AppendEmpty()
+
+			require.NoError(t, lr.Attributes().FromRaw(map[string]any{
+				"ClientIP":            fmt.Sprintf("89.163.253.%d", 200+idx),
+				"ClientRequestHost":   fmt.Sprintf("www.theburritobot%d.com", idx),
+				"ClientRequestMethod": "GET",
+				"ClientRequestURI":    "/static/img/testimonial-hipster.png",
+				"EdgeEndTimestamp":    "2023-03-03T05:30:05Z",
+				"EdgeResponseBytes":   "69045",
+				"EdgeResponseStatus":  "200",
+				"EdgeStartTimestamp":  "2023-03-03T05:29:05Z",
+				"RayID":               "3a6050bcbe121a87",
+				fmt.Sprintf("RequestHeaders%sContent_Type", separator): "application/json",
+			}))
+
+			lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(now))
+			ts, err := time.Parse(time.RFC3339, "2023-03-03T05:29:05Z")
+			require.NoError(t, err)
+			lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+			lr.SetSeverityNumber(plog.SeverityNumberInfo)
+			lr.SetSeverityText(plog.SeverityNumberInfo.String())
+
+			var log map[string]any
+			err = json.Unmarshal([]byte(line), &log)
+			require.NoError(t, err)
+
+			payloadToExpectedBody(t, line, lr)
+		}
+		return logs
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			recv := newReceiver(t, &Config{
+				Logs: LogsConfig{
+					Endpoint:           "localhost:0",
+					TLS:                &configtls.ServerConfig{},
+					MaxRequestBodySize: 1024,
+					TimestampField:     "EdgeStartTimestamp",
+					Attributes:         tc.attributes,
+					Separator:          tc.separator,
+				},
+			},
+				&consumertest.LogsSink{},
+			)
+			var logs plog.Logs
+			rawLogs, err := parsePayload([]byte(tc.payload))
+			if err == nil {
+				logs = recv.processLogs(pcommon.NewTimestampFromTime(time.Now()), rawLogs)
+			}
+			require.NoError(t, err)
+			require.NotNil(t, logs)
+			require.NoError(t, plogtest.CompareLogs(expectedLogs(t, tc.payload, tc.separator), logs, plogtest.IgnoreObservedTimestamp()))
+		})
+	}
+}
+
+func TestMultipleMapAttributes(t *testing.T) {
+	now := time.Time{}
+
+	testCases := []struct {
+		name       string
+		payload    string
+		attributes map[string]string
+	}{
+		{
+			name: "Multi Map Attributes",
+			payload: `{ "ClientIP": "89.163.253.200", "ClientRequestHost": "www.theburritobot0.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "2023-03-03T05:30:05Z", "EdgeResponseBytes": "69045", "EdgeResponseStatus": "200", "EdgeStartTimestamp": "2023-03-03T05:29:05Z", "RayID": "3a6050bcbe121a87", "RequestHeaders": { "Cookie-new": { "x-m2-new": "sensitive" } } }
+{ "ClientIP" : "89.163.253.201", "ClientRequestHost": "www.theburritobot1.com", "ClientRequestMethod": "GET", "ClientRequestURI": "/static/img/testimonial-hipster.png", "EdgeEndTimestamp": "2023-03-03T05:30:05Z", "EdgeResponseBytes": "69045", "EdgeResponseStatus": "200", "EdgeStartTimestamp": "2023-03-03T05:29:05Z", "RayID": "3a6050bcbe121a87", "RequestHeaders": { "Cookie-new": { "x-m2-new": "sensitive" } } }`,
+			attributes: map[string]string{},
+		},
+	}
+
+	expectedLogs := func(t *testing.T, payload string) plog.Logs {
+		logs := plog.NewLogs()
+		rl := logs.ResourceLogs().AppendEmpty()
+		sl := rl.ScopeLogs().AppendEmpty()
+		sl.Scope().SetName("github.com/open-telemetry/opentelemetry-collector-contrib/receiver/cloudflarereceiver")
+
+		for idx, line := range strings.Split(payload, "\n") {
+			lr := sl.LogRecords().AppendEmpty()
+
+			require.NoError(t, lr.Attributes().FromRaw(map[string]any{
+				"ClientIP":                           fmt.Sprintf("89.163.253.%d", 200+idx),
+				"ClientRequestHost":                  fmt.Sprintf("www.theburritobot%d.com", idx),
+				"ClientRequestMethod":                "GET",
+				"ClientRequestURI":                   "/static/img/testimonial-hipster.png",
+				"EdgeEndTimestamp":                   "2023-03-03T05:30:05Z",
+				"EdgeResponseBytes":                  "69045",
+				"EdgeResponseStatus":                 "200",
+				"EdgeStartTimestamp":                 "2023-03-03T05:29:05Z",
+				"RayID":                              "3a6050bcbe121a87",
+				"RequestHeaders.Cookie_new.x_m2_new": "sensitive",
+			}))
+
+			lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(now))
+			ts, err := time.Parse(time.RFC3339, "2023-03-03T05:29:05Z")
+			require.NoError(t, err)
+			lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
+			lr.SetSeverityNumber(plog.SeverityNumberInfo)
+			lr.SetSeverityText(plog.SeverityNumberInfo.String())
+
+			var log map[string]any
+			err = json.Unmarshal([]byte(line), &log)
+			require.NoError(t, err)
+
+			payloadToExpectedBody(t, line, lr)
+		}
+		return logs
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			recv := newReceiver(t, &Config{
+				Logs: LogsConfig{
+					Endpoint:           "localhost:0",
+					TLS:                &configtls.ServerConfig{},
+					MaxRequestBodySize: 1024,
+					TimestampField:     "EdgeStartTimestamp",
+					Attributes:         tc.attributes,
+					Separator:          ".",
+				},
+			},
+				&consumertest.LogsSink{},
+			)
+			var logs plog.Logs
+			rawLogs, err := parsePayload([]byte(tc.payload))
+			if err == nil {
+				logs = recv.processLogs(pcommon.NewTimestampFromTime(time.Now()), rawLogs)
+			}
+			require.NoError(t, err)
+			require.NotNil(t, logs)
+			require.NoError(t, plogtest.CompareLogs(expectedLogs(t, tc.payload), logs, plogtest.IgnoreObservedTimestamp()))
+		})
+	}
+}
+
+func gzippedMessage(message string) string {
+	var b bytes.Buffer
+	w := gzip.NewWriter(&b)
+	_, err := w.Write([]byte(message))
+	if err != nil {
+		panic(err)
+	}
+	w.Close()
+	return b.String()
+}
+
+func TestMaxRequestBodySize(t *testing.T) {
+	tests := []struct {
+		name               string
+		maxRequestBodySize int64
+		bodySize           int
+		expectedStatus     int
+	}{
+		{
+			name:               "body_within_limit",
+			maxRequestBodySize: 1024,
+			bodySize:           512,
+			expectedStatus:     http.StatusOK,
+		},
+		{
+			name:               "body_exceeds_limit",
+			maxRequestBodySize: 100,
+			bodySize:           1024,
+			expectedStatus:     http.StatusUnprocessableEntity,
+		},
+		{
+			name:               "body_just_under_limit",
+			maxRequestBodySize: 512,
+			bodySize:           511,
+			expectedStatus:     http.StatusOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a valid JSON log entry padded to the desired size
+			padding := strings.Repeat("a", tt.bodySize-100) // Leave room for JSON structure
+			logEntry := map[string]any{
+				"ClientIP":           "127.0.0.1",
+				"EdgeStartTimestamp": "2023-03-03T05:29:05Z",
+				"padding":            padding,
+			}
+			body, err := json.Marshal(logEntry)
+			require.NoError(t, err)
+
+			cfg := &Config{
+				Logs: LogsConfig{
+					Endpoint:           "localhost:0",
+					MaxRequestBodySize: tt.maxRequestBodySize,
+					TimestampField:     "EdgeStartTimestamp",
+					Secret:             "abc123",
+				},
+			}
+
+			r := newReceiver(t, cfg, consumertest.NewNop())
+
+			req := httptest.NewRequest(http.MethodPost, "/", bytes.NewBuffer(body))
+			req.Header.Add(secretHeaderName, "abc123")
+
+			w := httptest.NewRecorder()
+			r.handleRequest(w, req)
+
+			require.Equal(t, tt.expectedStatus, w.Code)
+		})
+	}
+}
+
+func newReceiver(t *testing.T, cfg *Config, nextConsumer consumer.Logs) *logsReceiver {
+	// Default timestamp_format to rfc3339 for tests
+	if cfg.Logs.TimestampFormat == "" {
+		cfg.Logs.TimestampFormat = "rfc3339"
+	}
+	// Validate config to set defaults (including MaxRequestBodySize)
+	// require.NoError(t, cfg.Validate())
+	set := receivertest.NewNopSettings(metadata.Type)
+	set.Logger = zaptest.NewLogger(t)
+	r, err := newLogsReceiver(set, cfg, nextConsumer)
+	require.NoError(t, err)
+	return r
+}
+
+func TestArrayAttributesArePreserved(t *testing.T) {
+	recv := newReceiver(t, &Config{
+		Logs: LogsConfig{
+			Endpoint:           "localhost:0",
+			TLS:                &configtls.ServerConfig{},
+			MaxRequestBodySize: 1024,
+			TimestampField:     "EdgeStartTimestamp",
+			TimestampFormat:    "rfc3339",
+			Separator:          ".",
+		},
+	}, &consumertest.LogsSink{})
+
+	payload := `{"EdgeStartTimestamp":"2023-03-03T05:29:05Z","SecurityActions":["log","block"],"BotDetectionIDs":[101,202],"Nested":{"SecurityRuleIDs":[11,22]}}`
+
+	rawLogs, err := parsePayload([]byte(payload))
+	require.NoError(t, err)
+
+	logs := recv.processLogs(pcommon.NewTimestampFromTime(time.Now()), rawLogs)
+	lr := logs.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
+
+	actions, ok := lr.Attributes().Get("SecurityActions")
+	require.True(t, ok)
+	require.Equal(t, pcommon.ValueTypeSlice, actions.Type())
+	require.Equal(t, "log", actions.Slice().At(0).Str())
+	require.Equal(t, "block", actions.Slice().At(1).Str())
+
+	ids, ok := lr.Attributes().Get("BotDetectionIDs")
+	require.True(t, ok)
+	require.Equal(t, pcommon.ValueTypeDouble, ids.Slice().At(0).Type())
+	require.Equal(t, 101.0, ids.Slice().At(0).Double())
+	require.Equal(t, 202.0, ids.Slice().At(1).Double())
+
+	nestedIDs, ok := lr.Attributes().Get("Nested.SecurityRuleIDs")
+	require.True(t, ok)
+	require.Equal(t, pcommon.ValueTypeDouble, nestedIDs.Slice().At(0).Type())
+	require.Equal(t, 11.0, nestedIDs.Slice().At(0).Double())
+	require.Equal(t, 22.0, nestedIDs.Slice().At(1).Double())
+}
+
+// TestMaxRequestBodySizeGzip covers the compressed path. MaxBytesReader bounds
+// the compressed bytes, but the decompressed stream is read separately, so a
+// small gzip payload that expands past the limit must still be rejected rather
+// than buffered in full.
+func TestMaxRequestBodySizeGzip(t *testing.T) {
+	tests := []struct {
+		name               string
+		maxRequestBodySize int64
+		decompressedSize   int
+		expectedStatus     int
+	}{
+		{
+			name:               "decompressed_within_limit",
+			maxRequestBodySize: 4096,
+			decompressedSize:   512,
+			expectedStatus:     http.StatusOK,
+		},
+		{
+			name:               "decompressed_exceeds_limit",
+			maxRequestBodySize: 1024,
+			decompressedSize:   512 * 1024,
+			expectedStatus:     http.StatusUnprocessableEntity,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Highly compressible padding, so the compressed body stays far below
+			// the limit while the decompressed payload does not.
+			padding := strings.Repeat("a", tt.decompressedSize)
+			logEntry := map[string]any{
+				"ClientIP":           "127.0.0.1",
+				"EdgeStartTimestamp": "2023-03-03T05:29:05Z",
+				"padding":            padding,
+			}
+			body, err := json.Marshal(logEntry)
+			require.NoError(t, err)
+
+			var compressed bytes.Buffer
+			gw := gzip.NewWriter(&compressed)
+			_, err = gw.Write(body)
+			require.NoError(t, err)
+			require.NoError(t, gw.Close())
+
+			require.Less(t, int64(compressed.Len()), tt.maxRequestBodySize,
+				"compressed body must fit under the limit for this test to exercise decompression")
+
+			cfg := &Config{
+				Logs: LogsConfig{
+					Endpoint:           "localhost:0",
+					MaxRequestBodySize: tt.maxRequestBodySize,
+					TimestampField:     "EdgeStartTimestamp",
+					Secret:             "abc123",
+				},
+			}
+
+			r := newReceiver(t, cfg, consumertest.NewNop())
+
+			req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(compressed.Bytes()))
+			req.Header.Add(secretHeaderName, "abc123")
+			req.Header.Add("Content-Encoding", "gzip")
+
+			w := httptest.NewRecorder()
+			r.handleRequest(w, req)
+
+			require.Equal(t, tt.expectedStatus, w.Code)
+		})
+	}
+}
+
+// TestMaxRequestBodySizeServer sends requests through the real HTTP server.
+// The confighttp middleware applies its own body limit before handleRequest
+// runs, so tests that call handleRequest directly do not see that limit.
+func TestMaxRequestBodySizeServer(t *testing.T) {
+	// confighttp applies 20MiB when the server config has no limit, so use
+	// bodies on both sides of that value.
+	const defaultLimit = 20 * 1024 * 1024
+
+	tests := []struct {
+		name               string
+		maxRequestBodySize int64
+		bodySize           int
+		gzip               bool
+		expectedStatus     int
+	}{
+		{
+			name:               "plain_above_confighttp_default_within_limit",
+			maxRequestBodySize: 2 * defaultLimit,
+			bodySize:           defaultLimit + 1024*1024,
+			expectedStatus:     http.StatusOK,
+		},
+		{
+			name:               "gzip_above_confighttp_default_within_limit",
+			maxRequestBodySize: 2 * defaultLimit,
+			bodySize:           defaultLimit + 1024*1024,
+			gzip:               true,
+			expectedStatus:     http.StatusOK,
+		},
+		{
+			name:               "plain_exceeds_limit",
+			maxRequestBodySize: 1024,
+			bodySize:           4096,
+			expectedStatus:     http.StatusUnprocessableEntity,
+		},
+		{
+			name:               "gzip_decompressed_exceeds_limit",
+			maxRequestBodySize: 1024,
+			bodySize:           512 * 1024,
+			gzip:               true,
+			expectedStatus:     http.StatusUnprocessableEntity,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logEntry := map[string]any{
+				"ClientIP":           "127.0.0.1",
+				"EdgeStartTimestamp": "2023-03-03T05:29:05Z",
+				"padding":            strings.Repeat("a", tt.bodySize),
+			}
+			body, err := json.Marshal(logEntry)
+			require.NoError(t, err)
+
+			if tt.gzip {
+				body = []byte(gzippedMessage(string(body)))
+				require.Less(t, int64(len(body)), tt.maxRequestBodySize,
+					"compressed body must fit under the limit for this test to exercise decompression")
+			}
+
+			addr := testutil.GetAvailableLocalAddress(t)
+			fact := NewFactory()
+			recv, err := fact.CreateLogs(
+				t.Context(),
+				receivertest.NewNopSettings(metadata.Type),
+				&Config{
+					Logs: LogsConfig{
+						Endpoint:           addr,
+						MaxRequestBodySize: tt.maxRequestBodySize,
+						TimestampField:     "EdgeStartTimestamp",
+						TimestampFormat:    "rfc3339",
+					},
+				},
+				consumertest.NewNop(),
+			)
+			require.NoError(t, err)
+			require.NoError(t, recv.Start(t.Context(), componenttest.NewNopHost()))
+			defer func() {
+				require.NoError(t, recv.Shutdown(t.Context()))
+			}()
+
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+addr, bytes.NewReader(body))
+			require.NoError(t, err)
+			if tt.gzip {
+				req.Header.Set("Content-Encoding", "gzip")
+			}
+
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			require.Equal(t, tt.expectedStatus, resp.StatusCode)
+		})
+	}
+}

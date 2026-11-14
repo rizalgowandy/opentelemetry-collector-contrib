@@ -1,0 +1,20 @@
+display_name: Redis Storage Extension
+type: redis_storage
+
+description: The Redis Storage Extension can persist state to a Redis cluster.
+
+status:
+  class: extension
+  stability:
+    alpha: [extension]
+  distributions: [contrib]
+  codeowners:
+    active: [atoulme]
+    seeking_new: true
+
+tests:
+  goleak:
+    ignore:
+      top:
+        # go-redis starts a circuit breaker cleanup goroutine per client that Close does not stop.
+        - "github.com/redis/go-redis/v9/maintnotifications.(*CircuitBreakerManager).cleanupLoop"

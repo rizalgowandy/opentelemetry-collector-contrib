@@ -1,0 +1,14 @@
+display_name: Google Cloud Spanner Receiver
+type: google_cloud_spanner
+deprecated_type: googlecloudspanner
+
+status:
+  class: receiver
+  stability:
+    beta: [metrics]
+  distributions: [contrib]
+  codeowners:
+    active: [dashpole, nsj07]
+    emeritus: [architjugran, dsimil, harishbohara11, KiranmayiB, varunraiko]
+tests:
+  config:

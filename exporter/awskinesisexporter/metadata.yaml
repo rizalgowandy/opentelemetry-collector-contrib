@@ -1,0 +1,13 @@
+type: awskinesis
+display_name: AWS Kinesis Exporter
+
+status:
+  class: exporter
+  stability:
+    beta: [traces, metrics, logs]
+  distributions: [contrib]
+  codeowners:
+    active: [Aneurysm9, MovieStoreGuy]
+
+sending_queue:
+  support: default

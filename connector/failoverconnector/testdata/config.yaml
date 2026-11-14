@@ -1,0 +1,51 @@
+failover:
+
+failover/default:
+  priority_levels:
+    - [traces]
+
+failover/full:
+  priority_levels:
+    - [ traces/first, traces/also_first ]
+    - [ traces/second ]
+    - [ traces/third ]
+    - [ traces/fourth ]
+  retry_interval: 5m
+
+failover/queue:
+  priority_levels:
+    - [ traces/first, traces/also_first ]
+    - [ traces/second ]
+    - [ traces/third ]
+    - [ traces/fourth ]
+  sending_queue:
+    enabled: true
+    
+failover/invalid:
+  priority_levels:
+    - [ traces/first ]
+    - [ traces/second ]
+  retry_interval: 0m
+
+failover/condition:
+  priority_levels:
+    - [ traces/first ]
+    - [ traces/second ]
+  retry_interval: 5m
+  condition:
+    error:
+      contains: ["network failure", "connection refused"]
+
+failover/emptycondition:
+  priority_levels:
+    - [ traces/first ]
+    - [ traces/second ]
+  condition: {}
+
+failover/emptyerrorcontains:
+  priority_levels:
+    - [ traces/first ]
+    - [ traces/second ]
+  retry_interval: 5m
+  condition:
+    error: {}

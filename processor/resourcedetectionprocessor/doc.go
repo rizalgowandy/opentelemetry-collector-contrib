@@ -1,17 +1,42 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-// package resourcedetectionprocessor implements a processor for specifying resource
-// labels to be added to OpenCensus trace data and metrics data.
-package resourcedetectionprocessor
+//go:generate make mdatagen
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/akamai/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/alibaba/ecs/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/aws/ec2/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/aws/ecs/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/aws/eks/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/aws/elasticbeanstalk/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/aws/lambda/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/azure/aks/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/azure/appservice/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/azure/containerapps/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/azure/functions/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/azure/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/consul/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/digitalocean/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/docker/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/dynatrace/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/env/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/gcp/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/heroku/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/hetzner/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/ibmcloud/classic/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/ibmcloud/vpc/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/k8sapi/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/kubeadm/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/openshift/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/openstack/nova/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/oraclecloud/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/scaleway/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/system/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/tencent/cvm/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/upcloud/metadata.yaml
+//go:generate make mdatagen MDATAGEN_METADATA_YAML=internal/vultr/metadata.yaml
+
+// package resourcedetectionprocessor implements a processor
+// which can be used to detect resource information from the host,
+// in a format that conforms to the OpenTelemetry resource semantic conventions, and append or
+// override the resource value in telemetry data with this information.
+package resourcedetectionprocessor // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor"

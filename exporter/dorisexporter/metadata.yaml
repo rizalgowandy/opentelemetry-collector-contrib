@@ -1,0 +1,15 @@
+type: doris
+scope_name: otelcol/doris
+display_name: Apache Doris Exporter
+
+status:
+  class: exporter
+  stability:
+    alpha: [traces, metrics, logs]
+  distributions: [contrib]
+  codeowners:
+    active: [joker-star-l]
+    emeritus: [atoulme]
+
+sending_queue:
+  support: default

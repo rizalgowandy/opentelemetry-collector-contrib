@@ -1,0 +1,62 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package redisreceiver
+
+import (
+	"runtime"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/config/configtls"
+	"go.opentelemetry.io/collector/receiver/receivertest"
+	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/redisreceiver/internal/metadata"
+)
+
+func TestRedisRunnable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/38955")
+	}
+	logger, _ := zap.NewDevelopment()
+	settings := receivertest.NewNopSettings(metadata.Type)
+	settings.Logger = logger
+	cfg := createDefaultConfig().(*Config)
+	cfg.AddrConfig.Endpoint = "localhost:6379"
+	rs := &redisScraper{mb: metadata.NewMetricsBuilder(cfg.MetricsBuilderConfig, settings)}
+	runner, err := newRedisScraperWithClient(newFakeClient(), settings, cfg)
+	require.NoError(t, err)
+	md, err := runner.ScrapeMetrics(t.Context())
+	require.NoError(t, err)
+	// + 9 because there are three keyspace entries each of which has three metrics
+	// -22 because that many recorders either have disabled metrics or keys absent from the test info fixture
+	// (includes cluster_enabled, maxmemory, tracking_total_keys, used_memory_overhead, used_memory_startup,
+	//  slave_repl_offset, all other cluster_*/links_buffer_limit_exceeded.count fields not in info.txt,
+	//  and pubsub_channels, pubsub_shardchannels, pubsub_clients, pubsub_patterns, which are all disabled
+	//  by default)
+	assert.Equal(t, len(rs.dataPointRecorders())+9-22, md.DataPointCount())
+	rm := md.ResourceMetrics().At(0)
+	ilm := rm.ScopeMetrics().At(0)
+	il := ilm.Scope()
+	assert.Equal(t, "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/redisreceiver", il.Name())
+}
+
+func TestNewReceiver_invalid_endpoint(t *testing.T) {
+	c := createDefaultConfig().(*Config)
+	_, err := createMetricsReceiver(t.Context(), receivertest.NewNopSettings(metadata.Type), c, nil)
+	assert.ErrorContains(t, err, "invalid endpoint")
+}
+
+func TestNewReceiver_invalid_auth_error(t *testing.T) {
+	c := createDefaultConfig().(*Config)
+	c.TLS = configtls.ClientConfig{
+		Config: configtls.Config{
+			CAFile: "/invalid",
+		},
+	}
+	r, err := createMetricsReceiver(t.Context(), receivertest.NewNopSettings(metadata.Type), c, nil)
+	assert.ErrorContains(t, err, "failed to load TLS config")
+	assert.Nil(t, r)
+}

@@ -1,116 +1,145 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package fluentforwardreceiver
+package fluentforwardreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/fluentforwardreceiver"
 
 import (
 	"bytes"
 	"compress/gzip"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
+	"strconv"
 	"time"
 
 	"github.com/tinylib/msgp/msgp"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 )
 
-const tagAttributeKey = "fluent.tag"
+const (
+	tagAttributeKey = "fluent.tag"
+	maxEntryCount   = 1_000_000
+	maxOptionCount  = 1_000
+)
 
 // Most of this logic is derived directly from
 // https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1,
 // which describes the fields in much greater detail.
 
-type Event interface {
+type event interface {
 	DecodeMsg(dc *msgp.Reader) error
-	LogRecords() pdata.LogSlice
+	LogRecords() plog.LogRecordSlice
 	Chunk() string
 	Compressed() string
 }
 
-type OptionsMap map[string]interface{}
+type eventWithACK struct {
+	event
+	ackCh chan error
+}
+
+type optionsMap map[string]any
 
 // Chunk returns the `chunk` option or blank string if it was not set.
-func (om OptionsMap) Chunk() string {
+func (om optionsMap) Chunk() string {
 	c, _ := om["chunk"].(string)
 	return c
 }
 
-func (om OptionsMap) Compressed() string {
+func (om optionsMap) Compressed() string {
 	compressed, _ := om["compressed"].(string)
 	return compressed
 }
 
-type EventMode int
+type eventMode int
 
-type Peeker interface {
+type peeker interface {
 	Peek(n int) ([]byte, error)
 }
 
-// Values for enum EventMode.
+// Values for enum eventMode.
 const (
-	UnknownMode EventMode = iota
-	MessageMode
-	ForwardMode
-	PackedForwardMode
+	unknownMode eventMode = iota
+	messageMode
+	forwardMode
+	packedForwardMode
 )
 
-func (em EventMode) String() string {
+func (em eventMode) String() string {
 	switch em {
-	case UnknownMode:
+	case unknownMode:
 		return "unknown"
-	case MessageMode:
+	case messageMode:
 		return "message"
-	case ForwardMode:
+	case forwardMode:
 		return "forward"
-	case PackedForwardMode:
+	case packedForwardMode:
 		return "packedforward"
 	default:
 		panic("programmer bug")
 	}
 }
 
-func insertToAttributeMap(key string, val interface{}, dest *pdata.AttributeMap) {
-	// See https://github.com/tinylib/msgp/wiki/Type-Mapping-Rules
-	switch r := val.(type) {
-	case bool:
-		dest.InsertBool(key, r)
-	case string:
-		dest.InsertString(key, r)
-	case uint64:
-		dest.InsertInt(key, int64(r))
-	case int64:
-		dest.InsertInt(key, r)
-	case []byte:
-		dest.InsertString(key, string(r))
-	case map[string]interface{}, []interface{}:
-		encoded, err := json.Marshal(r)
-		if err != nil {
-			dest.InsertString(key, err.Error())
-		}
-		dest.InsertString(key, string(encoded))
-	case float32:
-		dest.InsertDouble(key, float64(r))
-	case float64:
-		dest.InsertDouble(key, r)
-	default:
-		dest.InsertString(key, fmt.Sprintf("%v", r))
+// parseInterfaceToMap takes map of interface objects and returns
+// AttributeValueMap
+func parseInterfaceToMap(msi map[string]any, dest pcommon.Value) {
+	am := dest.SetEmptyMap()
+	am.EnsureCapacity(len(msi))
+	for k, value := range msi {
+		parseToAttributeValue(value, am.PutEmpty(k))
 	}
 }
 
-func timeFromTimestamp(ts interface{}) (time.Time, error) {
+// parseInterfaceToArray takes array of interface objects and returns
+// AttributeValueArray
+func parseInterfaceToArray(ai []any, dest pcommon.Value) {
+	av := dest.SetEmptySlice()
+	av.EnsureCapacity(len(ai))
+	for _, value := range ai {
+		parseToAttributeValue(value, av.AppendEmpty())
+	}
+}
+
+// parseToAttributeValue converts interface object to AttributeValue
+func parseToAttributeValue(val any, dest pcommon.Value) {
+	// See https://github.com/tinylib/msgp/wiki/Type-Mapping-Rules
+	switch r := val.(type) {
+	case bool:
+		dest.SetBool(r)
+	case string:
+		dest.SetStr(r)
+	case uint64:
+		// handle overflow of uint64 to int64
+		if r > math.MaxInt64 {
+			dest.SetStr(strconv.FormatUint(r, 10))
+			return
+		}
+		dest.SetInt(int64(r))
+	case int64:
+		dest.SetInt(r)
+	// Sometimes strings come in as bytes array
+	case []byte:
+		dest.SetStr(string(r))
+	case map[string]any:
+		parseInterfaceToMap(r, dest)
+	case []any:
+		parseInterfaceToArray(r, dest)
+	case float32:
+		dest.SetDouble(float64(r))
+	case float64:
+		dest.SetDouble(r)
+	case nil:
+	default:
+		dest.SetStr(fmt.Sprintf("%v", val))
+	}
+}
+
+func timeFromTimestamp(ts any) (time.Time, error) {
 	switch v := ts.(type) {
+	case uint64:
+		return time.Unix(int64(v), 0), nil
 	case int64:
 		return time.Unix(v, 0), nil
 	case *eventTimeExt:
@@ -120,7 +149,7 @@ func timeFromTimestamp(ts interface{}) (time.Time, error) {
 	}
 }
 
-func decodeTimestampToLogRecord(dc *msgp.Reader, lr pdata.LogRecord) error {
+func parseRecordToLogRecord(dc *msgp.Reader, lr plog.LogRecord) error {
 	tsIntf, err := dc.ReadIntf()
 	if err != nil {
 		return msgp.WrapError(err, "Time")
@@ -131,12 +160,7 @@ func decodeTimestampToLogRecord(dc *msgp.Reader, lr pdata.LogRecord) error {
 		return msgp.WrapError(err, "Time")
 	}
 
-	lr.SetTimestamp(pdata.TimestampFromTime(ts))
-	return nil
-}
-
-func parseRecordToLogRecord(dc *msgp.Reader, lr pdata.LogRecord) error {
-	attrs := lr.Attributes()
+	lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 
 	recordLen, err := dc.ReadMapHeader()
 	if err != nil {
@@ -162,42 +186,32 @@ func parseRecordToLogRecord(dc *msgp.Reader, lr pdata.LogRecord) error {
 
 		// fluentd uses message, fluentbit log.
 		if key == "message" || key == "log" {
-			switch v := val.(type) {
-			case string:
-				lr.Body().SetStringVal(v)
-			case []uint8:
-				// Sometimes strings come in as uint8's.
-				lr.Body().SetStringVal(string(v))
-			default:
-				return fmt.Errorf("cannot convert message type %T to string", val)
-			}
+			parseToAttributeValue(val, lr.Body())
 		} else {
-			insertToAttributeMap(key, val, &attrs)
+			parseToAttributeValue(val, lr.Attributes().PutEmpty(key))
 		}
 	}
 
 	return nil
 }
 
-type MessageEventLogRecord struct {
-	pdata.LogSlice
-	OptionsMap
+type messageEventLogRecord struct {
+	plog.LogRecordSlice
+	optionsMap
 }
 
-func (melr *MessageEventLogRecord) LogRecords() pdata.LogSlice {
-	return melr.LogSlice
+func (melr *messageEventLogRecord) LogRecords() plog.LogRecordSlice {
+	return melr.LogRecordSlice
 }
 
-func (melr *MessageEventLogRecord) DecodeMsg(dc *msgp.Reader) error {
-	melr.LogSlice = pdata.NewLogSlice()
-	log := melr.LogSlice.AppendEmpty()
-
+func (melr *messageEventLogRecord) DecodeMsg(dc *msgp.Reader) error {
+	melr.LogRecordSlice = plog.NewLogRecordSlice()
 	var arrLen uint32
 	var err error
 
 	arrLen, err = dc.ReadArrayHeader()
 	if err != nil {
-		return msgp.WrapError(err)
+		return err
 	}
 	if arrLen > 4 || arrLen < 3 {
 		return msgp.ArrayError{Wanted: 3, Got: arrLen}
@@ -208,35 +222,31 @@ func (melr *MessageEventLogRecord) DecodeMsg(dc *msgp.Reader) error {
 		return msgp.WrapError(err, "Tag")
 	}
 
+	log := melr.AppendEmpty()
 	attrs := log.Attributes()
-	attrs.InsertString(tagAttributeKey, tag)
-
-	err = decodeTimestampToLogRecord(dc, log)
-	if err != nil {
-		return msgp.WrapError(err, "Time")
-	}
-
+	attrs.PutStr(tagAttributeKey, tag)
 	err = parseRecordToLogRecord(dc, log)
 	if err != nil {
 		return err
 	}
 
 	if arrLen == 4 {
-		melr.OptionsMap, err = parseOptions(dc)
-		if err != nil {
-			return err
-		}
+		melr.optionsMap, err = parseOptions(dc)
+		return err
 	}
 	return nil
 }
 
-func parseOptions(dc *msgp.Reader) (OptionsMap, error) {
+func parseOptions(dc *msgp.Reader) (optionsMap, error) {
 	var optionLen uint32
 	optionLen, err := dc.ReadMapHeader()
 	if err != nil {
 		return nil, msgp.WrapError(err, "Option")
 	}
-	out := make(OptionsMap, optionLen)
+	if optionLen > maxOptionCount {
+		return nil, fmt.Errorf("option count %d exceeds maximum %d", optionLen, maxOptionCount)
+	}
+	out := make(optionsMap, optionLen)
 
 	for optionLen > 0 {
 		optionLen--
@@ -253,27 +263,24 @@ func parseOptions(dc *msgp.Reader) (OptionsMap, error) {
 	return out, nil
 }
 
-type ForwardEventLogRecords struct {
-	pdata.LogSlice
-	OptionsMap
+type forwardEventLogRecords struct {
+	plog.LogRecordSlice
+	optionsMap
 }
 
-func (fe *ForwardEventLogRecords) LogRecords() pdata.LogSlice {
-	return fe.LogSlice
+func (fe *forwardEventLogRecords) LogRecords() plog.LogRecordSlice {
+	return fe.LogRecordSlice
 }
 
-func (fe *ForwardEventLogRecords) DecodeMsg(dc *msgp.Reader) (err error) {
-	fe.LogSlice = pdata.NewLogSlice()
+func (fe *forwardEventLogRecords) DecodeMsg(dc *msgp.Reader) error {
+	fe.LogRecordSlice = plog.NewLogRecordSlice()
 
-	var arrLen uint32
-	arrLen, err = dc.ReadArrayHeader()
+	arrLen, err := dc.ReadArrayHeader()
 	if err != nil {
-		err = msgp.WrapError(err)
-		return
+		return err
 	}
 	if arrLen < 2 || arrLen > 3 {
-		err = msgp.ArrayError{Wanted: 2, Got: arrLen}
-		return
+		return msgp.ArrayError{Wanted: 2, Got: arrLen}
 	}
 
 	tag, err := dc.ReadString()
@@ -283,65 +290,59 @@ func (fe *ForwardEventLogRecords) DecodeMsg(dc *msgp.Reader) (err error) {
 
 	entryLen, err := dc.ReadArrayHeader()
 	if err != nil {
-		err = msgp.WrapError(err, "Record")
-		return
+		return msgp.WrapError(err, "Record")
+	}
+	if entryLen > maxEntryCount {
+		return fmt.Errorf("entry count %d exceeds maximum %d", entryLen, maxEntryCount)
 	}
 
-	fe.LogSlice.Resize(int(entryLen))
+	fe.EnsureCapacity(int(entryLen))
 	for i := 0; i < int(entryLen); i++ {
-		lr := fe.LogSlice.At(i)
+		lr := fe.AppendEmpty()
 
 		err = parseEntryToLogRecord(dc, lr)
 		if err != nil {
 			return msgp.WrapError(err, "Entries", i)
 		}
-		fe.LogSlice.At(i).Attributes().InsertString(tagAttributeKey, tag)
+		lr.Attributes().PutStr(tagAttributeKey, tag)
 	}
 
 	if arrLen == 3 {
-		fe.OptionsMap, err = parseOptions(dc)
-		if err != nil {
-			return err
-		}
+		fe.optionsMap, err = parseOptions(dc)
+		return err
 	}
 
-	return
+	return nil
 }
 
-func parseEntryToLogRecord(dc *msgp.Reader, lr pdata.LogRecord) error {
+func parseEntryToLogRecord(dc *msgp.Reader, lr plog.LogRecord) error {
 	arrLen, err := dc.ReadArrayHeader()
 	if err != nil {
-		return msgp.WrapError(err)
+		return err
 	}
 	if arrLen != 2 {
 		return msgp.ArrayError{Wanted: 2, Got: arrLen}
 	}
-
-	err = decodeTimestampToLogRecord(dc, lr)
-	if err != nil {
-		return msgp.WrapError(err, "Time")
-	}
-
 	return parseRecordToLogRecord(dc, lr)
 }
 
-type PackedForwardEventLogRecords struct {
-	pdata.LogSlice
-	OptionsMap
+type packedForwardEventLogRecords struct {
+	plog.LogRecordSlice
+	optionsMap
 }
 
-func (pfe *PackedForwardEventLogRecords) LogRecords() pdata.LogSlice {
-	return pfe.LogSlice
+func (pfe *packedForwardEventLogRecords) LogRecords() plog.LogRecordSlice {
+	return pfe.LogRecordSlice
 }
 
 // DecodeMsg implements msgp.Decodable.  This was originally code generated but
 // then manually copied here in order to handle the optional Options field.
-func (pfe *PackedForwardEventLogRecords) DecodeMsg(dc *msgp.Reader) error {
-	pfe.LogSlice = pdata.NewLogSlice()
+func (pfe *packedForwardEventLogRecords) DecodeMsg(dc *msgp.Reader) error {
+	pfe.LogRecordSlice = plog.NewLogRecordSlice()
 
 	arrLen, err := dc.ReadArrayHeader()
 	if err != nil {
-		return msgp.WrapError(err)
+		return err
 	}
 	if arrLen < 2 || arrLen > 3 {
 		return msgp.ArrayError{Wanted: 2, Got: arrLen}
@@ -382,7 +383,7 @@ func (pfe *PackedForwardEventLogRecords) DecodeMsg(dc *msgp.Reader) error {
 	}
 
 	if arrLen == 3 {
-		pfe.OptionsMap, err = parseOptions(dc)
+		pfe.optionsMap, err = parseOptions(dc)
 		if err != nil {
 			return err
 		}
@@ -396,7 +397,7 @@ func (pfe *PackedForwardEventLogRecords) DecodeMsg(dc *msgp.Reader) error {
 	return nil
 }
 
-func (pfe *PackedForwardEventLogRecords) parseEntries(entriesRaw []byte, isGzipped bool, tag string) error {
+func (pfe *packedForwardEventLogRecords) parseEntries(entriesRaw []byte, isGzipped bool, tag string) error {
 	var reader io.Reader
 	reader = bytes.NewReader(entriesRaw)
 
@@ -410,18 +411,17 @@ func (pfe *PackedForwardEventLogRecords) parseEntries(entriesRaw []byte, isGzipp
 	}
 
 	msgpReader := msgp.NewReader(reader)
+	// Allocate only once, since the MoveTo cleans the lr, so we can reuse.
+	lr := plog.NewLogRecord()
 	for {
-		lr := pdata.NewLogRecord()
 		err := parseEntryToLogRecord(msgpReader, lr)
 		if err != nil {
-			if msgp.Cause(err) == io.EOF {
+			if errors.Is(msgp.Cause(err), io.EOF) {
 				return nil
 			}
 			return err
 		}
-
-		lr.Attributes().InsertString(tagAttributeKey, tag)
-
-		pfe.LogSlice.Append(lr)
+		lr.Attributes().PutStr(tagAttributeKey, tag)
+		lr.MoveTo(pfe.AppendEmpty())
 	}
 }

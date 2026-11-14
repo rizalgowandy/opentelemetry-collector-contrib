@@ -1,58 +1,108 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package sentryexporter
+//go:generate make mdatagen
+
+package sentryexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/sentryexporter"
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
-)
 
-const (
-	typeStr = "sentry"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/sentryexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/sharedcomponent"
 )
 
 // NewFactory creates a factory for Sentry exporter.
-func NewFactory() component.ExporterFactory {
-	return exporterhelper.NewFactory(
-		typeStr,
+func NewFactory() exporter.Factory {
+	return exporter.NewFactory(
+		metadata.Type,
 		createDefaultConfig,
-		exporterhelper.WithTraces(createTracesExporter),
+		exporter.WithTraces(createTracesExporter, metadata.TracesStability),
+		exporter.WithLogs(createLogsExporter, metadata.LogsStability),
 	)
 }
 
-func createDefaultConfig() config.Exporter {
+func createDefaultConfig() component.Config {
+	httpClientConfig := confighttp.NewDefaultClientConfig()
+	httpClientConfig.Timeout = 30 * time.Second
+
 	return &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
+		ClientConfig:  httpClientConfig,
+		TimeoutConfig: exporterhelper.NewDefaultTimeoutConfig(),
+		QueueConfig:   configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
 	}
 }
 
 func createTracesExporter(
-	_ context.Context,
-	params component.ExporterCreateSettings,
-	config config.Exporter,
-) (component.TracesExporter, error) {
-	sentryConfig, ok := config.(*Config)
-	if !ok {
-		return nil, fmt.Errorf("unexpected config type: %T", config)
+	ctx context.Context,
+	set exporter.Settings,
+	config component.Config,
+) (exporter.Traces, error) {
+	sc, state, err := getOrCreateEndpointState(config, set)
+	if err != nil {
+		return nil, err
 	}
-
-	// Create exporter based on sentry config.
-	exp, err := CreateSentryExporter(sentryConfig, params)
-	return exp, err
+	cfg := config.(*Config)
+	se := newSentryExporter(state, set.Logger)
+	return exporterhelper.NewTraces(
+		ctx,
+		set,
+		config,
+		se.pushTraceData,
+		exporterhelper.WithStart(sc.Start),
+		exporterhelper.WithShutdown(sc.Shutdown),
+		exporterhelper.WithTimeout(cfg.TimeoutConfig),
+		exporterhelper.WithQueue(cfg.QueueConfig),
+	)
 }
+
+func createLogsExporter(
+	ctx context.Context,
+	set exporter.Settings,
+	config component.Config,
+) (exporter.Logs, error) {
+	sc, state, err := getOrCreateEndpointState(config, set)
+	if err != nil {
+		return nil, err
+	}
+	cfg := config.(*Config)
+	se := newSentryExporter(state, set.Logger)
+	return exporterhelper.NewLogs(
+		ctx,
+		set,
+		config,
+		se.pushLogData,
+		exporterhelper.WithStart(sc.Start),
+		exporterhelper.WithShutdown(sc.Shutdown),
+		exporterhelper.WithTimeout(cfg.TimeoutConfig),
+		exporterhelper.WithQueue(cfg.QueueConfig),
+	)
+}
+
+// getOrCreateEndpointState creates an endpointState and caches it for a particular configuration.
+func getOrCreateEndpointState(cfg component.Config, set exporter.Settings) (*sharedcomponent.SharedComponent, *endpointState, error) {
+	sc := states.GetOrAdd(cfg, func() component.Component {
+		sentryConfig := cfg.(*Config)
+		se, err := newEndpointState(sentryConfig, set)
+		if err != nil {
+			return nil
+		}
+		return se
+	})
+
+	unwrapped := sc.Unwrap()
+	if unwrapped == nil {
+		return nil, nil, errors.New("failed to create sentry exporter")
+	}
+	return sc, unwrapped.(*endpointState), nil
+}
+
+var states = sharedcomponent.NewSharedComponents()

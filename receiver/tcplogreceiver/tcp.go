@@ -1,76 +1,67 @@
-// Copyright 2021 OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package tcplogreceiver
+package tcplogreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/tcplogreceiver"
 
 import (
-	"github.com/open-telemetry/opentelemetry-log-collection/operator"
-	"github.com/open-telemetry/opentelemetry-log-collection/operator/builtin/input/tcp"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
-	"gopkg.in/yaml.v2"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/receiver/xreceiver"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/stanza"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/consumerretry"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/adapter"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/operator"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/operator/input/tcp"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/tcplogreceiver/internal/metadata"
 )
 
-const typeStr = "tcplog"
-
-// NewFactory creates a factory for tcp receiver
-func NewFactory() component.ReceiverFactory {
-	return stanza.NewFactory(ReceiverType{})
+// NewFactory creates a factory for tcp_log receiver
+func NewFactory() receiver.Factory {
+	return adapter.NewFactory(ReceiverType{}, metadata.LogsStability,
+		xreceiver.WithDeprecatedTypeAlias(metadata.DeprecatedType),
+	)
 }
 
-// ReceiverType implements stanza.LogReceiverType
+// ReceiverType implements adapter.LogReceiverTypeWithScope
 // to create a tcp receiver
 type ReceiverType struct{}
 
+var _ adapter.LogReceiverTypeWithScope = (*ReceiverType)(nil)
+
+// ScopeName sets the scope name that will be used on all logs coming from the receiver.
+func (ReceiverType) ScopeName() string { return metadata.ScopeName }
+
 // Type is the receiver type
-func (f ReceiverType) Type() config.Type {
-	return typeStr
+func (ReceiverType) Type() component.Type {
+	return metadata.Type
 }
 
 // CreateDefaultConfig creates a config with type and version
-func (f ReceiverType) CreateDefaultConfig() config.Receiver {
+func (ReceiverType) CreateDefaultConfig() component.Config {
 	return &TCPLogConfig{
-		BaseConfig: stanza.BaseConfig{
-			ReceiverSettings: config.NewReceiverSettings(config.NewID(typeStr)),
-			Operators:        stanza.OperatorConfigs{},
+		BaseConfig: adapter.BaseConfig{
+			Operators:      []operator.Config{},
+			RetryOnFailure: consumerretry.NewDefaultConfig(),
 		},
-		Input: stanza.InputConfig{},
+		InputConfig: *tcp.NewConfig(),
 	}
 }
 
 // BaseConfig gets the base config from config, for now
-func (f ReceiverType) BaseConfig(cfg config.Receiver) stanza.BaseConfig {
+func (ReceiverType) BaseConfig(cfg component.Config) adapter.BaseConfig {
 	return cfg.(*TCPLogConfig).BaseConfig
 }
 
-// TCPLogConfig defines configuration for the tcp receiver
+// TCPLogConfig defines configuration for the tcp_log receiver
 type TCPLogConfig struct {
-	stanza.BaseConfig `mapstructure:",squash"`
-	Input             stanza.InputConfig `mapstructure:",remain"`
+	InputConfig        tcp.Config `mapstructure:",squash"`
+	adapter.BaseConfig `mapstructure:",squash"`
+
+	// prevent unkeyed literal initialization
+	_ struct{}
 }
 
-// DecodeInputConfig unmarshals the input operator
-func (f ReceiverType) DecodeInputConfig(cfg config.Receiver) (*operator.Config, error) {
-	logConfig := cfg.(*TCPLogConfig)
-	yamlBytes, _ := yaml.Marshal(logConfig.Input)
-	inputCfg := tcp.NewTCPInputConfig("tcp_input")
-
-	if err := yaml.Unmarshal(yamlBytes, &inputCfg); err != nil {
-		return nil, err
-	}
-
-	return &operator.Config{Builder: inputCfg}, nil
+// InputConfig unmarshals the input operator
+func (ReceiverType) InputConfig(cfg component.Config) operator.Config {
+	return operator.NewConfig(&cfg.(*TCPLogConfig).InputConfig)
 }

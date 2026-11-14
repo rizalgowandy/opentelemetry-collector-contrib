@@ -1,0 +1,947 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package metrics
+
+import (
+	"testing"
+	"time"
+
+	"github.com/lightstep/go-expohisto/structure"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+)
+
+func TestConnector_ExpoHistToExponentialDataPoint(t *testing.T) {
+	tests := []struct {
+		name  string
+		input *structure.Histogram[float64]
+		want  pmetric.ExponentialHistogramDataPoint
+	}{
+		{
+			name:  "max bucket size - 4",
+			input: structure.NewFloat64(structure.NewConfig(structure.WithMaxSize(4)), 2, 4),
+			want: func() pmetric.ExponentialHistogramDataPoint {
+				dp := pmetric.NewExponentialHistogramDataPoint()
+				dp.SetCount(2)
+				dp.SetSum(6)
+				dp.SetMin(2)
+				dp.SetMax(4)
+				dp.SetZeroCount(0)
+				dp.SetScale(1)
+				dp.Positive().SetOffset(1)
+				dp.Positive().BucketCounts().FromRaw([]uint64{
+					1, 0, 1,
+				})
+				return dp
+			}(),
+		},
+		{
+			name:  "max bucket size - default",
+			input: structure.NewFloat64(structure.NewConfig(), 2, 4),
+			want: func() pmetric.ExponentialHistogramDataPoint {
+				dp := pmetric.NewExponentialHistogramDataPoint()
+				dp.SetCount(2)
+				dp.SetSum(6)
+				dp.SetMin(2)
+				dp.SetMax(4)
+				dp.SetZeroCount(0)
+				dp.SetScale(7)
+				dp.Positive().SetOffset(127)
+				buckets := make([]uint64, 129)
+				buckets[0] = 1
+				buckets[128] = 1
+				dp.Positive().BucketCounts().FromRaw(buckets)
+				return dp
+			}(),
+		},
+		{
+			name:  "max bucket size - 4, negative observations",
+			input: structure.NewFloat64(structure.NewConfig(structure.WithMaxSize(4)), -2, -4),
+			want: func() pmetric.ExponentialHistogramDataPoint {
+				dp := pmetric.NewExponentialHistogramDataPoint()
+				dp.SetCount(2)
+				dp.SetSum(-6)
+				dp.SetMin(-4)
+				dp.SetMax(-2)
+				dp.SetZeroCount(0)
+				dp.SetScale(1)
+				dp.Negative().SetOffset(1)
+				dp.Negative().BucketCounts().FromRaw([]uint64{
+					1, 0, 1,
+				})
+				return dp
+			}(),
+		},
+		{
+			name:  "max bucket size - 4, negative and positive observations",
+			input: structure.NewFloat64(structure.NewConfig(structure.WithMaxSize(4)), 2, 4, -2, -4),
+			want: func() pmetric.ExponentialHistogramDataPoint {
+				dp := pmetric.NewExponentialHistogramDataPoint()
+				dp.SetCount(4)
+				dp.SetSum(0)
+				dp.SetMin(-4)
+				dp.SetMax(4)
+				dp.SetZeroCount(0)
+				dp.SetScale(1)
+				dp.Positive().SetOffset(1)
+				dp.Positive().BucketCounts().FromRaw([]uint64{
+					1, 0, 1,
+				})
+				dp.Negative().SetOffset(1)
+				dp.Negative().BucketCounts().FromRaw([]uint64{
+					1, 0, 1,
+				})
+				return dp
+			}(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := pmetric.NewExponentialHistogramDataPoint()
+			expoHistToExponentialDataPoint(tt.input, got)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestSum_AddExemplar(t *testing.T) {
+	maxCount := 3
+	tests := []struct {
+		name  string
+		input Sum
+		want  int
+	}{
+		{
+			name:  "Sum Metric - set maxExemplarCount zero",
+			input: Sum{exemplars: pmetric.NewExemplarSlice(), maxExemplarCount: 0},
+			want:  0,
+		},
+		{
+			name: "Sum Metric - With exemplars length less than configured max count",
+			input: func() Sum {
+				exs := pmetric.NewExemplarSlice()
+
+				e1 := exs.AppendEmpty()
+				e1.SetTimestamp(1)
+				e1.SetDoubleValue(1)
+
+				return Sum{
+					exemplars:        exs,
+					maxExemplarCount: maxCount,
+				}
+			}(),
+			want: 2,
+		},
+		{
+			name: "Sum Metric - With exemplars length equal to configured max count",
+			input: func() Sum {
+				exs := pmetric.NewExemplarSlice()
+
+				e1 := exs.AppendEmpty()
+				e1.SetTimestamp(1)
+				e1.SetDoubleValue(1)
+
+				e2 := exs.AppendEmpty()
+				e2.SetTimestamp(2)
+				e2.SetDoubleValue(2)
+
+				e3 := exs.AppendEmpty()
+				e3.SetTimestamp(3)
+				e3.SetDoubleValue(3)
+
+				return Sum{
+					exemplars:        exs,
+					maxExemplarCount: maxCount,
+				}
+			}(),
+			want: 3,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.input.AddExemplar(pcommon.TraceID{}, pcommon.SpanID{}, 4)
+			assert.Equal(t, tt.want, tt.input.exemplars.Len())
+		})
+	}
+}
+
+func TestExplicitHistogram_AddExemplar(t *testing.T) {
+	maxCount := 3
+	tests := []struct {
+		name  string
+		input explicitHistogram
+		want  int
+	}{
+		{
+			name:  "Explicit Histogram - set maxExemplarCount zero",
+			input: explicitHistogram{exemplars: pmetric.NewExemplarSlice(), maxExemplarCount: 0},
+			want:  0,
+		},
+		{
+			name: "Explicit Histogram - With exemplars length less than configured max count",
+			input: func() explicitHistogram {
+				exs := pmetric.NewExemplarSlice()
+
+				e1 := exs.AppendEmpty()
+				e1.SetTimestamp(1)
+				e1.SetDoubleValue(1)
+
+				return explicitHistogram{
+					exemplars:        exs,
+					maxExemplarCount: maxCount,
+				}
+			}(),
+			want: 2,
+		},
+		{
+			name: "Explicit Histogram - With exemplars length equal to configured max count",
+			input: func() explicitHistogram {
+				exs := pmetric.NewExemplarSlice()
+
+				e1 := exs.AppendEmpty()
+				e1.SetTimestamp(1)
+				e1.SetDoubleValue(1)
+
+				e2 := exs.AppendEmpty()
+				e2.SetTimestamp(2)
+				e2.SetDoubleValue(2)
+
+				e3 := exs.AppendEmpty()
+				e3.SetTimestamp(3)
+				e3.SetDoubleValue(3)
+
+				return explicitHistogram{
+					exemplars:        exs,
+					maxExemplarCount: maxCount,
+				}
+			}(),
+			want: 3,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.input.AddExemplar(pcommon.TraceID{}, pcommon.SpanID{}, 4)
+			assert.Equal(t, tt.want, tt.input.exemplars.Len())
+		})
+	}
+}
+
+func TestExponentialHistogram_AddExemplar(t *testing.T) {
+	maxCount := 3
+	tests := []struct {
+		name  string
+		input exponentialHistogram
+		want  int
+	}{
+		{
+			name:  "Exponential Histogram - set maxExemplarCount zero",
+			input: exponentialHistogram{exemplars: pmetric.NewExemplarSlice(), maxExemplarCount: 0},
+			want:  0,
+		},
+		{
+			name: "Exponential Histogram - With exemplars length less than configured max count",
+			input: func() exponentialHistogram {
+				exs := pmetric.NewExemplarSlice()
+
+				e1 := exs.AppendEmpty()
+				e1.SetTimestamp(1)
+				e1.SetDoubleValue(1)
+
+				return exponentialHistogram{
+					exemplars:        exs,
+					maxExemplarCount: maxCount,
+				}
+			}(),
+			want: 2,
+		},
+		{
+			name: "Exponential Histogram - With exemplars length equal to configured max count",
+			input: func() exponentialHistogram {
+				exs := pmetric.NewExemplarSlice()
+
+				e1 := exs.AppendEmpty()
+				e1.SetTimestamp(1)
+				e1.SetDoubleValue(1)
+
+				e2 := exs.AppendEmpty()
+				e2.SetTimestamp(2)
+				e2.SetDoubleValue(2)
+
+				e3 := exs.AppendEmpty()
+				e3.SetTimestamp(3)
+				e3.SetDoubleValue(3)
+
+				return exponentialHistogram{
+					exemplars:        exs,
+					maxExemplarCount: maxCount,
+				}
+			}(),
+			want: 3,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.input.AddExemplar(pcommon.TraceID{}, pcommon.SpanID{}, 4)
+			assert.Equal(t, tt.want, tt.input.exemplars.Len())
+		})
+	}
+}
+
+func TestSum_Add(t *testing.T) {
+	tests := []struct {
+		name     string
+		sum      Sum
+		value    uint64
+		expected uint64
+	}{
+		{
+			name:     "Add zero to empty sum",
+			sum:      Sum{count: 0},
+			value:    0,
+			expected: 0,
+		},
+		{
+			name:     "Add positive value to empty sum",
+			sum:      Sum{count: 0},
+			value:    5,
+			expected: 5,
+		},
+		{
+			name:     "Add value to existing sum",
+			sum:      Sum{count: 10},
+			value:    5,
+			expected: 15,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.sum.Add(tt.value)
+			assert.Equal(t, tt.expected, tt.sum.count)
+		})
+	}
+}
+
+func TestSumMetrics_IsCardinalityLimitReached(t *testing.T) {
+	tests := []struct {
+		name             string
+		metrics          map[Key]*Sum
+		zeroed           map[Key]*Sum
+		pending          map[Key]*Sum
+		cardinalityLimit int
+		expected         bool
+	}{
+		{
+			name:             "No limit set",
+			metrics:          make(map[Key]*Sum),
+			cardinalityLimit: 0,
+			expected:         false,
+		},
+		{
+			name:             "Below limit",
+			metrics:          map[Key]*Sum{"key1": {}, "key2": {}},
+			cardinalityLimit: 3,
+			expected:         false,
+		},
+		{
+			name:             "At limit",
+			metrics:          map[Key]*Sum{"key1": {}, "key2": {}, "key3": {}},
+			cardinalityLimit: 3,
+			expected:         true,
+		},
+		{
+			name:             "Above limit",
+			metrics:          map[Key]*Sum{"key1": {}, "key2": {}, "key3": {}, "key4": {}},
+			cardinalityLimit: 3,
+			expected:         true,
+		},
+		{
+			name:             "Zeroed and pending series count toward the limit",
+			metrics:          map[Key]*Sum{"key1": {}},
+			zeroed:           map[Key]*Sum{"key2": {}},
+			pending:          map[Key]*Sum{"key3": {}},
+			cardinalityLimit: 3,
+			expected:         true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sm := SumMetrics{
+				metrics:          tt.metrics,
+				zeroed:           tt.zeroed,
+				pending:          tt.pending,
+				cardinalityLimit: tt.cardinalityLimit,
+			}
+			assert.Equal(t, tt.expected, sm.IsCardinalityLimitReached())
+		})
+	}
+}
+
+func TestSumMetrics_GetOrCreate(t *testing.T) {
+	now := time.Unix(123, 0)
+	tests := []struct {
+		name               string
+		metrics            map[Key]*Sum
+		zeroed             map[Key]*Sum
+		pending            map[Key]*Sum
+		key                Key
+		attributes         pcommon.Map
+		cardinalityLimit   int
+		expectedMetricsLen int
+		expectedSumCount   int
+		expectedCreated    bool
+		limitReached       bool
+	}{
+		{
+			name:               "Create new sum",
+			metrics:            make(map[Key]*Sum),
+			key:                "new-key",
+			attributes:         pcommon.NewMap(),
+			expectedMetricsLen: 1,
+			expectedSumCount:   1,
+			expectedCreated:    true,
+		},
+		{
+			name: "Get existing sum",
+			metrics: map[Key]*Sum{
+				"existing-key": {count: 5},
+			},
+			key:                "existing-key",
+			attributes:         pcommon.NewMap(),
+			expectedMetricsLen: 1,
+			expectedSumCount:   6,
+			expectedCreated:    false,
+		},
+		{
+			name:    "Get existing sum that has not been flushed yet",
+			metrics: make(map[Key]*Sum),
+			pending: map[Key]*Sum{
+				"existing-key": {count: 5},
+			},
+			key:                "existing-key",
+			attributes:         pcommon.NewMap(),
+			expectedMetricsLen: 1,
+			expectedSumCount:   6,
+			expectedCreated:    false,
+		},
+		{
+			name:    "Get existing sum that has only reported zero so far",
+			metrics: make(map[Key]*Sum),
+			zeroed: map[Key]*Sum{
+				"existing-key": {count: 5},
+			},
+			key:                "existing-key",
+			attributes:         pcommon.NewMap(),
+			expectedMetricsLen: 1,
+			expectedSumCount:   6,
+			expectedCreated:    false,
+		},
+		{
+			name: "sum reach cardinality limit and create the overflow metric",
+			metrics: map[Key]*Sum{
+				"key-1": {count: 5},
+				"key-2": {count: 6},
+			},
+			key: "key-3",
+			attributes: func() pcommon.Map {
+				attributes := pcommon.NewMap()
+				attributes.PutBool(overflowKey, true)
+				return attributes
+			}(),
+			cardinalityLimit:   2,
+			expectedMetricsLen: 3,
+			expectedCreated:    true,
+			limitReached:       true,
+		},
+		{
+			name: "sum reach cardinality limit and return the existing overflow metric",
+			metrics: map[Key]*Sum{
+				"key-1":                {count: 5},
+				"key-2":                {count: 6},
+				"otel.metric.overflow": {count: 1},
+			},
+			key: "key-3",
+			attributes: func() pcommon.Map {
+				attributes := pcommon.NewMap()
+				attributes.PutBool(overflowKey, true)
+				return attributes
+			}(),
+			cardinalityLimit:   2,
+			expectedMetricsLen: 3,
+			expectedSumCount:   2,
+			expectedCreated:    false,
+			limitReached:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pending := tt.pending
+			if pending == nil {
+				pending = make(map[Key]*Sum)
+			}
+			sm := SumMetrics{
+				metrics:          tt.metrics,
+				zeroed:           tt.zeroed,
+				pending:          pending,
+				cardinalityLimit: tt.cardinalityLimit,
+			}
+			attributesFun := func() pcommon.Map {
+				return tt.attributes
+			}
+			sum, limitReached := sm.GetOrCreate(tt.key, attributesFun, pcommon.Timestamp(0), now)
+			sum.Add(1)
+			assert.Equal(t, tt.limitReached, limitReached)
+			assert.Equal(t, tt.expectedMetricsLen, len(sm.metrics)+len(sm.zeroed)+len(sm.pending))
+			if tt.expectedCreated {
+				// New series wait in pending until their first flush.
+				createdKey := tt.key
+				if tt.limitReached {
+					createdKey = overflowKey
+				}
+				assert.Contains(t, sm.pending, createdKey)
+				assert.Equal(t, tt.attributes, sum.attributes)
+				assert.Equal(t, uint64(1), sum.count)
+			} else {
+				assert.Equal(t, uint64(tt.expectedSumCount), sum.count)
+			}
+		})
+	}
+}
+
+func TestSumMetrics_ExpireSeries(t *testing.T) {
+	now := time.Unix(123, 0)
+	sm := SumMetrics{
+		metrics: map[Key]*Sum{
+			"active":    {lastSeen: now},
+			"stale":     {lastSeen: now.Add(-2 * time.Second)},
+			overflowKey: {lastSeen: now.Add(-2 * time.Second)},
+		},
+		zeroed: map[Key]*Sum{
+			"zeroed": {lastSeen: now.Add(-2 * time.Second)},
+		},
+		pending: map[Key]*Sum{
+			"unreported": {lastSeen: now.Add(-2 * time.Second)},
+		},
+	}
+
+	sm.ExpireSeries(time.Second, now)
+
+	assert.Contains(t, sm.metrics, Key("active"))
+	assert.NotContains(t, sm.metrics, Key("stale"))
+	assert.NotContains(t, sm.metrics, Key(overflowKey))
+	// Series that have not reported their accumulated value yet are never expired.
+	assert.Contains(t, sm.zeroed, Key("zeroed"))
+	assert.Contains(t, sm.pending, Key("unreported"))
+}
+
+func TestExplicitHistogramMetrics_ExpireSeries(t *testing.T) {
+	now := time.Unix(123, 0)
+	hm := &explicitHistogramMetrics{
+		metrics: map[Key]*explicitHistogram{
+			"active": {lastSeen: now},
+			"stale":  {lastSeen: now.Add(-2 * time.Second)},
+		},
+		zeroed: map[Key]*explicitHistogram{
+			"zeroed": {lastSeen: now.Add(-2 * time.Second)},
+		},
+		pending: map[Key]*explicitHistogram{
+			"unreported": {lastSeen: now.Add(-2 * time.Second)},
+		},
+	}
+
+	hm.ExpireSeries(time.Second, now)
+
+	assert.Contains(t, hm.metrics, Key("active"))
+	assert.NotContains(t, hm.metrics, Key("stale"))
+	assert.Contains(t, hm.zeroed, Key("zeroed"))
+	assert.Contains(t, hm.pending, Key("unreported"))
+}
+
+func TestExponentialHistogramMetrics_ExpireSeries(t *testing.T) {
+	now := time.Unix(123, 0)
+	hm := &exponentialHistogramMetrics{
+		metrics: map[Key]*exponentialHistogram{
+			"active": {lastSeen: now},
+			"stale":  {lastSeen: now.Add(-2 * time.Second)},
+		},
+		zeroed: map[Key]*exponentialHistogram{
+			"zeroed": {lastSeen: now.Add(-2 * time.Second)},
+		},
+		pending: map[Key]*exponentialHistogram{
+			"unreported": {lastSeen: now.Add(-2 * time.Second)},
+		},
+	}
+
+	hm.ExpireSeries(time.Second, now)
+
+	assert.Contains(t, hm.metrics, Key("active"))
+	assert.NotContains(t, hm.metrics, Key("stale"))
+	assert.Contains(t, hm.zeroed, Key("zeroed"))
+	assert.Contains(t, hm.pending, Key("unreported"))
+}
+
+func TestSumMetrics_BuildMetrics(t *testing.T) {
+	tests := []struct {
+		name          string
+		metrics       map[Key]*Sum
+		temporality   pmetric.AggregationTemporality
+		expectedCount int
+		expectedValue int64
+	}{
+		{
+			name: "Build metrics with one sum",
+			metrics: map[Key]*Sum{
+				"key1": {
+					count: 5,
+					attributes: func() pcommon.Map {
+						m := pcommon.NewMap()
+						m.PutStr("attr1", "value1")
+						return m
+					}(),
+					exemplars: pmetric.NewExemplarSlice(),
+				},
+			},
+			temporality:   pmetric.AggregationTemporalityCumulative,
+			expectedCount: 1,
+			expectedValue: 5,
+		},
+		{
+			name: "Build metrics with multiple sums",
+			metrics: map[Key]*Sum{
+				"key1": {
+					count: 5,
+					attributes: func() pcommon.Map {
+						m := pcommon.NewMap()
+						m.PutStr("attr1", "value1")
+						return m
+					}(),
+					exemplars: pmetric.NewExemplarSlice(),
+				},
+				"key2": {
+					count: 10,
+					attributes: func() pcommon.Map {
+						m := pcommon.NewMap()
+						m.PutStr("attr2", "value2")
+						return m
+					}(),
+					exemplars: pmetric.NewExemplarSlice(),
+				},
+			},
+			temporality:   pmetric.AggregationTemporalityDelta,
+			expectedCount: 2,
+			expectedValue: 5, // Will check both values in the test
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sm := SumMetrics{
+				metrics: tt.metrics,
+			}
+			metric := pmetric.NewMetric()
+			startTimestamp := func(Key, pcommon.Timestamp) pcommon.Timestamp { return 0 }
+			timestamp := pcommon.Timestamp(1000)
+
+			sm.BuildMetrics(metric, timestamp, startTimestamp, tt.temporality)
+
+			assert.Equal(t, pmetric.MetricTypeSum, metric.Type())
+			assert.Equal(t, tt.temporality, metric.Sum().AggregationTemporality())
+			assert.True(t, metric.Sum().IsMonotonic())
+
+			dps := metric.Sum().DataPoints()
+			assert.Equal(t, tt.expectedCount, dps.Len())
+
+			for i := 0; i < dps.Len(); i++ {
+				dp := dps.At(i)
+				assert.Equal(t, timestamp, dp.Timestamp())
+				assert.Equal(t, pcommon.Timestamp(0), dp.StartTimestamp())
+				if tt.expectedCount == 1 {
+					assert.Equal(t, tt.expectedValue, dp.IntValue())
+				}
+			}
+		})
+	}
+}
+
+func TestSumMetrics_BuildMetrics_FirstFlushIsZero(t *testing.T) {
+	startTimestamp := func(Key, pcommon.Timestamp) pcommon.Timestamp { return 0 }
+	attributesFun := pcommon.NewMap
+
+	tests := []struct {
+		name               string
+		temporality        pmetric.AggregationTemporality
+		wantFirstValue     int64
+		wantFirstExemplars int
+	}{
+		{
+			name:               "cumulative first flush is zero",
+			temporality:        pmetric.AggregationTemporalityCumulative,
+			wantFirstValue:     0,
+			wantFirstExemplars: 0,
+		},
+		{
+			name:               "delta first flush holds the batch",
+			temporality:        pmetric.AggregationTemporalityDelta,
+			wantFirstValue:     2,
+			wantFirstExemplars: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sm := NewSumMetrics(1, 0)
+			s, _ := sm.GetOrCreate("key1", attributesFun, 0, time.Now())
+			s.Add(2)
+			s.AddExemplar(pcommon.TraceID{1}, pcommon.SpanID{1}, 5)
+
+			first := pmetric.NewMetric()
+			sm.BuildMetrics(first, pcommon.Timestamp(1000), startTimestamp, tt.temporality)
+			require.Equal(t, 1, first.Sum().DataPoints().Len())
+			dp := first.Sum().DataPoints().At(0)
+			assert.Equal(t, tt.wantFirstValue, dp.IntValue())
+			assert.Equal(t, tt.wantFirstExemplars, dp.Exemplars().Len())
+			assert.Empty(t, sm.pending)
+			if tt.temporality == pmetric.AggregationTemporalityCumulative {
+				// The series waits apart from the reported ones until its first real flush.
+				assert.Contains(t, sm.zeroed, Key("key1"))
+			} else {
+				assert.Contains(t, sm.metrics, Key("key1"))
+			}
+			sm.ClearExemplars()
+
+			second := pmetric.NewMetric()
+			sm.BuildMetrics(second, pcommon.Timestamp(2000), startTimestamp, tt.temporality)
+			require.Equal(t, 1, second.Sum().DataPoints().Len())
+			dp = second.Sum().DataPoints().At(0)
+			assert.Equal(t, int64(2), dp.IntValue())
+			assert.Empty(t, sm.zeroed)
+			assert.Contains(t, sm.metrics, Key("key1"))
+			if tt.temporality == pmetric.AggregationTemporalityCumulative {
+				require.Equal(t, 1, dp.Exemplars().Len())
+				assert.Equal(t, pcommon.Timestamp(2000), dp.Exemplars().At(0).Timestamp())
+			} else {
+				assert.Equal(t, 0, dp.Exemplars().Len())
+			}
+		})
+	}
+}
+
+func TestExplicitHistogramMetrics_BuildMetrics_FirstFlushIsZero(t *testing.T) {
+	bounds := []float64{1, 10}
+	startTimestamp := func(Key, pcommon.Timestamp) pcommon.Timestamp { return 0 }
+	attributesFun := pcommon.NewMap
+
+	tests := []struct {
+		name               string
+		temporality        pmetric.AggregationTemporality
+		wantFirstCount     uint64
+		wantFirstSum       float64
+		wantFirstBucket    []uint64
+		wantFirstExemplars int
+	}{
+		{
+			name:               "cumulative first flush is zero",
+			temporality:        pmetric.AggregationTemporalityCumulative,
+			wantFirstCount:     0,
+			wantFirstSum:       0,
+			wantFirstBucket:    []uint64{0, 0, 0},
+			wantFirstExemplars: 0,
+		},
+		{
+			name:               "delta first flush holds the batch",
+			temporality:        pmetric.AggregationTemporalityDelta,
+			wantFirstCount:     2,
+			wantFirstSum:       7,
+			wantFirstBucket:    []uint64{0, 2, 0},
+			wantFirstExemplars: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hm := NewExplicitHistogramMetrics(bounds, 1, 0)
+			h, _ := hm.GetOrCreate("key1", attributesFun, 0, time.Now())
+			h.Observe(2)
+			h.Observe(5)
+			h.AddExemplar(pcommon.TraceID{1}, pcommon.SpanID{1}, 5)
+
+			first := pmetric.NewMetric()
+			hm.BuildMetrics(first, pcommon.Timestamp(1000), startTimestamp, tt.temporality)
+			require.Equal(t, 1, first.Histogram().DataPoints().Len())
+			dp := first.Histogram().DataPoints().At(0)
+			assert.Equal(t, tt.wantFirstCount, dp.Count())
+			assert.Equal(t, tt.wantFirstSum, dp.Sum())
+			assert.Equal(t, bounds, dp.ExplicitBounds().AsRaw())
+			assert.Equal(t, tt.wantFirstBucket, dp.BucketCounts().AsRaw())
+			assert.Equal(t, tt.wantFirstExemplars, dp.Exemplars().Len())
+			hm.ClearExemplars()
+
+			second := pmetric.NewMetric()
+			hm.BuildMetrics(second, pcommon.Timestamp(2000), startTimestamp, tt.temporality)
+			require.Equal(t, 1, second.Histogram().DataPoints().Len())
+			dp = second.Histogram().DataPoints().At(0)
+			assert.Equal(t, uint64(2), dp.Count())
+			assert.Equal(t, float64(7), dp.Sum())
+			assert.Equal(t, []uint64{0, 2, 0}, dp.BucketCounts().AsRaw())
+			if tt.temporality == pmetric.AggregationTemporalityCumulative {
+				require.Equal(t, 1, dp.Exemplars().Len())
+				assert.Equal(t, pcommon.Timestamp(2000), dp.Exemplars().At(0).Timestamp())
+			} else {
+				assert.Equal(t, 0, dp.Exemplars().Len())
+			}
+		})
+	}
+}
+
+func TestExponentialHistogramMetrics_BuildMetrics_FirstFlushIsZero(t *testing.T) {
+	startTimestamp := func(Key, pcommon.Timestamp) pcommon.Timestamp { return 0 }
+	attributesFun := pcommon.NewMap
+
+	tests := []struct {
+		name               string
+		temporality        pmetric.AggregationTemporality
+		wantFirstCount     uint64
+		wantFirstSum       float64
+		wantFirstExemplars int
+	}{
+		{
+			name:               "cumulative first flush is zero",
+			temporality:        pmetric.AggregationTemporalityCumulative,
+			wantFirstCount:     0,
+			wantFirstSum:       0,
+			wantFirstExemplars: 0,
+		},
+		{
+			name:               "delta first flush holds the batch",
+			temporality:        pmetric.AggregationTemporalityDelta,
+			wantFirstCount:     2,
+			wantFirstSum:       7,
+			wantFirstExemplars: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hm := NewExponentialHistogramMetrics(160, 1, 0)
+			h, _ := hm.GetOrCreate("key1", attributesFun, 0, time.Now())
+			h.Observe(2)
+			h.Observe(5)
+			h.AddExemplar(pcommon.TraceID{1}, pcommon.SpanID{1}, 5)
+
+			first := pmetric.NewMetric()
+			hm.BuildMetrics(first, pcommon.Timestamp(1000), startTimestamp, tt.temporality)
+			require.Equal(t, 1, first.ExponentialHistogram().DataPoints().Len())
+			dp := first.ExponentialHistogram().DataPoints().At(0)
+			assert.Equal(t, tt.wantFirstCount, dp.Count())
+			assert.Equal(t, tt.wantFirstSum, dp.Sum())
+			assert.Equal(t, uint64(0), dp.ZeroCount())
+			assert.Equal(t, tt.wantFirstExemplars, dp.Exemplars().Len())
+			if tt.wantFirstCount == 0 {
+				assert.Empty(t, dp.Positive().BucketCounts().AsRaw())
+				assert.Empty(t, dp.Negative().BucketCounts().AsRaw())
+				assert.False(t, dp.HasMin())
+				assert.False(t, dp.HasMax())
+			} else {
+				assert.NotEmpty(t, dp.Positive().BucketCounts().AsRaw())
+			}
+			hm.ClearExemplars()
+
+			second := pmetric.NewMetric()
+			hm.BuildMetrics(second, pcommon.Timestamp(2000), startTimestamp, tt.temporality)
+			require.Equal(t, 1, second.ExponentialHistogram().DataPoints().Len())
+			dp = second.ExponentialHistogram().DataPoints().At(0)
+			assert.Equal(t, uint64(2), dp.Count())
+			assert.Equal(t, float64(7), dp.Sum())
+			assert.Equal(t, first.ExponentialHistogram().DataPoints().At(0).Scale(), dp.Scale())
+			assert.Equal(t, float64(2), dp.Min())
+			assert.Equal(t, float64(5), dp.Max())
+			assert.NotEmpty(t, dp.Positive().BucketCounts().AsRaw())
+			if tt.temporality == pmetric.AggregationTemporalityCumulative {
+				require.Equal(t, 1, dp.Exemplars().Len())
+				assert.Equal(t, pcommon.Timestamp(2000), dp.Exemplars().At(0).Timestamp())
+			} else {
+				assert.Equal(t, 0, dp.Exemplars().Len())
+			}
+		})
+	}
+}
+
+func TestSumMetrics_ClearExemplars(t *testing.T) {
+	tests := []struct {
+		name     string
+		metrics  map[Key]*Sum
+		zeroed   map[Key]*Sum
+		pending  map[Key]*Sum
+		expected int
+	}{
+		{
+			name: "Clear exemplars from multiple sums",
+			metrics: map[Key]*Sum{
+				"key1": {
+					exemplars: func() pmetric.ExemplarSlice {
+						es := pmetric.NewExemplarSlice()
+						es.AppendEmpty()
+						return es
+					}(),
+				},
+				"key2": {
+					exemplars: func() pmetric.ExemplarSlice {
+						es := pmetric.NewExemplarSlice()
+						es.AppendEmpty()
+						es.AppendEmpty()
+						return es
+					}(),
+				},
+			},
+			expected: 0,
+		},
+		{
+			name: "Keep exemplars of sums that have not reported their value yet",
+			zeroed: map[Key]*Sum{
+				"key1": {
+					exemplars: func() pmetric.ExemplarSlice {
+						es := pmetric.NewExemplarSlice()
+						es.AppendEmpty()
+						return es
+					}(),
+				},
+			},
+			pending: map[Key]*Sum{
+				"key2": {
+					exemplars: func() pmetric.ExemplarSlice {
+						es := pmetric.NewExemplarSlice()
+						es.AppendEmpty()
+						return es
+					}(),
+				},
+			},
+			expected: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sm := SumMetrics{
+				metrics: tt.metrics,
+				zeroed:  tt.zeroed,
+				pending: tt.pending,
+			}
+			sm.ClearExemplars()
+
+			for _, sum := range sm.metrics {
+				assert.Equal(t, tt.expected, sum.exemplars.Len())
+			}
+			for _, sum := range sm.zeroed {
+				assert.Equal(t, tt.expected, sum.exemplars.Len())
+			}
+			for _, sum := range sm.pending {
+				assert.Equal(t, tt.expected, sum.exemplars.Len())
+			}
+		})
+	}
+}

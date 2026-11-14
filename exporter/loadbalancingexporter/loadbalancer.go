@@ -1,34 +1,29 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package loadbalancingexporter
+package loadbalancingexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/loadbalancingexporter"
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/consumer/pdata"
 	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/loadbalancingexporter/internal/metadata"
 )
 
 const (
 	defaultPort = "4317"
+
+	// backendStartTimeout bounds the creation and start of the exporter for each new backend.
+	backendStartTimeout = 5 * time.Second
 )
 
 var (
@@ -36,51 +31,112 @@ var (
 	errMultipleResolversProvided = errors.New("only one resolver should be specified")
 )
 
-var _ loadBalancer = (*loadBalancerImp)(nil)
+type componentFactory func(ctx context.Context, endpoint string) (component.Component, error)
 
-type componentFactory func(ctx context.Context, endpoint string) (component.Exporter, error)
-
-type loadBalancer interface {
-	component.Component
-	Endpoint(traceID pdata.TraceID) string
-	Exporter(endpoint string) (component.Exporter, error)
-}
-
-type loadBalancerImp struct {
+type loadBalancer struct {
 	logger *zap.Logger
 	host   component.Host
 
 	res  resolver
 	ring *hashRing
 
-	componentFactory componentFactory
-	exporters        map[string]component.Exporter
+	componentFactory    componentFactory
+	exporters           map[string]*wrappedExporter
+	exportersShutdownWG sync.WaitGroup
 
 	stopped    bool
 	updateLock sync.RWMutex
+
+	// backendChangeMu serializes the resolver callbacks, so that topology updates are still
+	// applied one at a time without having to hold updateLock while exporters are being
+	// created and started.
+	backendChangeMu sync.Mutex
 }
 
 // Create new load balancer
-func newLoadBalancer(params component.ExporterCreateSettings, cfg config.Exporter, factory componentFactory) (*loadBalancerImp, error) {
+func newLoadBalancer(logger *zap.Logger, cfg component.Config, factory componentFactory, telemetry *metadata.TelemetryBuilder) (*loadBalancer, error) {
 	oCfg := cfg.(*Config)
 
-	if oCfg.Resolver.DNS != nil && oCfg.Resolver.Static != nil {
+	count := 0
+	if oCfg.Resolver.DNS.HasValue() {
+		count++
+	}
+	if oCfg.Resolver.Static.HasValue() {
+		count++
+	}
+	if oCfg.Resolver.AWSCloudMap.HasValue() {
+		count++
+	}
+	if oCfg.Resolver.K8sSvc.HasValue() {
+		count++
+	}
+	if count > 1 {
 		return nil, errMultipleResolversProvided
 	}
 
 	var res resolver
-	if oCfg.Resolver.Static != nil {
+	if oCfg.Resolver.Static.HasValue() {
 		var err error
-		res, err = newStaticResolver(oCfg.Resolver.Static.Hostnames)
+		res, err = newStaticResolver(
+			oCfg.Resolver.Static.Get().Hostnames,
+			telemetry,
+		)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if oCfg.Resolver.DNS != nil {
-		dnsLogger := params.Logger.With(zap.String("resolver", "dns"))
+	if oCfg.Resolver.DNS.HasValue() {
+		dnsLogger := logger.With(zap.String("resolver", "dns"))
 
 		var err error
-		res, err = newDNSResolver(dnsLogger, oCfg.Resolver.DNS.Hostname, oCfg.Resolver.DNS.Port)
+		dnsResolver := oCfg.Resolver.DNS.Get()
+		res, err = newDNSResolver(
+			dnsLogger,
+			dnsResolver.Hostname,
+			dnsResolver.Port,
+			dnsResolver.Interval,
+			dnsResolver.Timeout,
+			telemetry,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if oCfg.Resolver.K8sSvc.HasValue() {
+		k8sLogger := logger.With(zap.String("resolver", "k8s service"))
+
+		// Pass nil client - it will be created during start() to allow validation outside k8s cluster
+		k8sSvcResolver := oCfg.Resolver.K8sSvc.Get()
+		var err error
+		res, err = newK8sResolver(
+			nil,
+			k8sLogger,
+			k8sSvcResolver.Service,
+			k8sSvcResolver.Ports,
+			k8sSvcResolver.Timeout,
+			k8sSvcResolver.ReturnHostnames,
+			telemetry,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if oCfg.Resolver.AWSCloudMap.HasValue() {
+		awsCloudMapLogger := logger.With(zap.String("resolver", "aws_cloud_map"))
+		awsCloudMapResolver := oCfg.Resolver.AWSCloudMap.Get()
+		var err error
+		res, err = newCloudMapResolver(
+			awsCloudMapLogger,
+			&awsCloudMapResolver.NamespaceName,
+			&awsCloudMapResolver.ServiceName,
+			awsCloudMapResolver.Port,
+			&awsCloudMapResolver.HealthStatus,
+			awsCloudMapResolver.Interval,
+			awsCloudMapResolver.Timeout,
+			awsCloudMapResolver.OwnerAccount,
+			telemetry,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -90,56 +146,101 @@ func newLoadBalancer(params component.ExporterCreateSettings, cfg config.Exporte
 		return nil, errNoResolver
 	}
 
-	return &loadBalancerImp{
-		logger:           params.Logger,
+	return &loadBalancer{
+		logger:           logger,
 		res:              res,
 		componentFactory: factory,
-		exporters:        map[string]component.Exporter{},
+		exporters:        map[string]*wrappedExporter{},
 	}, nil
 }
 
-func (lb *loadBalancerImp) Start(ctx context.Context, host component.Host) error {
+func (lb *loadBalancer) Start(ctx context.Context, host component.Host) error {
 	lb.res.onChange(lb.onBackendChanges)
 	lb.host = host
 	return lb.res.start(ctx)
 }
 
-func (lb *loadBalancerImp) onBackendChanges(resolved []string) {
+func (lb *loadBalancer) onBackendChanges(resolved []string) {
+	lb.backendChangeMu.Lock()
+	defer lb.backendChangeMu.Unlock()
+
 	newRing := newHashRing(resolved)
 
-	if !newRing.equal(lb.ring) {
-		lb.updateLock.Lock()
-		defer lb.updateLock.Unlock()
-
-		lb.ring = newRing
-
-		// TODO: set a timeout?
-		ctx := context.Background()
-
-		// add the missing exporters first
-		lb.addMissingExporters(ctx, resolved)
-		lb.removeExtraExporters(ctx, resolved)
+	// prepare phase: take a snapshot of the current state, holding updateLock only for the
+	// duration of the copy
+	lb.updateLock.RLock()
+	if newRing.equal(lb.ring) {
+		lb.updateLock.RUnlock()
+		return
 	}
+
+	running := maps.Clone(lb.exporters)
+	lb.updateLock.RUnlock()
+
+	// create and start the missing exporters without holding updateLock, so that slow
+	// component factories or Start calls don't block the data path.
+	added := lb.startMissingExporters(resolved, running)
+	maps.Copy(running, added)
+
+	// only route to endpoints that have a running exporter. Endpoints that failed to start are
+	// left out of the ring until the resolver reports the next change in the backend set.
+	available := make([]string, 0, len(resolved))
+	for _, endpoint := range resolved {
+		if _, ok := running[endpointWithPort(endpoint)]; ok {
+			available = append(available, endpoint)
+		}
+	}
+
+	// commit phase: install the new exporters and publish the new ring atomically
+	lb.updateLock.Lock()
+	defer lb.updateLock.Unlock()
+
+	maps.Copy(lb.exporters, added)
+	lb.ring = newHashRing(available)
+	lb.removeExtraExporters(context.Background(), resolved)
 }
 
-func (lb *loadBalancerImp) addMissingExporters(ctx context.Context, endpoints []string) {
+// startMissingExporters creates and starts an exporter for every endpoint that isn't part of the
+// given existing exporters, returning the started ones keyed by endpoint, without installing them.
+func (lb *loadBalancer) startMissingExporters(endpoints []string, existing map[string]*wrappedExporter) map[string]*wrappedExporter {
+	added := make(map[string]*wrappedExporter)
 	for _, endpoint := range endpoints {
 		endpoint = endpointWithPort(endpoint)
 
-		if _, exists := lb.exporters[endpoint]; !exists {
-			exp, err := lb.componentFactory(ctx, endpoint)
-			if err != nil {
-				lb.logger.Error("failed to create new exporter for endpoint", zap.String("endpoint", endpoint), zap.Error(err))
-				continue
-			}
-
-			if err = exp.Start(ctx, lb.host); err != nil {
-				lb.logger.Error("failed to start new exporter for endpoint", zap.String("endpoint", endpoint), zap.Error(err))
-				continue
-			}
-			lb.exporters[endpoint] = exp
+		if _, ok := existing[endpoint]; ok {
+			continue
 		}
+		if _, ok := added[endpoint]; ok {
+			continue
+		}
+
+		we, err := lb.startExporter(endpoint)
+		if err != nil {
+			lb.logger.Error("failed to start new exporter for endpoint", zap.String("endpoint", endpoint), zap.Error(err))
+			continue
+		}
+		added[endpoint] = we
 	}
+
+	return added
+}
+
+// startExporter creates and starts the exporter for a single endpoint, bounded by
+// backendStartTimeout for implementations that honor the context.
+func (lb *loadBalancer) startExporter(endpoint string) (*wrappedExporter, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), backendStartTimeout)
+	defer cancel()
+
+	exp, err := lb.componentFactory(ctx, endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("creating exporter: %w", err)
+	}
+
+	we := newWrappedExporter(exp, endpoint)
+	if err := we.Start(ctx, lb.host); err != nil {
+		return nil, fmt.Errorf("starting exporter: %w", err)
+	}
+	return we, nil
 }
 
 func endpointWithPort(endpoint string) string {
@@ -149,48 +250,54 @@ func endpointWithPort(endpoint string) string {
 	return endpoint
 }
 
-func (lb *loadBalancerImp) removeExtraExporters(ctx context.Context, endpoints []string) {
+func (lb *loadBalancer) removeExtraExporters(ctx context.Context, endpoints []string) {
+	endpointsWithPort := make([]string, len(endpoints))
+	for i, e := range endpoints {
+		endpointsWithPort[i] = endpointWithPort(e)
+	}
 	for existing := range lb.exporters {
-		if !endpointFound(existing, endpoints) {
-			lb.exporters[existing].Shutdown(ctx)
+		if !slices.Contains(endpointsWithPort, existing) {
+			exp := lb.exporters[existing]
+			// Shutdown the exporter asynchronously to avoid blocking the resolver
+			lb.exportersShutdownWG.Go(func() {
+				_ = exp.Shutdown(ctx)
+			})
 			delete(lb.exporters, existing)
 		}
 	}
 }
 
-func endpointFound(endpoint string, endpoints []string) bool {
-	for _, candidate := range endpoints {
-		if candidate == endpoint {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (lb *loadBalancerImp) Shutdown(context.Context) error {
+func (lb *loadBalancer) Shutdown(ctx context.Context) error {
+	err := lb.res.shutdown(ctx)
 	lb.stopped = true
-	return nil
+
+	for _, e := range lb.exporters {
+		err = errors.Join(err, e.Shutdown(ctx))
+	}
+	lb.exportersShutdownWG.Wait()
+	return err
 }
 
-func (lb *loadBalancerImp) Endpoint(traceID pdata.TraceID) string {
-	lb.updateLock.RLock()
-	defer lb.updateLock.RUnlock()
-
-	return lb.ring.endpointFor(traceID)
-}
-
-func (lb *loadBalancerImp) Exporter(endpoint string) (component.Exporter, error) {
-	// NOTE: make rolling updates of next tier of collectors work. currently this may cause
+// exporterAndEndpoint returns the exporter and the endpoint for the given identifier.
+func (lb *loadBalancer) exporterAndEndpoint(identifier []byte) (*wrappedExporter, string, error) {
+	// NOTE: make rolling updates of next tier of collectors work. currently, this may cause
 	// data loss because the latest batches sent to outdated backend will never find their way out.
 	// for details: https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/1690
 	lb.updateLock.RLock()
-	exp, found := lb.exporters[endpoint]
-	lb.updateLock.RUnlock()
+	defer lb.updateLock.RUnlock()
+	endpoint := lb.ring.endpointFor(identifier)
+	exp, found := lb.exporters[endpointWithPort(endpoint)]
 	if !found {
 		// something is really wrong... how come we couldn't find the exporter??
-		return nil, fmt.Errorf("couldn't find the exporter for the endpoint %q", endpoint)
+		return nil, "", fmt.Errorf("couldn't find the exporter for the endpoint %q", endpoint)
 	}
 
-	return exp, nil
+	return exp, endpoint, nil
+}
+
+// NumBackends returns the current number of resolved backend exporters.
+func (lb *loadBalancer) NumBackends() int {
+	lb.updateLock.RLock()
+	defer lb.updateLock.RUnlock()
+	return len(lb.exporters)
 }

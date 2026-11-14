@@ -1,0 +1,154 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package prometheusremotewriteexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusremotewriteexporter"
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	remoteapi "github.com/prometheus/client_golang/exp/api/remote"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/config/configretry"
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/exporter/xexporter"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusremotewriteexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/resourcetotelemetry"
+)
+
+// NewFactory creates a new Prometheus Remote Write exporter.
+func NewFactory() exporter.Factory {
+	return xexporter.NewFactory(
+		metadata.Type,
+		createDefaultConfig,
+		xexporter.WithMetrics(createMetricsExporter, metadata.MetricsStability),
+		xexporter.WithDeprecatedTypeAlias(metadata.DeprecatedType),
+	)
+}
+
+func createMetricsExporter(ctx context.Context, set exporter.Settings,
+	cfg component.Config,
+) (exporter.Metrics, error) {
+	prwCfg, ok := cfg.(*Config)
+	if !ok {
+		return nil, errors.New("invalid configuration")
+	}
+
+	if !metadata.ExporterPrometheusremotewritexporterEnableMultipleWorkersFeatureGate.IsEnabled() && prwCfg.RemoteWriteQueue.NumConsumers != 5 {
+		set.Logger.Warn("`remote_write_queue.num_consumers` will be used to configure processing parallelism, rather than request parallelism in a future release. This may cause out-of-order issues unless you take action. Please migrate to using `max_batch_request_parallelism` to keep the your existing behavior.")
+	}
+
+	if !prwCfg.AddMetricSuffixes {
+		set.Logger.Warn("`add_metric_suffixes` is deprecated. Please use `translation_strategy: UnderscoreEscapingWithoutSuffixes` instead.")
+	}
+
+	prwe, err := newPRWExporter(prwCfg, set)
+	if err != nil {
+		return nil, err
+	}
+
+	numConsumers := 1
+	if metadata.ExporterPrometheusremotewritexporterEnableMultipleWorkersFeatureGate.IsEnabled() {
+		numConsumers = prwCfg.RemoteWriteQueue.NumConsumers
+	}
+
+	qCfg := configoptional.Default(exporterhelper.QueueBatchConfig{
+		NumConsumers: numConsumers,
+		QueueSize:    int64(prwCfg.RemoteWriteQueue.QueueSize),
+		Sizer:        exporterhelper.RequestSizerTypeRequests,
+	})
+	if prwCfg.RemoteWriteQueue.Enabled {
+		qCfg.GetOrInsertDefault()
+	}
+
+	exporter, err := exporterhelper.NewMetrics(
+		ctx,
+		set,
+		cfg,
+		prwe.PushMetrics,
+		// The timeout is applied by the exporter to every attempt to send a request. It must not
+		// also be applied by the exporterhelper, which would bound the whole retry loop with it.
+		// The option is required: without it the exporterhelper applies its default timeout.
+		exporterhelper.WithTimeout(exporterhelper.TimeoutConfig{Timeout: 0}),
+		exporterhelper.WithQueue(qCfg),
+		exporterhelper.WithStart(prwe.Start),
+		exporterhelper.WithShutdown(prwe.Shutdown),
+	)
+	if err != nil {
+		return nil, err
+	}
+	settings := prwCfg.ResourceConstantLabels
+	if settings.IsEmpty() && !metadata.ExporterPrometheusremotewriteDisableResourceToTelemetryConversionFeatureGate.IsEnabled() && !prwCfg.ResourceToTelemetrySettings.IsEmpty() {
+		set.Logger.Warn("resource_to_telemetry_conversion is deprecated; use resource_constant_labels instead")
+		settings = prwCfg.ResourceToTelemetrySettings
+	}
+	return &retryStoppingExporter{
+		Metrics:       resourcetotelemetry.WrapMetricsExporter(settings, exporter),
+		startShutdown: prwe.startShutdown,
+	}, nil
+}
+
+// retryStoppingExporter stops the retries of the wrapped exporter at the start of the shutdown, and
+// passes it the context of the shutdown so that its deadline bounds the flush of the queue.
+// The exporterhelper shuts down the wrapped exporter last, after it drained its queue. As this
+// exporter does the retries itself, the queue would otherwise be drained with retries, which can
+// take retry_on_failure.max_elapsed_time for every queued request while the backend is unavailable.
+type retryStoppingExporter struct {
+	exporter.Metrics
+	startShutdown func(context.Context)
+}
+
+func (e *retryStoppingExporter) Shutdown(ctx context.Context) error {
+	e.startShutdown(ctx)
+	return e.Metrics.Shutdown(ctx)
+}
+
+func createDefaultConfig() component.Config {
+	retrySettings := configretry.NewDefaultBackOffConfig()
+	retrySettings.InitialInterval = 50 * time.Millisecond
+
+	numConsumers := 5
+	if metadata.ExporterPrometheusremotewritexporterEnableMultipleWorkersFeatureGate.IsEnabled() {
+		numConsumers = 1
+	}
+	return &Config{
+		Namespace:         "",
+		ExternalLabels:    map[string]string{},
+		MaxBatchSizeBytes: 3000000,
+		// To set this as default once `exporter.prometheusremotewritexporter.EnableMultipleWorkers` is removed
+		// MaxBatchRequestParallelism: 5,
+		TimeoutSettings:   exporterhelper.NewDefaultTimeoutConfig(),
+		BackOffConfig:     retrySettings,
+		AddMetricSuffixes: true,
+		// TODO: Set TranslationStrategy to UnderscoreEscapingWithSuffixes once AddMetricSuffixes is removed.
+		SendMetadata:        false,
+		RemoteWriteProtoMsg: remoteapi.WriteV1MessageType,
+		// TODO: Remove ClientConfig in favor of HTTP settings eventually.
+		ClientConfig: getDefaultHTTPClientConfig(),
+		// TODO(jbd): Adjust the default queue size.
+		RemoteWriteQueue: RemoteWriteQueue{
+			Enabled:      true,
+			QueueSize:    10000,
+			NumConsumers: numConsumers,
+		},
+		TargetInfo: TargetInfo{
+			Enabled: true,
+		},
+		HTTP: getDefaultHTTPClientConfig(),
+	}
+}
+
+func getDefaultHTTPClientConfig() confighttp.ClientConfig {
+	clientConfig := confighttp.NewDefaultClientConfig()
+	clientConfig.Endpoint = "http://some.url:9411/api/prom/push"
+	// We almost read 0 bytes, so no need to tune ReadBufferSize.
+	clientConfig.ReadBufferSize = 0
+	clientConfig.WriteBufferSize = 512 * 1024
+	clientConfig.Timeout = exporterhelper.NewDefaultTimeoutConfig().Timeout
+	return clientConfig
+}

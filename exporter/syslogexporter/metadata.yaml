@@ -1,0 +1,14 @@
+type: syslog
+display_name: Syslog Exporter
+
+status:
+  class: exporter
+  stability: 
+    alpha: [logs]
+  distributions: [contrib]
+  codeowners:
+    active: [rnishtala-sumo, andrzej-stencel]
+    emeritus: [kasia-kujawa]
+
+sending_queue:
+  support: default

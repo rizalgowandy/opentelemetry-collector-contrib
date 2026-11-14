@@ -1,0 +1,16 @@
+display_name: Azure Blob Receiver
+type: azure_blob
+deprecated_type: azureblob
+
+status:
+  class: receiver
+  stability:
+    alpha: [logs, traces]
+  distributions: [contrib]
+  codeowners:
+    active: [mx-psi, dyl10s]
+    emeritus: [eedorenko]
+
+tests:
+  config:
+    connection_string: DefaultEndpointsProtocol=https;AccountName=accountName;AccountKey=+idLkHYcL0MUWIKYHm2j4Q==;EndpointSuffix=core.windows.net

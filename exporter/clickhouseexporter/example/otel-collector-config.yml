@@ -1,0 +1,60 @@
+receivers:
+  fluentforward:
+    endpoint: 0.0.0.0:24224
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  memory_limiter:
+    check_interval: 2s
+    limit_mib: 1800
+    spike_limit_mib: 500
+  resource_detection/system:
+    detectors: [ "system" ]
+    system:
+      hostname_sources: [ "os" ]
+  resource:
+    attributes:
+      - key: service.name
+        value: "serviceName"
+        action: upsert
+exporters:
+  clickhouse:
+    endpoint: tcp://clickhouse:9000
+    database: otel
+    logs_table_name: otel_logs
+    traces_table_name: otel_traces
+    ttl: 12h
+    timeout: 10s
+    sending_queue:
+      queue_size: 1000
+      # Batch inserts inside the exporter's sending queue instead of using the
+      # standalone `batch` processor. ClickHouse performs best with large inserts.
+      # `num_consumers` still controls how many inserts run concurrently.
+      batch:
+        min_size: 5000       # rows per INSERT (items sizer); tune to your workload
+        flush_timeout: 5s    # flush a partial batch after this delay
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    username: default
+    password: default
+extensions:
+  health_check:
+  pprof:
+  zpages:
+
+service:
+  extensions: [ pprof, zpages, health_check ]
+  pipelines:
+    logs:
+      receivers: [ fluentforward, otlp ]
+      processors: [ memory_limiter, resource_detection/system, resource ]
+      exporters: [ clickhouse ]
+    traces:
+      receivers: [ otlp ]
+      processors: [ memory_limiter, resource_detection/system, resource ]
+      exporters: [ clickhouse ]

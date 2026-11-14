@@ -1,0 +1,8 @@
+google_client_auth:
+google_client_auth/customname:
+  project: my-project
+  scopes:
+  - "https://www.something.com/hello"
+  - "https://www.something.com/world"
+  quota_project: other-project
+  audience: my-audience

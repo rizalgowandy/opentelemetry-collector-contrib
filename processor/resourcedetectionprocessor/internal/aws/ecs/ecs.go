@@ -1,132 +1,157 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package ecs
+//go:build (!remove_all_resourcedetection_detectors || enable_detector_aws_ecs) && !omit_detector_aws_ecs
+
+package ecs // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/aws/ecs"
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"net/http"
-	"os"
 	"strings"
 
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/conventions"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/processor"
+	conventions "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.uber.org/zap"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/ecsutil"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/ecsutil/endpoints"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal"
-)
-
-const (
-	// TypeStr is type of detector.
-	TypeStr     = "ecs"
-	tmde3EnvVar = "ECS_CONTAINER_METADATA_URI"
-	tmde4EnvVar = "ECS_CONTAINER_METADATA_URI_V4"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/aws/ecs/internal/metadata"
 )
 
 var _ internal.Detector = (*Detector)(nil)
 
 type Detector struct {
-	provider ecsMetadataProvider
+	// hostLookup is true when any host.* attribute is enabled, which makes the
+	// detector query the ECS and EC2 APIs for tasks running on EC2.
+	hostLookup bool
+	// lastHost is the last successful EC2 lookup. It is reused for the lifetime
+	// of the same task, in strict and soft mode, without further API calls.
+	lastHost              *ec2Host
+	logger                *zap.Logger
+	clients               func(context.Context, string) (ecsAPI, ec2API, error)
+	provider              ecsutil.MetadataProvider
+	rb                    *metadata.ResourceBuilder
+	failOnMissingMetadata bool
 }
 
-func NewDetector(params component.ProcessorCreateSettings, _ internal.DetectorConfig) (internal.Detector, error) {
-	return &Detector{provider: &ecsMetadataProviderImpl{logger: params.Logger, client: &http.Client{}}}, nil
+func NewDetector(params processor.Settings, dcfg internal.DetectorConfig, failOnMissingMetadata bool) (internal.Detector, error) {
+	cfg := dcfg.(Config)
+	provider, err := ecsutil.NewDetectedTaskMetadataProvider(params.TelemetrySettings)
+	if err != nil {
+		// Allow metadata provider to be created in incompatible environments and just have a noop Detect()
+		if _, ok := errors.AsType[endpoints.ErrNoTaskMetadataEndpointDetected](err); ok {
+			return &Detector{provider: nil, failOnMissingMetadata: failOnMissingMetadata}, nil
+		}
+		return nil, fmt.Errorf("unable to create task metadata provider: %w", err)
+	}
+	ra := cfg.ResourceAttributes
+	hostLookup := ra.HostID.Enabled || ra.HostName.Enabled || ra.HostType.Enabled || ra.HostImageID.Enabled
+	return &Detector{hostLookup: hostLookup, logger: params.Logger, clients: newEC2MetadataClients, provider: provider, rb: metadata.NewResourceBuilder(cfg.ResourceAttributes), failOnMissingMetadata: failOnMissingMetadata}, nil
 }
 
 // Detect records metadata retrieved from the ECS Task Metadata Endpoint (TMDE) as resource attributes
 // TODO(willarmiros): Replace all attribute fields and enums with values defined in "conventions" once they exist
-func (d *Detector) Detect(context.Context) (pdata.Resource, error) {
-	res := pdata.NewResource()
-
-	tmde := getTmdeFromEnv()
-
-	// Fail fast if neither env var is present
-	if tmde == "" {
-		// TODO: Log a more specific error with zap
-		return res, nil
+func (d *Detector) Detect(ctx context.Context) (resource pcommon.Resource, schemaURL string, err error) {
+	// don't attempt to fetch metadata if there's no provider (incompatible env)
+	if d.provider == nil {
+		if d.failOnMissingMetadata {
+			return pcommon.NewResource(), "", errors.New("ecs metadata unavailable: no task metadata endpoint detected")
+		}
+		return pcommon.NewResource(), "", nil
 	}
 
-	tmdeResp, err := d.provider.fetchTaskMetaData(tmde)
+	tmdeResp, err := d.provider.FetchTaskMetadata()
 
 	if err != nil || tmdeResp == nil {
-		return res, err
+		return pcommon.NewResource(), "", fmt.Errorf("unable to fetch task metadata: %w", err)
 	}
 
-	attr := res.Attributes()
-	attr.InsertString(conventions.AttributeCloudProvider, conventions.AttributeCloudProviderAWS)
-	attr.InsertString(conventions.AttributeCloudPlatform, conventions.AttributeCloudPlatformAWSECS)
-	attr.InsertString(conventions.AttributeAWSECSTaskARN, tmdeResp.TaskARN)
-	attr.InsertString(conventions.AttributeAWSECSTaskFamily, tmdeResp.Family)
-	attr.InsertString(conventions.AttributeAWSECSTaskRevision, tmdeResp.Revision)
+	d.rb.SetCloudProvider(conventions.CloudProviderAWS.Value.AsString())
+	d.rb.SetCloudPlatform(conventions.CloudPlatformAWSECS.Value.AsString())
+	d.rb.SetAwsEcsTaskArn(tmdeResp.TaskARN)
+	d.rb.SetAwsEcsTaskFamily(tmdeResp.Family)
+	d.rb.SetAwsEcsTaskRevision(tmdeResp.Revision)
 
-	region, account := parseRegionAndAccount(tmdeResp.TaskARN)
+	region, account, taskID := parseTaskARN(tmdeResp.TaskARN)
 	if account != "" {
-		attr.InsertString(conventions.AttributeCloudAccount, account)
+		d.rb.SetCloudAccountID(account)
 	}
 
 	if region != "" {
-		attr.InsertString(conventions.AttributeCloudRegion, region)
+		d.rb.SetCloudRegion(region)
 	}
 
-	// TMDE returns the the cluster short name or ARN, so we need to construct the ARN if necessary
-	attr.InsertString(conventions.AttributeAWSECSClusterARN, constructClusterArn(tmdeResp.Cluster, region, account))
+	if taskID != "" {
+		d.rb.SetAwsEcsTaskID(taskID)
+	}
 
-	// The Availability Zone is not available in all Fargate runtimes
+	// TMDE returns the cluster short name or ARN, so we need to construct the ARN if necessary
+	d.rb.SetAwsEcsClusterArn(constructClusterArn(tmdeResp.Cluster, region, account))
+
 	if tmdeResp.AvailabilityZone != "" {
-		attr.InsertString(conventions.AttributeCloudAvailabilityZone, tmdeResp.AvailabilityZone)
+		d.rb.SetCloudAvailabilityZone(tmdeResp.AvailabilityZone)
 	}
 
 	// The launch type and log data attributes are only available in TMDE v4
 	switch lt := strings.ToLower(tmdeResp.LaunchType); lt {
 	case "ec2":
-		attr.InsertString(conventions.AttributeAWSECSLaunchType, "ec2")
-
+		d.rb.SetAwsEcsLaunchtype("ec2")
 	case "fargate":
-		attr.InsertString(conventions.AttributeAWSECSLaunchType, "fargate")
+		d.rb.SetAwsEcsLaunchtype("fargate")
 	}
 
-	selfMetaData, err := d.provider.fetchContainerMetaData(tmde)
-
-	if err != nil || selfMetaData == nil {
-		return res, err
-	}
-
-	logAttributes := [4]string{
-		conventions.AttributeAWSLogGroupNames,
-		conventions.AttributeAWSLogGroupARNs,
-		conventions.AttributeAWSLogStreamNames,
-		conventions.AttributeAWSLogStreamARNs,
-	}
-
-	for i, attribVal := range getValidLogData(tmdeResp.Containers, selfMetaData, account) {
-		if attribVal.ArrayVal().Len() > 0 {
-			attr.Insert(logAttributes[i], attribVal)
+	if d.hostLookup && strings.EqualFold(tmdeResp.LaunchType, "EC2") {
+		if enrichmentErr := d.enrichEC2(ctx, tmdeResp); enrichmentErr != nil {
+			if d.failOnMissingMetadata {
+				// Discard partial attributes before a retry can observe a different task.
+				d.rb.Emit()
+				return pcommon.NewResource(), "", fmt.Errorf("unable to enrich ECS resource with EC2 metadata: %w", enrichmentErr)
+			}
+			d.logger.Warn("Unable to enrich ECS resource with EC2 metadata", zap.Error(enrichmentErr))
 		}
 	}
 
-	return res, nil
-}
+	selfMetaData, err := d.provider.FetchContainerMetadata()
 
-func getTmdeFromEnv() string {
-	var tmde string
-	if tmde = strings.TrimSpace(os.Getenv(tmde4EnvVar)); tmde == "" {
-		tmde = strings.TrimSpace(os.Getenv(tmde3EnvVar))
+	if err != nil || selfMetaData == nil {
+		if err != nil && d.failOnMissingMetadata {
+			d.rb.Emit()
+			return pcommon.NewResource(), "", fmt.Errorf("ecs container metadata unavailable: %w", err)
+		}
+		// Task metadata was retrieved successfully, so return it without the container
+		// log attributes rather than reporting a failure the caller cannot act on.
+		return d.rb.Emit(), conventions.SchemaURL, nil
 	}
 
-	return tmde
+	addValidLogData(tmdeResp.Containers, selfMetaData, account, d.rb)
+
+	return d.rb.Emit(), conventions.SchemaURL, nil
+}
+
+// enrichEC2 adds the EC2 host attributes. A task ARN identifies an immutable
+// placement, so a successful lookup is cached and reused for the same task
+// without further API calls. A different task never inherits another task's
+// host. Failed lookups are not cached and are retried on the next detection.
+func (d *Detector) enrichEC2(ctx context.Context, meta *ecsutil.TaskMetadata) error {
+	if d.lastHost != nil {
+		if d.lastHost.taskARN == meta.TaskARN {
+			d.applyEC2Host(d.lastHost)
+			return nil
+		}
+		d.lastHost = nil
+	}
+	host, err := d.lookupEC2Host(ctx, meta)
+	if err != nil {
+		return err
+	}
+	d.lastHost = host
+	d.applyEC2Host(host)
+	return nil
 }
 
 func constructClusterArn(cluster, region, account string) string {
@@ -138,43 +163,60 @@ func constructClusterArn(cluster, region, account string) string {
 	return fmt.Sprintf("arn:aws:ecs:%s:%s:cluster/%s", region, account, cluster)
 }
 
-// Parses the AWS Account ID and AWS Region from a task ARN
+// Parses ECS Task ARN into subcomponents according to its spec
 // See: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-account-settings.html#ecs-resource-ids
-func parseRegionAndAccount(taskARN string) (region string, account string) {
+func parseTaskARN(taskARN string) (region, account, taskID string) {
 	parts := strings.Split(taskARN, ":")
-	if len(parts) >= 5 {
-		return parts[3], parts[4]
+	if len(parts) >= 6 {
+		region := parts[3]
+		account := parts[4]
+
+		// ECS Task ARNs come in two versions. In the old one, the last part of the ARN contains
+		// only the "task/<task-id>". In the new one, it contains "task/cluster-name/task-id".
+		// This handles both cases.
+		taskInfo := parts[5]
+		taskInfoParts := strings.Split(taskInfo, "/")
+		taskID := taskInfoParts[len(taskInfoParts)-1]
+
+		return region, account, taskID
 	}
 
-	return "", ""
+	return "", "", ""
 }
 
 // Filter out non-normal containers, our own container since we assume the collector is run as a sidecar,
 // "init" containers which only run at startup then shutdown (as indicated by the "KnownStatus" attribute),
 // containers not using AWS Logs, and those without log group metadata to get the final lists of valid log data
 // See: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint-v4.html#task-metadata-endpoint-v4-response
-func getValidLogData(containers []Container, self *Container, account string) [4]pdata.AttributeValue {
-	logGroupNames := pdata.NewAttributeValueArray()
-	logGroupArns := pdata.NewAttributeValueArray()
-	logStreamNames := pdata.NewAttributeValueArray()
-	logStreamArns := pdata.NewAttributeValueArray()
+func addValidLogData(containers []ecsutil.ContainerMetadata, self *ecsutil.ContainerMetadata, account string, rb *metadata.ResourceBuilder) {
+	logGroupNames := make([]any, 0, len(containers))
+	logGroupArns := make([]any, 0, len(containers))
+	logStreamNames := make([]any, 0, len(containers))
+	logStreamArns := make([]any, 0, len(containers))
+	containerFound := false
 
-	for _, container := range containers {
+	for i := range containers {
+		container := &containers[i]
 		logData := container.LogOptions
 		if container.Type == "NORMAL" &&
 			container.KnownStatus == "RUNNING" &&
 			container.LogDriver == "awslogs" &&
 			self.DockerID != container.DockerID &&
-			logData != (LogData{}) {
-
-			logGroupNames.ArrayVal().AppendEmpty().SetStringVal(logData.LogGroup)
-			logGroupArns.ArrayVal().AppendEmpty().SetStringVal(constructLogGroupArn(logData.Region, account, logData.LogGroup))
-			logStreamNames.ArrayVal().AppendEmpty().SetStringVal(logData.Stream)
-			logStreamArns.ArrayVal().AppendEmpty().SetStringVal(constructLogStreamArn(logData.Region, account, logData.LogGroup, logData.Stream))
+			logData != (ecsutil.LogOptions{}) {
+			containerFound = true
+			logGroupNames = append(logGroupNames, logData.LogGroup)
+			logGroupArns = append(logGroupArns, constructLogGroupArn(logData.Region, account, logData.LogGroup))
+			logStreamNames = append(logStreamNames, logData.Stream)
+			logStreamArns = append(logStreamArns, constructLogStreamArn(logData.Region, account, logData.LogGroup, logData.Stream))
 		}
 	}
 
-	return [4]pdata.AttributeValue{logGroupNames, logGroupArns, logStreamNames, logStreamArns}
+	if containerFound {
+		rb.SetAwsLogGroupNames(logGroupNames)
+		rb.SetAwsLogGroupArns(logGroupArns)
+		rb.SetAwsLogStreamNames(logStreamNames)
+		rb.SetAwsLogStreamArns(logStreamArns)
+	}
 }
 
 func constructLogGroupArn(region, account, group string) string {

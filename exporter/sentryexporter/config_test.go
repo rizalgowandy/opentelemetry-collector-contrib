@@ -1,47 +1,195 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package sentryexporter
 
 import (
-	"path"
+	"fmt"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configtest"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configopaque"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/sentryexporter/internal/metadata"
 )
 
 func TestLoadConfig(t *testing.T) {
-	factories, err := componenttest.NopFactories()
-	assert.Nil(t, err)
+	t.Parallel()
 
-	factory := NewFactory()
-	factories.Exporters[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
-
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
 	require.NoError(t, err)
-	require.NotNil(t, cfg)
 
-	e0 := cfg.Exporters[config.NewID(typeStr)]
-	assert.Equal(t, e0, factory.CreateDefaultConfig())
+	tests := []struct {
+		id       component.ID
+		expected component.Config
+	}{
+		{
+			id: component.NewIDWithName(metadata.Type, ""),
+			expected: func() *Config {
+				cfg := createDefaultConfig().(*Config)
+				cfg.URL = "https://sentry.io"
+				cfg.OrgSlug = "my-org"
+				cfg.AuthToken = configopaque.String("test-auth-token-12345")
+				return cfg
+			}(),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "with_routing"),
+			expected: func() *Config {
+				cfg := createDefaultConfig().(*Config)
+				cfg.URL = "https://sentry.io"
+				cfg.OrgSlug = "my-org"
+				cfg.AuthToken = configopaque.String("test-auth-token-12345")
+				cfg.AutoCreateProjects = true
+				cfg.Routing = RoutingConfig{
+					ProjectFromAttribute: "service.name",
+					AttributeToProjectMapping: map[string]string{
+						"api-service": "backend-api",
+						"web-service": "frontend-web",
+					},
+				}
+				return cfg
+			}(),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "full"),
+			expected: func() *Config {
+				cfg := createDefaultConfig().(*Config)
+				cfg.URL = "https://sentry.example.com"
+				cfg.OrgSlug = "example-org"
+				cfg.AuthToken = configopaque.String("full-test-token")
+				cfg.ClientConfig.Timeout = 20 * time.Second
+				cfg.ClientConfig.TLS.Insecure = true
+				cfg.TimeoutConfig.Timeout = 45 * time.Second
+				cfg.AutoCreateProjects = true
+				cfg.Routing = RoutingConfig{
+					ProjectFromAttribute: "deployment.environment.name",
+					AttributeToProjectMapping: map[string]string{
+						"production": "prod-project",
+						"staging":    "stage-project",
+					},
+				}
+				return cfg
+			}(),
+		},
+	}
 
-	e1 := cfg.Exporters[config.NewIDWithName(typeStr, "2")]
-	assert.Equal(t, e1, &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewIDWithName(typeStr, "2")),
-		DSN:              "https://key@host/path/42",
-	})
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
+
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			assert.NoError(t, confmap.Validate(cfg))
+			assert.Equal(t, tt.expected, cfg)
+		})
+	}
+}
+
+func TestValidateRejectsInvalidProjectSlug(t *testing.T) {
+	t.Parallel()
+
+	cfg := minimalValidConfig()
+	cfg.Routing.AttributeToProjectMapping = map[string]string{
+		"api-service": "invalid slug",
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "project slug")
+}
+
+func TestValidateRejectsUpperCaseProjectSlug(t *testing.T) {
+	t.Parallel()
+
+	cfg := minimalValidConfig()
+	cfg.Routing.AttributeToProjectMapping = map[string]string{
+		"api-service": "BackendAPI",
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "project slug")
+}
+
+func TestValidateRejectsNumericOnlyProjectSlug(t *testing.T) {
+	t.Parallel()
+
+	cfg := minimalValidConfig()
+	cfg.Routing.AttributeToProjectMapping = map[string]string{
+		"api-service": "12345",
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "project slug")
+}
+
+func TestValidateRejectsEmptyAttributeValue(t *testing.T) {
+	t.Parallel()
+
+	cfg := minimalValidConfig()
+	cfg.Routing.AttributeToProjectMapping = map[string]string{
+		"": "backend-api",
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty attribute value")
+}
+
+func TestValidateRejectsTooManyProjectMappings(t *testing.T) {
+	t.Parallel()
+
+	cfg := minimalValidConfig()
+	cfg.Routing.AttributeToProjectMapping = make(map[string]string, maxProjects+1)
+
+	for i := range maxProjects + 1 {
+		attr := fmt.Sprintf("service-%d", i)
+		project := fmt.Sprintf("project-%d", i)
+		cfg.Routing.AttributeToProjectMapping[attr] = project
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must not define more than")
+}
+
+func minimalValidConfig() *Config {
+	cfg := createDefaultConfig().(*Config)
+	cfg.URL = "https://sentry.io"
+	cfg.OrgSlug = "my-org"
+	cfg.AuthToken = configopaque.String("token")
+	return cfg
+}
+
+func TestValidateRejectsTraversalOrgSlug(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		"../../organizations/victim/members",
+		"foo/../../bar",
+		"slug/with/slashes",
+	}
+
+	for _, payload := range cases {
+		t.Run(payload, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := minimalValidConfig()
+			cfg.OrgSlug = payload
+
+			err := cfg.Validate()
+			require.Error(t, err, "Validate must reject org_slug %q", payload)
+			assert.Contains(t, err.Error(), "org_slug")
+		})
+	}
 }

@@ -1,0 +1,88 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package jaegerreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/jaegerreceiver"
+
+// This file implements factory for Jaeger receiver.
+
+import (
+	"context"
+
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configgrpc"
+	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/confignet"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/receiver"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/coredistro"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/jaegerreceiver/internal/metadata"
+)
+
+const (
+	// Default endpoints to bind to.
+	defaultGRPCEndpoint          = "localhost:14250"
+	defaultHTTPEndpoint          = "localhost:14268"
+	defaultThriftCompactEndpoint = "localhost:6831"
+	defaultThriftBinaryEndpoint  = "localhost:6832"
+)
+
+// NewFactory creates a new Jaeger receiver factory.
+func NewFactory() receiver.Factory {
+	return receiver.NewFactory(
+		metadata.Type,
+		createDefaultConfig,
+		receiver.WithTraces(createTracesReceiver, metadata.TracesStability),
+	)
+}
+
+// CreateDefaultConfig creates the default configuration for Jaeger receiver.
+func createDefaultConfig() component.Config {
+	thriftHTTPServerConfig := confighttp.NewDefaultServerConfig()
+	thriftHTTPServerConfig.NetAddr = confignet.AddrConfig{
+		Endpoint:  defaultHTTPEndpoint,
+		Transport: confignet.TransportTypeTCP,
+	}
+	return &Config{
+		Protocols: Protocols{
+			GRPC: configoptional.Default(configgrpc.ServerConfig{
+				NetAddr: confignet.AddrConfig{
+					Endpoint:  defaultGRPCEndpoint,
+					Transport: confignet.TransportTypeTCP,
+				},
+			}),
+			ThriftHTTP: configoptional.Default(thriftHTTPServerConfig),
+			ThriftBinaryUDP: configoptional.Default(ProtocolUDP{
+				Endpoint:        defaultThriftBinaryEndpoint,
+				ServerConfigUDP: defaultServerConfigUDP(),
+			}),
+			ThriftCompactUDP: configoptional.Default(ProtocolUDP{
+				Endpoint:        defaultThriftCompactEndpoint,
+				ServerConfigUDP: defaultServerConfigUDP(),
+			}),
+		},
+	}
+}
+
+// createTracesReceiver creates a trace receiver based on provided config.
+func createTracesReceiver(
+	_ context.Context,
+	set receiver.Settings,
+	cfg component.Config,
+	nextConsumer consumer.Traces,
+) (receiver.Traces, error) {
+	coredistro.WarnRemoval(set.TelemetrySettings, set.BuildInfo, "v0.167.0", coredistro.JaegerZipkinCoda)
+	// Convert settings in the source config to configuration struct
+	// that Jaeger receiver understands.
+	// Error handling for the conversion is done in the Validate function from the Config object itself.
+
+	rCfg := cfg.(*Config)
+
+	if rCfg.RemoteSampling != nil {
+		set.Logger.Warn("You are using a deprecated no-op `remote_sampling` option which will be removed soon; use a `jaegerremotesampling` extension instead")
+	}
+
+	// Create the receiver.
+	return newJaegerReceiver(set.ID, rCfg.Protocols, nextConsumer, set)
+}

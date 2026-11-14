@@ -1,65 +1,80 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package awsemfexporter
+package awsemfexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsemfexporter"
 
 import (
 	"context"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.uber.org/zap"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsemfexporter/internal/metadata"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/awsutil"
-)
-
-const (
-	// The value of "type" key in configuration.
-	typeStr = "awsemf"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/resourcetotelemetry"
 )
 
 // NewFactory creates a factory for AWS EMF exporter.
-func NewFactory() component.ExporterFactory {
-	return exporterhelper.NewFactory(
-		typeStr,
+func NewFactory() exporter.Factory {
+	return exporter.NewFactory(
+		metadata.Type,
 		createDefaultConfig,
-		exporterhelper.WithMetrics(createMetricsExporter))
+		exporter.WithMetrics(createMetricsExporter, metadata.MetricsStability),
+	)
 }
 
 // CreateDefaultConfig creates the default configuration for exporter.
-func createDefaultConfig() config.Exporter {
+func createDefaultConfig() component.Config {
+	var defaultDimensionRollupOption string
+	if metadata.AwsemfNodimrollupdefaultFeatureGate.IsEnabled() {
+		defaultDimensionRollupOption = "NoDimensionRollup"
+	} else {
+		defaultDimensionRollupOption = "ZeroAndSingleDimensionRollup"
+	}
 	return &Config{
-		ExporterSettings:                config.NewExporterSettings(config.NewID(typeStr)),
 		AWSSessionSettings:              awsutil.CreateDefaultSessionConfig(),
 		LogGroupName:                    "",
 		LogStreamName:                   "",
 		Namespace:                       "",
-		DimensionRollupOption:           "ZeroAndSingleDimensionRollup",
-		ParseJSONEncodedAttributeValues: make([]string, 0),
-		MetricDeclarations:              make([]*MetricDeclaration, 0),
-		MetricDescriptors:               make([]MetricDescriptor, 0),
+		DimensionRollupOption:           defaultDimensionRollupOption,
+		Version:                         "1",
+		RetainInitialValueOfDeltaMetric: false,
 		OutputDestination:               "cloudwatch",
-		logger:                          nil,
+		logger:                          zap.NewNop(),
 	}
 }
 
 // createMetricsExporter creates a metrics exporter based on this config.
-func createMetricsExporter(_ context.Context,
-	params component.ExporterCreateSettings,
-	config config.Exporter) (component.MetricsExporter, error) {
-
+func createMetricsExporter(ctx context.Context, params exporter.Settings, config component.Config) (exporter.Metrics, error) {
 	expCfg := config.(*Config)
 
-	return NewEmfExporter(expCfg, params)
+	emfExp, err := newEmfExporter(ctx, expCfg, params)
+	if err != nil {
+		return nil, err
+	}
+
+	exporter, err := exporterhelper.NewMetrics(
+		ctx,
+		params,
+		config,
+		emfExp.pushMetricsData,
+		exporterhelper.WithShutdown(emfExp.shutdown),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	rttSettings := expCfg.ResourceToTelemetrySettings
+	//nolint:staticcheck // check deprecated fields
+	if (rttSettings.Enabled || rttSettings.ExcludeServiceAttributes) && !metadata.ExporterAwsemfDisableLegacyResourceToTelemetryConversionFeatureGate.IsEnabled() {
+		params.Logger.Warn("enabled and exclude_service_attributes in resource_to_telemetry_conversion are deprecated; use included and excluded patterns instead")
+	}
+	if metadata.ExporterAwsemfDisableLegacyResourceToTelemetryConversionFeatureGate.IsEnabled() {
+		rttSettings.Enabled = false                  //nolint:staticcheck // ignore deprecated field
+		rttSettings.ExcludeServiceAttributes = false //nolint:staticcheck // ignore deprecated field
+	}
+
+	return resourcetotelemetry.WrapMetricsExporter(rttSettings, exporter), nil
 }

@@ -1,139 +1,504 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package windowsperfcountersreceiver
 
 import (
 	"fmt"
-	"path"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configtest"
-	"go.opentelemetry.io/collector/receiver/scraperhelper"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/scraper/scraperhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/windowsperfcountersreceiver/internal/metadata"
+)
+
+const (
+	negativeCollectionIntervalErr = "\"collection_interval\": requires positive value"
+	noPerfCountersErr             = "must specify at least one perf counter"
+	noObjectNameErr               = "must specify object name for all perf counters"
+	noCountersErr                 = `perf counter for object "%s" does not specify any counters`
+	emptyInstanceErr              = `perf counter for object "%s" includes an empty instance`
 )
 
 func TestLoadConfig(t *testing.T) {
-	factories, err := componenttest.NopFactories()
+	t.Parallel()
+
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
 	require.NoError(t, err)
-
-	factory := NewFactory()
-	factories.Receivers[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
-
-	require.NoError(t, err)
-	require.NotNil(t, cfg)
-
-	assert.Equal(t, len(cfg.Receivers), 2)
-
-	r0 := cfg.Receivers[config.NewID(typeStr)]
-	defaultConfigSingleObject := factory.CreateDefaultConfig()
-	defaultConfigSingleObject.(*Config).PerfCounters = []PerfCounterConfig{{Object: "object", Counters: []string{"counter"}}}
-
-	assert.Equal(t, defaultConfigSingleObject, r0)
-
-	r1 := cfg.Receivers[config.NewIDWithName(typeStr, "customname")].(*Config)
-	expectedConfig := &Config{
-		ScraperControllerSettings: scraperhelper.ScraperControllerSettings{
-			ReceiverSettings:   config.NewReceiverSettings(config.NewIDWithName(typeStr, "customname")),
-			CollectionInterval: 30 * time.Second,
+	counterConfig := CounterConfig{
+		Name: "counter1",
+		MetricRep: MetricRep{
+			Name: "metric",
 		},
-		PerfCounters: []PerfCounterConfig{
-			{
-				Object:   "object1",
-				Counters: []string{"counter1"},
-			},
-			{
-				Object:   "object2",
-				Counters: []string{"counter1", "counter2"},
-			},
+	}
+	singleObject := createDefaultConfig()
+	singleObject.(*Config).PerfCounters = []ObjectConfig{{Object: "object", Counters: []CounterConfig{counterConfig}}}
+	singleObject.(*Config).MetricMetaData = map[string]MetricConfig{
+		"metric": {
+			Description: "desc",
+			Unit:        "1",
+			Gauge:       GaugeMetric{},
 		},
 	}
 
-	assert.Equal(t, expectedConfig, r1)
+	tests := []struct {
+		id           component.ID
+		expected     component.Config
+		expectedErrs []string
+	}{
+		{
+			id:       component.NewIDWithName(metadata.Type, ""),
+			expected: singleObject,
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "customname"),
+			expected: &Config{
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 30 * time.Second,
+					InitialDelay:       time.Second,
+				},
+				PerfCounters: []ObjectConfig{
+					{
+						Object:          "object1",
+						Instances:       []string{"*", "_Global_"},
+						AggregationName: "_Global_",
+						Counters:        []CounterConfig{counterConfig},
+					},
+					{
+						Object: "object2",
+						Counters: []CounterConfig{
+							counterConfig,
+							{
+								Name: "counter2",
+								MetricRep: MetricRep{
+									Name: "metric2",
+								},
+							},
+						},
+					},
+				},
+				MetricMetaData: map[string]MetricConfig{
+					"metric": {
+						Description: "desc",
+						Unit:        "1",
+						Gauge:       GaugeMetric{},
+					},
+					"metric2": {
+						Description: "desc",
+						Unit:        "1",
+						Gauge:       GaugeMetric{},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "nometrics"),
+			expected: &Config{
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 60 * time.Second,
+					InitialDelay:       time.Second,
+				},
+				PerfCounters: []ObjectConfig{
+					{
+						Object:   "object",
+						Counters: []CounterConfig{{Name: "counter1"}},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "nometricspecified"),
+			expected: &Config{
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 60 * time.Second,
+					InitialDelay:       time.Second,
+				},
+				PerfCounters: []ObjectConfig{
+					{
+						Object:   "object",
+						Counters: []CounterConfig{{Name: "counter1"}},
+					},
+				},
+				MetricMetaData: map[string]MetricConfig{
+					"metric": {
+						Description: "desc",
+						Unit:        "1",
+						Gauge:       GaugeMetric{},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "summetric"),
+			expected: &Config{
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 60 * time.Second,
+					InitialDelay:       time.Second,
+				},
+				PerfCounters: []ObjectConfig{
+					{
+						Object:   "object",
+						Counters: []CounterConfig{{Name: "counter1", MetricRep: MetricRep{Name: "metric"}}},
+					},
+				},
+				MetricMetaData: map[string]MetricConfig{
+					"metric": {
+						Description: "desc",
+						Unit:        "1",
+						Sum: SumMetric{
+							Aggregation: "cumulative",
+							Monotonic:   false,
+						},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "unspecifiedmetrictype"),
+			expected: &Config{
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 60 * time.Second,
+					InitialDelay:       time.Second,
+				},
+				PerfCounters: []ObjectConfig{
+					{
+						Object:   "object",
+						Counters: []CounterConfig{{Name: "counter1", MetricRep: MetricRep{Name: "metric"}}},
+					},
+				},
+				MetricMetaData: map[string]MetricConfig{
+					"metric": {
+						Description: "desc",
+						Unit:        "1",
+						Gauge:       GaugeMetric{},
+					},
+				},
+			},
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "negative-collection-interval"),
+			expectedErrs: []string{"collection_interval must be a positive duration", negativeCollectionIntervalErr},
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "noperfcounters"),
+			expectedErrs: []string{noPerfCountersErr},
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "noobjectname"),
+			expectedErrs: []string{noObjectNameErr},
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "nocounters"),
+			expectedErrs: []string{fmt.Sprintf(noCountersErr, "object")},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "allerrors"),
+			expectedErrs: []string{
+				"collection_interval must be a positive duration",
+				fmt.Sprintf(noCountersErr, "object"),
+				fmt.Sprintf(emptyInstanceErr, "object"),
+				noObjectNameErr,
+				negativeCollectionIntervalErr,
+			},
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "emptyinstance"),
+			expectedErrs: []string{fmt.Sprintf(emptyInstanceErr, "object")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
+
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			if len(tt.expectedErrs) > 0 {
+				for _, err := range tt.expectedErrs {
+					assert.ErrorContains(t, confmap.Validate(cfg), err)
+				}
+				return
+			}
+			assert.NoError(t, confmap.Validate(cfg))
+			assert.Equal(t, tt.expected, cfg)
+		})
+	}
 }
 
-func TestLoadConfig_Error(t *testing.T) {
-	type testCase struct {
-		name        string
-		cfgFile     string
-		expectedErr string
+func TestLoadDeprecatedConfig(t *testing.T) {
+	t.Parallel()
+
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config-deprecated.yaml"))
+	require.NoError(t, err)
+	counterConfig := CounterConfig{
+		Name: "counter1",
+		MetricRep: MetricRep{
+			Name: "metric",
+		},
+	}
+	singleObject := createDefaultConfig()
+	singleObject.(*Config).PerfCounters = []ObjectConfig{{Object: "object", Counters: []CounterConfig{counterConfig}}}
+	singleObject.(*Config).MetricMetaData = map[string]MetricConfig{
+		"metric": {
+			Description: "desc",
+			Unit:        "1",
+			Gauge:       GaugeMetric{},
+		},
 	}
 
-	const (
-		errorPrefix                   = "receiver \"windowsperfcounters\" has invalid configuration"
-		negativeCollectionIntervalErr = "collection_interval must be a positive duration"
-		noPerfCountersErr             = "must specify at least one perf counter"
-		noObjectNameErr               = "must specify object name for all perf counters"
-		noCountersErr                 = `perf counter for object "%s" does not specify any counters`
-		emptyInstanceErr              = `perf counter for object "%s" includes an empty instance`
-	)
-
-	testCases := []testCase{
+	tests := []struct {
+		id           component.ID
+		expected     component.Config
+		expectedErrs []string
+	}{
 		{
-			name:        "NegativeCollectionInterval",
-			cfgFile:     "config-negative-collection-interval.yaml",
-			expectedErr: fmt.Sprintf("%s: %s", errorPrefix, negativeCollectionIntervalErr),
+			id:       component.NewIDWithName(metadata.DeprecatedType, ""),
+			expected: singleObject,
 		},
 		{
-			name:        "NoPerfCounters",
-			cfgFile:     "config-noperfcounters.yaml",
-			expectedErr: fmt.Sprintf("%s: %s", errorPrefix, noPerfCountersErr),
+			id: component.NewIDWithName(metadata.DeprecatedType, "customname"),
+			expected: &Config{
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 30 * time.Second,
+					InitialDelay:       time.Second,
+				},
+				PerfCounters: []ObjectConfig{
+					{
+						Object:          "object1",
+						Instances:       []string{"*", "_Global_"},
+						AggregationName: "_Global_",
+						Counters:        []CounterConfig{counterConfig},
+					},
+					{
+						Object: "object2",
+						Counters: []CounterConfig{
+							counterConfig,
+							{
+								Name: "counter2",
+								MetricRep: MetricRep{
+									Name: "metric2",
+								},
+							},
+						},
+					},
+				},
+				MetricMetaData: map[string]MetricConfig{
+					"metric": {
+						Description: "desc",
+						Unit:        "1",
+						Gauge:       GaugeMetric{},
+					},
+					"metric2": {
+						Description: "desc",
+						Unit:        "1",
+						Gauge:       GaugeMetric{},
+					},
+				},
+			},
 		},
 		{
-			name:        "NoObjectName",
-			cfgFile:     "config-noobjectname.yaml",
-			expectedErr: fmt.Sprintf("%s: %s", errorPrefix, noObjectNameErr),
+			id: component.NewIDWithName(metadata.DeprecatedType, "nometrics"),
+			expected: &Config{
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 60 * time.Second,
+					InitialDelay:       time.Second,
+				},
+				PerfCounters: []ObjectConfig{
+					{
+						Object:   "object",
+						Counters: []CounterConfig{{Name: "counter1"}},
+					},
+				},
+			},
 		},
 		{
-			name:        "NoCounters",
-			cfgFile:     "config-nocounters.yaml",
-			expectedErr: fmt.Sprintf("%s: %s", errorPrefix, fmt.Sprintf(noCountersErr, "object")),
+			id: component.NewIDWithName(metadata.DeprecatedType, "nometricspecified"),
+			expected: &Config{
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 60 * time.Second,
+					InitialDelay:       time.Second,
+				},
+				PerfCounters: []ObjectConfig{
+					{
+						Object:   "object",
+						Counters: []CounterConfig{{Name: "counter1"}},
+					},
+				},
+				MetricMetaData: map[string]MetricConfig{
+					"metric": {
+						Description: "desc",
+						Unit:        "1",
+						Gauge:       GaugeMetric{},
+					},
+				},
+			},
 		},
 		{
-			name:        "EmptyInstance",
-			cfgFile:     "config-emptyinstance.yaml",
-			expectedErr: fmt.Sprintf("%s: %s", errorPrefix, fmt.Sprintf(emptyInstanceErr, "object")),
+			id: component.NewIDWithName(metadata.DeprecatedType, "summetric"),
+			expected: &Config{
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 60 * time.Second,
+					InitialDelay:       time.Second,
+				},
+				PerfCounters: []ObjectConfig{
+					{
+						Object:   "object",
+						Counters: []CounterConfig{{Name: "counter1", MetricRep: MetricRep{Name: "metric"}}},
+					},
+				},
+				MetricMetaData: map[string]MetricConfig{
+					"metric": {
+						Description: "desc",
+						Unit:        "1",
+						Sum: SumMetric{
+							Aggregation: "cumulative",
+							Monotonic:   false,
+						},
+					},
+				},
+			},
 		},
 		{
-			name:    "AllErrors",
-			cfgFile: "config-allerrors.yaml",
-			expectedErr: fmt.Sprintf(
-				"%s: [%s; %s; %s; %s]",
-				errorPrefix,
-				negativeCollectionIntervalErr,
-				fmt.Sprintf(emptyInstanceErr, "object"),
+			id: component.NewIDWithName(metadata.DeprecatedType, "unspecifiedmetrictype"),
+			expected: &Config{
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 60 * time.Second,
+					InitialDelay:       time.Second,
+				},
+				PerfCounters: []ObjectConfig{
+					{
+						Object:   "object",
+						Counters: []CounterConfig{{Name: "counter1", MetricRep: MetricRep{Name: "metric"}}},
+					},
+				},
+				MetricMetaData: map[string]MetricConfig{
+					"metric": {
+						Description: "desc",
+						Unit:        "1",
+						Gauge:       GaugeMetric{},
+					},
+				},
+			},
+		},
+		{
+			id:           component.NewIDWithName(metadata.DeprecatedType, "negative-collection-interval"),
+			expectedErrs: []string{"collection_interval must be a positive duration", negativeCollectionIntervalErr},
+		},
+		{
+			id:           component.NewIDWithName(metadata.DeprecatedType, "noperfcounters"),
+			expectedErrs: []string{noPerfCountersErr},
+		},
+		{
+			id:           component.NewIDWithName(metadata.DeprecatedType, "noobjectname"),
+			expectedErrs: []string{noObjectNameErr},
+		},
+		{
+			id:           component.NewIDWithName(metadata.DeprecatedType, "nocounters"),
+			expectedErrs: []string{fmt.Sprintf(noCountersErr, "object")},
+		},
+		{
+			id: component.NewIDWithName(metadata.DeprecatedType, "allerrors"),
+			expectedErrs: []string{
+				"collection_interval must be a positive duration",
 				fmt.Sprintf(noCountersErr, "object"),
+				fmt.Sprintf(emptyInstanceErr, "object"),
 				noObjectNameErr,
-			),
+				negativeCollectionIntervalErr,
+			},
+		},
+		{
+			id:           component.NewIDWithName(metadata.DeprecatedType, "emptyinstance"),
+			expectedErrs: []string{fmt.Sprintf(emptyInstanceErr, "object")},
 		},
 	}
 
-	for _, test := range testCases {
-		t.Run(test.name, func(t *testing.T) {
-			factories, err := componenttest.NopFactories()
-			require.NoError(t, err)
-
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
 			factory := NewFactory()
-			factories.Receivers[typeStr] = factory
-			_, err = configtest.LoadConfigAndValidate(path.Join(".", "testdata", test.cfgFile), factories)
+			cfg := factory.CreateDefaultConfig()
 
-			require.EqualError(t, err, test.expectedErr)
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			if len(tt.expectedErrs) > 0 {
+				for _, err := range tt.expectedErrs {
+					assert.ErrorContains(t, confmap.Validate(cfg), err)
+				}
+				return
+			}
+			assert.NoError(t, confmap.Validate(cfg))
+			assert.Equal(t, tt.expected, cfg)
+		})
+	}
+}
+
+func TestAggregationSettings(t *testing.T) {
+	tests := []struct {
+		name                       string
+		config                     ObjectConfig
+		expectedAggregationName    string
+		includeAggregationInstance bool
+	}{
+		{
+			name:                    "wildcard preserves old behavior",
+			config:                  ObjectConfig{Instances: []string{"*"}},
+			expectedAggregationName: defaultAggregationName,
+		},
+		{
+			name:                       "wildcard and default aggregation opts in",
+			config:                     ObjectConfig{Instances: []string{"*", defaultAggregationName}},
+			expectedAggregationName:    defaultAggregationName,
+			includeAggregationInstance: true,
+		},
+		{
+			name:                    "default aggregation alone keeps standalone behavior",
+			config:                  ObjectConfig{Instances: []string{defaultAggregationName}},
+			expectedAggregationName: defaultAggregationName,
+		},
+		{
+			name:                    "unrelated explicit instance does not opt in",
+			config:                  ObjectConfig{Instances: []string{"*", "worker"}},
+			expectedAggregationName: defaultAggregationName,
+		},
+		{
+			name:                    "custom aggregation with wildcard",
+			config:                  ObjectConfig{Instances: []string{"*"}, AggregationName: "_Global_"},
+			expectedAggregationName: "_Global_",
+		},
+		{
+			name:                       "wildcard and custom aggregation opts in",
+			config:                     ObjectConfig{Instances: []string{"*", "_Global_"}, AggregationName: "_Global_"},
+			expectedAggregationName:    "_Global_",
+			includeAggregationInstance: true,
+		},
+		{
+			name:                    "default name is ordinary when aggregation is custom",
+			config:                  ObjectConfig{Instances: []string{"*", defaultAggregationName}, AggregationName: "_Global_"},
+			expectedAggregationName: "_Global_",
+		},
+		{
+			name:                    "empty aggregation name uses default",
+			config:                  ObjectConfig{Instances: []string{"*"}, AggregationName: ""},
+			expectedAggregationName: defaultAggregationName,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			aggregationName, includeAggregationInstance := test.config.aggregationSettings()
+			assert.Equal(t, test.expectedAggregationName, aggregationName)
+			assert.Equal(t, test.includeAggregationInstance, includeAggregationInstance)
 		})
 	}
 }

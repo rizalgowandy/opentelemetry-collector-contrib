@@ -1,33 +1,109 @@
-receivers:
-  nop:
-
-processors:
-  nop:
-
-exporters:
-  elasticsearch:
-    endpoints: [https://elastic.example.com:9200]
-  elasticsearch/customname:
-    endpoints: [https://elastic.example.com:9200]
-    cloudid: TRNMxjXlNJEt
-    timeout: 2m
-    headers:
-      myheader: test
-    index: myindex
-    pipeline: mypipeline
-    user: elastic
-    password: search
-    api_key: AvFsEiPs==
-    discover:
-      on_start: true
-    flush:
-      bytes: 10485760
-    retry:
-      max_requests: 5
-
-service:
-  pipelines:
-    logs:
-      receivers: [nop]
-      processors: [nop]
-      exporters: [elasticsearch]
+elasticsearch:
+  endpoints: [https://elastic.example.com:9200]
+elasticsearch/trace:
+  tls:
+    insecure: false
+  endpoints: [https://elastic.example.com:9200]
+  timeout: 2m
+  headers:
+    myheader: test
+  traces_index: trace_index
+  pipeline: mypipeline
+  user: elastic
+  password: search
+  api_key: AvFsEiPs==
+  discover:
+    on_start: true
+  retry:
+    max_retries: 5
+    retry_on_status:
+      - 429
+      - 500
+elasticsearch/metric:
+  tls:
+    insecure: false
+  endpoints: [http://localhost:9200]
+  metrics_index: my_metric_index
+  timeout: 2m
+  headers:
+    myheader: test
+  pipeline: mypipeline
+  user: elastic
+  password: search
+  api_key: AvFsEiPs==
+  discover:
+    on_start: true
+  retry:
+    max_retries: 5
+    retry_on_status:
+      - 429
+      - 500
+elasticsearch/log:
+  tls:
+    insecure: false
+  endpoints: [http://localhost:9200]
+  logs_index: my_log_index
+  timeout: 2m
+  headers:
+    myheader: test
+  pipeline: mypipeline
+  user: elastic
+  password: search
+  api_key: AvFsEiPs==
+  discover:
+    on_start: true
+  retry:
+    max_retries: 5
+    retry_on_status:
+      - 429
+      - 500
+elasticsearch/logstash_format:
+  endpoints: [http://localhost:9200]
+  logstash_format:
+    enabled: true
+elasticsearch/cloudid:
+  cloudid: foo:YmFyLmNsb3VkLmVzLmlvJGFiYzEyMyRkZWY0NTY=
+elasticsearch/confighttp_endpoint:
+  endpoint: https://elastic.example.com:9200
+elasticsearch/compression_none:
+  endpoint: https://elastic.example.com:9200
+  compression: none
+elasticsearch/compression_gzip:
+  endpoint: https://elastic.example.com:9200
+  compression: gzip
+elasticsearch/include_source_on_error:
+  endpoint: https://elastic.example.com:9200
+  include_source_on_error: true
+elasticsearch/metadata_keys:
+  endpoint: https://elastic.example.com:9200
+  metadata_keys:
+    - x-test-1
+    - x-test-2
+elasticsearch/sendingqueue_disabled:
+  endpoint: https://elastic.example.com:9200
+  sending_queue:
+    enabled: false
+elasticsearch/sendingqueue_enabled:
+  endpoint: https://elastic.example.com:9200
+  sending_queue:
+    enabled: true
+    sizer: requests
+    num_consumers: 100
+    batch:
+      flush_timeout: 1s
+      sizer: items
+      min_size: 1000
+      max_size: 5000
+elasticsearch/suppress_conflict_errors:
+  endpoint: https://elastic.example.com:9200
+  suppress_conflict_errors: true
+elasticsearch/retry_on_document_status:
+  endpoint: https://elastic.example.com:9200
+  retry:
+    retry_on_status: [429, 500]
+    retry_on_document_status: [400, 409]
+elasticsearch/retry_on_document_status_empty:
+  endpoint: https://elastic.example.com:9200
+  retry:
+    retry_on_status: [429, 500]
+    retry_on_document_status: []

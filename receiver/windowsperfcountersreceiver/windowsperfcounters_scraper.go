@@ -1,150 +1,223 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-// +build windows
+//go:build windows
 
-package windowsperfcountersreceiver
+package windowsperfcountersreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/windowsperfcountersreceiver"
 
 import (
 	"context"
-	"fmt"
+	"slices"
 	"time"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer/consumererror"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/scraper/scrapererror"
+	"go.uber.org/multierr"
 	"go.uber.org/zap"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/windowsperfcountersreceiver/internal/pdh"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/windowsperfcountersreceiver/internal/third_party/telegraf/win_perf_counters"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/winperfcounters"
 )
 
 const instanceLabelName = "instance"
 
-type PerfCounterScraper interface {
-	// Path returns the counter path
-	Path() string
-	// ScrapeData collects a measurement and returns the value(s).
-	ScrapeData() ([]win_perf_counters.CounterValue, error)
-	// Close all counters/handles related to the query and free all associated memory.
-	Close() error
+type perfCounterMetricWatcher struct {
+	winperfcounters.PerfCounterWatcher
+	MetricRep MetricRep
+	recreate  bool
 }
 
-// scraper is the type that scrapes various host metrics.
-type scraper struct {
+type newWatcherFunc func(string, string, string, ...winperfcounters.WatcherOption) (winperfcounters.PerfCounterWatcher, error)
+
+// windowsPerfCountersScraper is the type that scrapes various host metrics.
+type windowsPerfCountersScraper struct {
 	cfg      *Config
-	logger   *zap.Logger
-	counters []PerfCounterScraper
+	settings component.TelemetrySettings
+	watchers []perfCounterMetricWatcher
+
+	// for mocking
+	newWatcher newWatcherFunc
 }
 
-func newScraper(cfg *Config, logger *zap.Logger) (*scraper, error) {
-	if err := cfg.Validate(); err != nil {
-		return nil, err
+func newScraper(cfg *Config, settings component.TelemetrySettings) *windowsPerfCountersScraper {
+	return &windowsPerfCountersScraper{cfg: cfg, settings: settings, newWatcher: winperfcounters.NewWatcher}
+}
+
+func (s *windowsPerfCountersScraper) start(context.Context, component.Host) error {
+	watchers, err := s.initWatchers()
+	if err != nil {
+		s.settings.Logger.Warn("some performance counters could not be initialized", zap.Error(err))
 	}
-
-	s := &scraper{cfg: cfg, logger: logger}
-	return s, nil
+	s.watchers = watchers
+	return nil
 }
 
-func (s *scraper) start(context.Context, component.Host) error {
-	var errors []error
+func (s *windowsPerfCountersScraper) initWatchers() ([]perfCounterMetricWatcher, error) {
+	var errs error
+	var watchers []perfCounterMetricWatcher
 
-	for _, perfCounterCfg := range s.cfg.PerfCounters {
-		for _, instance := range perfCounterCfg.instances() {
-			for _, counterName := range perfCounterCfg.Counters {
-				counterPath := counterPath(perfCounterCfg.Object, instance, counterName)
-
-				c, err := pdh.NewPerfCounter(counterPath, true)
+	for _, objCfg := range s.cfg.PerfCounters {
+		aggregationName, includeAggregationInstance := objCfg.aggregationSettings()
+		options := []winperfcounters.WatcherOption{winperfcounters.WithLogger(s.settings.Logger), winperfcounters.WithAggregationName(aggregationName)}
+		if includeAggregationInstance {
+			options = append(options, winperfcounters.WithIncludeAggregationInstance())
+		}
+		for _, instance := range instancesFromConfig(objCfg) {
+			for _, counterCfg := range objCfg.Counters {
+				pcw, err := s.newWatcher(objCfg.Object, instance, counterCfg.Name, options...)
 				if err != nil {
-					errors = append(errors, fmt.Errorf("counter %v: %w", counterPath, err))
-				} else {
-					s.counters = append(s.counters, c)
+					errs = multierr.Append(errs, err)
+					continue
 				}
+
+				watcher := perfCounterMetricWatcher{
+					PerfCounterWatcher: pcw,
+					MetricRep:          MetricRep{Name: pcw.Path()},
+					recreate:           counterCfg.RecreateQuery,
+				}
+				if counterCfg.MetricRep.Name != "" {
+					watcher.MetricRep.Name = counterCfg.MetricRep.Name
+					if counterCfg.MetricRep.Attributes != nil {
+						watcher.MetricRep.Attributes = counterCfg.MetricRep.Attributes
+					}
+				}
+
+				watchers = append(watchers, watcher)
 			}
 		}
 	}
 
-	// log a warning if some counters cannot be loaded, but do not crash the app
-	if len(errors) > 0 {
-		s.logger.Warn("some performance counters could not be initialized", zap.Error(consumererror.Combine(errors)))
-	}
-
-	return nil
+	return watchers, errs
 }
 
-func counterPath(object, instance, counterName string) string {
-	if instance != "" {
-		instance = fmt.Sprintf("(%s)", instance)
-	}
-
-	return fmt.Sprintf("\\%s%s\\%s", object, instance, counterName)
-}
-
-func (s *scraper) shutdown(context.Context) error {
-	var errors []error
-
-	for _, counter := range s.counters {
-		if err := counter.Close(); err != nil {
-			errors = append(errors, err)
+func (s *windowsPerfCountersScraper) shutdown(context.Context) error {
+	var errs error
+	for _, watcher := range s.watchers {
+		err := watcher.Close()
+		if err != nil {
+			errs = multierr.Append(errs, err)
 		}
 	}
-
-	return consumererror.Combine(errors)
+	return errs
 }
 
-func (s *scraper) scrape(context.Context) (pdata.MetricSlice, error) {
-	metrics := pdata.NewMetricSlice()
+func (s *windowsPerfCountersScraper) scrape(context.Context) (pmetric.Metrics, error) {
+	md := pmetric.NewMetrics()
+	metricSlice := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics()
+	now := pcommon.NewTimestampFromTime(time.Now())
+	var errs error
 
-	now := pdata.TimestampFromTime(time.Now())
+	metricSlice.EnsureCapacity(len(s.watchers))
+	metrics := map[string]pmetric.Metric{}
+	for name, metricCfg := range s.cfg.MetricMetaData {
+		builtMetric := metricSlice.AppendEmpty()
 
-	var errors []error
+		builtMetric.SetName(name)
+		builtMetric.SetDescription(metricCfg.Description)
+		builtMetric.SetUnit(metricCfg.Unit)
 
-	metrics.Resize(len(s.counters))
-	idx := 0
-	for _, counter := range s.counters {
-		counterValues, err := counter.ScrapeData()
+		if (metricCfg.Sum != SumMetric{}) {
+			builtMetric.SetEmptySum().SetIsMonotonic(metricCfg.Sum.Monotonic)
+
+			switch metricCfg.Sum.Aggregation {
+			case "cumulative":
+				builtMetric.Sum().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+			case "delta":
+				builtMetric.Sum().SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+			}
+		} else {
+			builtMetric.SetEmptyGauge()
+		}
+
+		metrics[name] = builtMetric
+	}
+
+	scrapeFailures := 0
+	for _, watcher := range s.watchers {
+		counterVals, err := watcher.ScrapeData()
 		if err != nil {
-			errors = append(errors, err)
+			if !winperfcounters.IsIgnorableError(err) {
+				errs = multierr.Append(errs, err)
+				scrapeFailures++
+			}
 			continue
 		}
 
-		initializeDoubleGaugeMetric(metrics.At(idx), now, counter.Path(), counterValues)
-		idx++
-	}
-	metrics.Resize(len(s.counters) - len(errors))
+		if watcher.recreate {
+			err := watcher.Reset()
+			if err != nil {
+				errs = multierr.Append(errs, err)
+			}
+		}
 
-	return metrics, consumererror.Combine(errors)
+		for _, val := range counterVals {
+			var metric pmetric.Metric
+			if builtmetric, ok := metrics[watcher.MetricRep.Name]; ok {
+				metric = builtmetric
+			} else {
+				metric = metricSlice.AppendEmpty()
+				metric.SetName(watcher.MetricRep.Name)
+				metric.SetUnit("1")
+				metric.SetEmptyGauge()
+			}
+
+			initializeMetricDps(metric, now, val, watcher.MetricRep.Attributes)
+		}
+	}
+
+	// Drop metrics with no datapoints. This happens when configured counters don't exist on the host.
+	// This may result in a Metrics message with no metrics if all counters are missing.
+	metricSlice.RemoveIf(func(m pmetric.Metric) bool {
+		switch m.Type() {
+		case pmetric.MetricTypeGauge:
+			return m.Gauge().DataPoints().Len() == 0
+		case pmetric.MetricTypeSum:
+			return m.Sum().DataPoints().Len() == 0
+		default:
+			return false
+		}
+	})
+
+	if scrapeFailures != 0 && scrapeFailures != len(s.watchers) {
+		errs = scrapererror.NewPartialScrapeError(errs, scrapeFailures)
+	}
+
+	return md, errs
 }
 
-func initializeDoubleGaugeMetric(metric pdata.Metric, now pdata.Timestamp, name string, counterValues []win_perf_counters.CounterValue) {
-	metric.SetName(name)
-	metric.SetDataType(pdata.MetricDataTypeDoubleGauge)
+func initializeMetricDps(metric pmetric.Metric, now pcommon.Timestamp, counterValue winperfcounters.CounterValue,
+	attributes map[string]string,
+) {
+	var dps pmetric.NumberDataPointSlice
 
-	dg := metric.DoubleGauge()
-	ddps := dg.DataPoints()
-	ddps.Resize(len(counterValues))
-	for i, counterValue := range counterValues {
-		initializeDoubleDataPoint(ddps.At(i), now, counterValue.InstanceName, counterValue.Value)
+	if metric.Type() == pmetric.MetricTypeGauge {
+		dps = metric.Gauge().DataPoints()
+	} else {
+		dps = metric.Sum().DataPoints()
 	}
+
+	dp := dps.AppendEmpty()
+	if counterValue.InstanceName != "" {
+		dp.Attributes().PutStr(instanceLabelName, counterValue.InstanceName)
+	}
+
+	for attKey, attVal := range attributes {
+		dp.Attributes().PutStr(attKey, attVal)
+	}
+
+	dp.SetTimestamp(now)
+	dp.SetDoubleValue(counterValue.Value)
 }
 
-func initializeDoubleDataPoint(dataPoint pdata.DoubleDataPoint, now pdata.Timestamp, instanceLabel string, value float64) {
-	if instanceLabel != "" {
-		labelsMap := dataPoint.LabelsMap()
-		labelsMap.Insert(instanceLabelName, instanceLabel)
+func instancesFromConfig(oc ObjectConfig) []string {
+	if len(oc.Instances) == 0 {
+		return []string{""}
 	}
 
-	dataPoint.SetTimestamp(now)
-	dataPoint.SetValue(value)
+	if slices.Contains(oc.Instances, "*") {
+		return []string{"*"}
+	}
+
+	return oc.Instances
 }

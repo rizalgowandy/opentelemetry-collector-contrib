@@ -1,0 +1,79 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build (!remove_all_resourcedetection_detectors || enable_detector_heroku) && !omit_detector_heroku
+
+package heroku // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/heroku"
+
+import (
+	"context"
+	"errors"
+	"os"
+
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/processor"
+	conventions "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/heroku/internal/metadata"
+)
+
+// NewDetector returns a detector which can detect resource attributes on Heroku
+func NewDetector(set processor.Settings, dcfg internal.DetectorConfig, failOnMissingMetadata bool) (internal.Detector, error) {
+	cfg := dcfg.(Config)
+	return &detector{
+		logger:                set.Logger,
+		rb:                    metadata.NewResourceBuilder(cfg.ResourceAttributes),
+		failOnMissingMetadata: failOnMissingMetadata,
+	}, nil
+}
+
+type detector struct {
+	logger                *zap.Logger
+	rb                    *metadata.ResourceBuilder
+	failOnMissingMetadata bool
+}
+
+// Detect detects heroku metadata and returns a resource with the available ones
+func (d *detector) Detect(_ context.Context) (resource pcommon.Resource, schemaURL string, err error) {
+	dynoIDMissing := false
+	if dynoID, ok := os.LookupEnv("HEROKU_DYNO_ID"); ok {
+		d.rb.SetServiceInstanceID(dynoID)
+	} else {
+		dynoIDMissing = true
+	}
+
+	herokuAppIDMissing := false
+	if v, ok := os.LookupEnv("HEROKU_APP_ID"); ok {
+		d.rb.SetHerokuAppID(v)
+	} else {
+		herokuAppIDMissing = true
+	}
+	if dynoIDMissing && herokuAppIDMissing {
+		if d.failOnMissingMetadata {
+			return pcommon.NewResource(), "", errors.New("heroku metadata unavailable: HEROKU_DYNO_ID and HEROKU_APP_ID env vars not set")
+		}
+		d.logger.Debug("Heroku metadata is missing. Please check metadata is enabled.")
+	} else if dynoIDMissing {
+		// some heroku deployments will enable some of the metadata.
+		d.logger.Debug("Partial Heroku metadata is missing. Please check metadata is supported.")
+	}
+	if !herokuAppIDMissing {
+		d.rb.SetCloudProvider(conventions.CloudProviderHeroku.Value.AsString())
+	}
+	if v, ok := os.LookupEnv("HEROKU_APP_NAME"); ok {
+		d.rb.SetServiceName(v)
+	}
+	if v, ok := os.LookupEnv("HEROKU_RELEASE_CREATED_AT"); ok {
+		d.rb.SetHerokuReleaseCreationTimestamp(v)
+	}
+	if v, ok := os.LookupEnv("HEROKU_RELEASE_VERSION"); ok {
+		d.rb.SetServiceVersion(v)
+	}
+	if v, ok := os.LookupEnv("HEROKU_SLUG_COMMIT"); ok {
+		d.rb.SetHerokuReleaseCommit(v)
+	}
+
+	return d.rb.Emit(), conventions.SchemaURL, nil
+}

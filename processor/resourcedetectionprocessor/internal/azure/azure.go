@@ -1,72 +1,136 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package azure
+//go:build (!remove_all_resourcedetection_detectors || enable_detector_azure) && !omit_detector_azure
+
+package azure // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/azure"
 
 import (
 	"context"
+	"fmt"
+	"regexp"
 
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/conventions"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/processor"
+	conventions "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.uber.org/zap"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/metadataproviders/azure"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal/azure/internal/metadata"
 )
 
-const (
-	// TypeStr is type of detector.
-	TypeStr = "azure"
-)
+const tagPrefix = "azure.tag."
 
 var _ internal.Detector = (*Detector)(nil)
 
 // Detector is an Azure metadata detector
 type Detector struct {
-	provider Provider
-	logger   *zap.Logger
+	provider              azure.Provider
+	tagKeyRegexes         []*regexp.Regexp
+	logger                *zap.Logger
+	rb                    *metadata.ResourceBuilder
+	failOnMissingMetadata bool
 }
 
 // NewDetector creates a new Azure metadata detector
-func NewDetector(p component.ProcessorCreateSettings, cfg internal.DetectorConfig) (internal.Detector, error) {
+func NewDetector(p processor.Settings, dcfg internal.DetectorConfig, failOnMissingMetadata bool) (internal.Detector, error) {
+	cfg := dcfg.(Config)
+
+	tagKeyRegexes, err := compileRegexes(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Detector{
-		provider: NewProvider(),
-		logger:   p.Logger,
+		provider:              azure.NewProvider(),
+		tagKeyRegexes:         tagKeyRegexes,
+		logger:                p.Logger,
+		rb:                    metadata.NewResourceBuilder(cfg.ResourceAttributes),
+		failOnMissingMetadata: failOnMissingMetadata,
 	}, nil
 }
 
 // Detect detects system metadata and returns a resource with the available ones
-func (d *Detector) Detect(ctx context.Context) (pdata.Resource, error) {
-	res := pdata.NewResource()
-	attrs := res.Attributes()
-
+func (d *Detector) Detect(ctx context.Context) (resource pcommon.Resource, schemaURL string, err error) {
 	compute, err := d.provider.Metadata(ctx)
 	if err != nil {
 		d.logger.Debug("Azure detector metadata retrieval failed", zap.Error(err))
-		// return an empty Resource and no error
-		return res, nil
+		if d.failOnMissingMetadata {
+			return pcommon.NewResource(), "", fmt.Errorf("azure metadata unavailable: %w", err)
+		}
+		return pcommon.NewResource(), "", nil
 	}
 
-	attrs.InsertString(conventions.AttributeCloudProvider, conventions.AttributeCloudProviderAzure)
-	attrs.InsertString(conventions.AttributeCloudPlatform, conventions.AttributeCloudPlatformAzureVM)
-	attrs.InsertString(conventions.AttributeHostName, compute.Name)
-	attrs.InsertString(conventions.AttributeCloudRegion, compute.Location)
-	attrs.InsertString(conventions.AttributeHostID, compute.VMID)
-	attrs.InsertString(conventions.AttributeCloudAccount, compute.SubscriptionID)
-	attrs.InsertString("azure.vm.size", compute.VMSize)
-	attrs.InsertString("azure.vm.scaleset.name", compute.VMScaleSetName)
-	attrs.InsertString("azure.resourcegroup.name", compute.ResourceGroupName)
+	d.rb.SetCloudProvider(conventions.CloudProviderAzure.Value.AsString())
+	d.rb.SetCloudPlatform(conventions.CloudPlatformAzureVM.Value.AsString())
+	// Use osProfile.computerName for host.name, falling back to the VM name
+	// if computerName is empty (e.g., VMs created from specialized disks).
+	if compute.OSProfile.ComputerName != "" {
+		d.rb.SetHostName(compute.OSProfile.ComputerName)
+	} else if compute.Name != "" {
+		d.rb.SetHostName(compute.Name)
+	}
+	d.rb.SetCloudRegion(compute.Location)
+	d.rb.SetHostID(compute.VMID)
+	d.rb.SetCloudAccountID(compute.SubscriptionID)
+	if compute.AvailabilityZone != "" {
+		d.rb.SetCloudAvailabilityZone(compute.AvailabilityZone)
+	}
 
-	return res, nil
+	// Also save compute.Name in "azure.vm.name" as host.id (AttributeHostName) is
+	// used by system detector.
+	d.rb.SetAzureVMName(compute.Name)
+	d.rb.SetAzureVMSize(compute.VMSize)
+	if compute.VMScaleSetName != "" {
+		d.rb.SetAzureVMScalesetName(compute.VMScaleSetName)
+	}
+	if metadata.ProcessorAzuredetectorRenameResourceGroupAttributeFeatureGate.IsEnabled() {
+		d.rb.SetAzureResourceGroupName(compute.ResourceGroupName)
+	} else {
+		d.rb.SetAzureResourcegroupName(compute.ResourceGroupName)
+	}
+	res := d.rb.Emit()
+
+	if len(d.tagKeyRegexes) != 0 {
+		tags := matchAzureTags(compute.TagsList, d.tagKeyRegexes)
+		for key, val := range tags {
+			res.Attributes().PutStr(tagPrefix+key, val)
+		}
+	}
+
+	return res, conventions.SchemaURL, nil
+}
+
+func matchAzureTags(azureTags []azure.ComputeTagsListMetadata, tagKeyRegexes []*regexp.Regexp) map[string]string {
+	tags := make(map[string]string)
+	for _, tag := range azureTags {
+		matched := regexArrayMatch(tagKeyRegexes, tag.Name)
+		if matched {
+			tags[tag.Name] = tag.Value
+		}
+	}
+	return tags
+}
+
+func compileRegexes(cfg Config) ([]*regexp.Regexp, error) {
+	tagRegexes := make([]*regexp.Regexp, len(cfg.Tags))
+	for i, elem := range cfg.Tags {
+		regex, err := regexp.Compile(elem)
+		if err != nil {
+			return nil, err
+		}
+		tagRegexes[i] = regex
+	}
+	return tagRegexes, nil
+}
+
+func regexArrayMatch(arr []*regexp.Regexp, val string) bool {
+	for _, elem := range arr {
+		matched := elem.MatchString(val)
+		if matched {
+			return true
+		}
+	}
+	return false
 }

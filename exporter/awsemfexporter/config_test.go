@@ -1,123 +1,360 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package awsemfexporter
 
 import (
-	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configtest"
-	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/featuregate"
 	"go.uber.org/zap"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsemfexporter/internal/metadata"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/awsutil"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/resourcetotelemetry"
 )
 
 func TestLoadConfig(t *testing.T) {
-	factories, err := componenttest.NopFactories()
-	assert.Nil(t, err)
+	t.Parallel()
 
-	factory := NewFactory()
-	factories.Exporters[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
-
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
 	require.NoError(t, err)
-	require.NotNil(t, cfg)
 
-	assert.Equal(t, 3, len(cfg.Exporters))
-
-	r0 := cfg.Exporters[config.NewID(typeStr)]
-	assert.Equal(t, factory.CreateDefaultConfig(), r0)
-
-	r1 := cfg.Exporters[config.NewIDWithName(typeStr, "1")].(*Config)
-	assert.NoError(t, r1.Validate())
-	assert.Equal(t,
-		&Config{
-			ExporterSettings: config.NewExporterSettings(config.NewIDWithName(typeStr, "1")),
-			AWSSessionSettings: awsutil.AWSSessionSettings{
-				NumberOfWorkers:       8,
-				Endpoint:              "",
-				RequestTimeoutSeconds: 30,
-				MaxRetries:            2,
-				NoVerifySSL:           false,
-				ProxyAddress:          "",
-				Region:                "us-west-2",
-				RoleARN:               "arn:aws:iam::123456789:role/monitoring-EKS-NodeInstanceRole",
+	tests := []struct {
+		id       component.ID
+		expected component.Config
+	}{
+		{
+			id:       component.NewIDWithName(metadata.Type, ""),
+			expected: createDefaultConfig(),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "1"),
+			expected: &Config{
+				AWSSessionSettings: awsutil.AWSSessionSettings{
+					NumberOfWorkers:       8,
+					Endpoint:              "",
+					RequestTimeoutSeconds: 30,
+					MaxRetries:            2,
+					NoVerifySSL:           false,
+					ProxyAddress:          "",
+					Region:                "us-west-2",
+					RoleARN:               "arn:aws:iam::123456789:role/monitoring-EKS-NodeInstanceRole",
+				},
+				LogGroupName:          "",
+				LogStreamName:         "",
+				DimensionRollupOption: "ZeroAndSingleDimensionRollup",
+				OutputDestination:     "cloudwatch",
+				Version:               "1",
+				logger:                zap.NewNop(),
 			},
-			LogGroupName:                    "",
-			LogStreamName:                   "",
-			DimensionRollupOption:           "ZeroAndSingleDimensionRollup",
-			OutputDestination:               "cloudwatch",
-			ParseJSONEncodedAttributeValues: make([]string, 0),
-			MetricDeclarations:              []*MetricDeclaration{},
-			MetricDescriptors:               []MetricDescriptor{},
-		}, r1)
-
-	r2 := cfg.Exporters[config.NewIDWithName(typeStr, "resource_attr_to_label")].(*Config)
-	assert.NoError(t, r2.Validate())
-	assert.Equal(t, r2,
-		&Config{
-			ExporterSettings: config.NewExporterSettings(config.NewIDWithName(typeStr, "resource_attr_to_label")),
-			AWSSessionSettings: awsutil.AWSSessionSettings{
-				NumberOfWorkers:       8,
-				Endpoint:              "",
-				RequestTimeoutSeconds: 30,
-				MaxRetries:            2,
-				NoVerifySSL:           false,
-				ProxyAddress:          "",
-				Region:                "",
-				RoleARN:               "",
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "resource_attr_to_label"),
+			expected: &Config{
+				AWSSessionSettings: awsutil.AWSSessionSettings{
+					NumberOfWorkers:       8,
+					Endpoint:              "",
+					RequestTimeoutSeconds: 30,
+					MaxRetries:            2,
+					NoVerifySSL:           false,
+					ProxyAddress:          "",
+					Region:                "",
+					RoleARN:               "",
+				},
+				LogGroupName:          "",
+				LogStreamName:         "",
+				DimensionRollupOption: "ZeroAndSingleDimensionRollup",
+				OutputDestination:     "cloudwatch",
+				Version:               "1",
+				//nolint:staticcheck // test deprecated field
+				ResourceToTelemetrySettings: resourcetotelemetry.Settings{Enabled: true},
+				logger:                      zap.NewNop(),
 			},
-			LogGroupName:                    "",
-			LogStreamName:                   "",
-			DimensionRollupOption:           "ZeroAndSingleDimensionRollup",
-			OutputDestination:               "cloudwatch",
-			ResourceToTelemetrySettings:     exporterhelper.ResourceToTelemetrySettings{Enabled: true},
-			ParseJSONEncodedAttributeValues: make([]string, 0),
-			MetricDeclarations:              []*MetricDeclaration{},
-			MetricDescriptors:               []MetricDescriptor{},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "metric_descriptors"),
+			expected: &Config{
+				AWSSessionSettings: awsutil.AWSSessionSettings{
+					NumberOfWorkers:       8,
+					Endpoint:              "",
+					RequestTimeoutSeconds: 30,
+					MaxRetries:            2,
+					NoVerifySSL:           false,
+					ProxyAddress:          "",
+					Region:                "",
+					RoleARN:               "",
+				},
+				LogGroupName:          "",
+				LogStreamName:         "",
+				DimensionRollupOption: "ZeroAndSingleDimensionRollup",
+				OutputDestination:     "cloudwatch",
+				Version:               "1",
+				MetricDescriptors: []MetricDescriptor{{
+					MetricName: "memcached_current_items",
+					Unit:       "Count",
+					Overwrite:  true,
+				}},
+				logger: zap.NewNop(),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
+
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			assert.NoError(t, confmap.Validate(cfg))
+			assert.Equal(t, tt.expected, cfg)
 		})
+	}
 }
 
 func TestConfigValidate(t *testing.T) {
 	incorrectDescriptor := []MetricDescriptor{
-		{metricName: ""},
-		{unit: "Count", metricName: "apiserver_total", overwrite: true},
-		{unit: "INVALID", metricName: "404"},
-		{unit: "Megabytes", metricName: "memory_usage"},
+		{MetricName: ""},
+		{Unit: "Count", MetricName: "apiserver_total", Overwrite: true},
+		{Unit: "INVALID", MetricName: "404"},
+		{Unit: "Megabytes", MetricName: "memory_usage"},
 	}
 	cfg := &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewIDWithName(typeStr, "1")),
 		AWSSessionSettings: awsutil.AWSSessionSettings{
 			RequestTimeoutSeconds: 30,
 			MaxRetries:            1,
 		},
-		DimensionRollupOption:       "ZeroAndSingleDimensionRollup",
-		ResourceToTelemetrySettings: exporterhelper.ResourceToTelemetrySettings{Enabled: true},
-		MetricDescriptors:           incorrectDescriptor,
-		logger:                      zap.NewNop(),
+		DimensionRollupOption: "ZeroAndSingleDimensionRollup",
+		MetricDescriptors:     incorrectDescriptor,
+		logger:                zap.NewNop(),
+	}
+	assert.NoError(t, confmap.Validate(cfg))
+
+	assert.Len(t, cfg.MetricDescriptors, 2)
+	assert.Equal(t, []MetricDescriptor{
+		{Unit: "Count", MetricName: "apiserver_total", Overwrite: true},
+		{Unit: "Megabytes", MetricName: "memory_usage"},
+	}, cfg.MetricDescriptors)
+}
+
+func TestConfigValidateDropsDeclarationWithInvalidSelector(t *testing.T) {
+	cfg := &Config{
+		AWSSessionSettings: awsutil.AWSSessionSettings{
+			RequestTimeoutSeconds: 30,
+			MaxRetries:            1,
+		},
+		DimensionRollupOption: "ZeroAndSingleDimensionRollup",
+		MetricDeclarations: []*MetricDeclaration{
+			{MetricNameSelectors: []string{"[unclosed"}},
+			{MetricNameSelectors: []string{"^valid$"}},
+		},
+		logger: zap.NewNop(),
+	}
+
+	assert.NoError(t, confmap.Validate(cfg))
+
+	// The declaration with the invalid selector is dropped, the valid one is kept.
+	require.Len(t, cfg.MetricDeclarations, 1)
+	assert.Equal(t, []string{"^valid$"}, cfg.MetricDeclarations[0].MetricNameSelectors)
+}
+
+func TestRetentionValidateCorrect(t *testing.T) {
+	cfg := &Config{
+		AWSSessionSettings: awsutil.AWSSessionSettings{
+			RequestTimeoutSeconds: 30,
+			MaxRetries:            1,
+		},
+		DimensionRollupOption: "ZeroAndSingleDimensionRollup",
+		LogRetention:          365,
+		logger:                zap.NewNop(),
+	}
+	assert.NoError(t, confmap.Validate(cfg))
+}
+
+func TestRetentionValidateWrong(t *testing.T) {
+	wrongcfg := &Config{
+		AWSSessionSettings: awsutil.AWSSessionSettings{
+			RequestTimeoutSeconds: 30,
+			MaxRetries:            1,
+		},
+		DimensionRollupOption: "ZeroAndSingleDimensionRollup",
+		LogRetention:          366,
+		logger:                zap.NewNop(),
+	}
+	assert.Error(t, confmap.Validate(wrongcfg))
+}
+
+func TestValidateTags(t *testing.T) {
+	// Create *string values for tags inputs
+	basicValue := "avalue"
+	wrongRegexValue := "***"
+	emptyValue := ""
+	tooLongValue := strings.Repeat("a", 257)
+
+	// Create a map with no items and then one with too many items for testing
+	bigMap := make(map[string]string)
+	for i := range 51 {
+		bigMap[strconv.Itoa(i)] = basicValue
+	}
+
+	tests := []struct {
+		id           component.ID
+		tags         map[string]string
+		errorMessage string
+	}{
+		{
+			id:   component.NewIDWithName(metadata.Type, "validate-correct"),
+			tags: map[string]string{"basicKey": basicValue},
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "too-little-tags"),
+			tags:         make(map[string]string),
+			errorMessage: "invalid amount of items. Please input at least 1 tag or remove the tag field",
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "too-many-tags"),
+			tags:         bigMap,
+			errorMessage: "invalid amount of items. Please input at most 50 tags",
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "wrong-key-regex"),
+			tags:         map[string]string{"***": basicValue},
+			errorMessage: "key - *** does not follow the regex pattern" + `^([\p{L}\p{Z}\p{N}_.:/=+\-@]+)$`,
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "wrong-value-regex"),
+			tags:         map[string]string{"basicKey": wrongRegexValue},
+			errorMessage: "value - " + wrongRegexValue + " does not follow the regex pattern" + `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`,
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "key-too-short"),
+			tags:         map[string]string{"": basicValue},
+			errorMessage: "key -  has an invalid length. Please use keys with a length of 1 to 128 characters",
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "key-too-long"),
+			tags:         map[string]string{strings.Repeat("a", 129): basicValue},
+			errorMessage: "key - " + strings.Repeat("a", 129) + " has an invalid length. Please use keys with a length of 1 to 128 characters",
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "value-too-short"),
+			tags:         map[string]string{"basicKey": emptyValue},
+			errorMessage: "value - " + emptyValue + " has an invalid length. Please use values with a length of 1 to 256 characters",
+		},
+		{
+			id:           component.NewIDWithName(metadata.Type, "value-too-long"),
+			tags:         map[string]string{"basicKey": tooLongValue},
+			errorMessage: "value - " + tooLongValue + " has an invalid length. Please use values with a length of 1 to 256 characters",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			cfg := &Config{
+				AWSSessionSettings: awsutil.AWSSessionSettings{
+					RequestTimeoutSeconds: 30,
+					MaxRetries:            1,
+				},
+				DimensionRollupOption: "ZeroAndSingleDimensionRollup",
+				Tags:                  tt.tags,
+				logger:                zap.NewNop(),
+			}
+			if tt.errorMessage != "" {
+				assert.ErrorContains(t, confmap.Validate(cfg), tt.errorMessage)
+				return
+			}
+			assert.NoError(t, confmap.Validate(cfg))
+		})
+	}
+}
+
+func TestNoDimensionRollupFeatureGate(t *testing.T) {
+	err := featuregate.GlobalRegistry().Set("awsemf.nodimrollupdefault", true)
+	require.NoError(t, err)
+	cfg := createDefaultConfig()
+
+	assert.Equal(t, "NoDimensionRollup", cfg.(*Config).DimensionRollupOption)
+	_ = featuregate.GlobalRegistry().Set("awsemf.nodimrollupdefault", false)
+}
+
+func TestIsApplicationSignalsEnabled(t *testing.T) {
+	tests := []struct {
+		name            string
+		metricNameSpace string
+		logGroupName    string
+		expectedResult  bool
+	}{
+		{
+			"validApplicationSignalsEMF",
+			"ApplicationSignals",
+			"/aws/application-signals/data",
+			true,
+		},
+		{
+			"invalidApplicationSignalsLogsGroup",
+			"ApplicationSignals",
+			"/nonaws/application-signals/eks",
+			false,
+		},
+		{
+			"invalidApplicationSignalsMetricNamespace",
+			"NonApplicationSignals",
+			"/aws/application-signals/data",
+			false,
+		},
+		{
+			"invalidApplicationSignalsEMF",
+			"NonApplicationSignals",
+			"/nonaws/application-signals/eks",
+			false,
+		},
+		{
+			"defaultConfig",
+			"",
+			"",
+			false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig().(*Config)
+			if tc.metricNameSpace != "" {
+				cfg.Namespace = tc.metricNameSpace
+			}
+			if tc.logGroupName != "" {
+				cfg.LogGroupName = tc.logGroupName
+			}
+
+			assert.Equal(t, tc.expectedResult, cfg.isAppSignalsEnabled())
+		})
+	}
+}
+
+func TestDisableLegacyResourceToTelemetryConversionValidation(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	cfg.ResourceToTelemetrySettings = resourcetotelemetry.Settings{
+		Included: []string{"service*"},
 	}
 	assert.NoError(t, cfg.Validate())
 
-	assert.Equal(t, 2, len(cfg.MetricDescriptors))
-	assert.Equal(t, []MetricDescriptor{
-		{unit: "Count", metricName: "apiserver_total", overwrite: true},
-		{unit: "Megabytes", metricName: "memory_usage"},
-	}, cfg.MetricDescriptors)
+	cfg.ResourceToTelemetrySettings.Enabled = true //nolint:staticcheck // ignore deprecated field
+	require.NoError(t, featuregate.GlobalRegistry().Set(metadata.ExporterAwsemfDisableLegacyResourceToTelemetryConversionFeatureGate.ID(), true))
+	defer func() {
+		_ = featuregate.GlobalRegistry().Set(metadata.ExporterAwsemfDisableLegacyResourceToTelemetryConversionFeatureGate.ID(), false)
+	}()
+	assert.Error(t, cfg.Validate())
+
+	cfg.ResourceToTelemetrySettings.Enabled = false //nolint:staticcheck // ignore deprecated field
+	assert.NoError(t, cfg.Validate())
 }

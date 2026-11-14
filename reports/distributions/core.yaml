@@ -1,0 +1,41 @@
+name: core
+url: https://github.com/open-telemetry/opentelemetry-collector-releases/tree/main/distributions/otelcol
+maintainers: []
+components:
+    exporter:
+        - file
+        - kafka
+        - prometheus
+        - prometheus_remote_write
+        - zipkin
+    extension:
+        - health_check
+        - pprof
+    processor:
+        - attributes
+        - filter
+        - probabilistic_sampler
+        - resource
+        - resource_detection
+        - span
+        - transform
+    receiver:
+        - file_log
+        - host_metrics
+        - jaeger
+        - kafka
+        - prometheus
+        - zipkin
+    scraper:
+        - cpu
+        - disk
+        - filesystem
+        - hardware
+        - load
+        - memory
+        - network
+        - nfs
+        - paging
+        - process
+        - processes
+        - system

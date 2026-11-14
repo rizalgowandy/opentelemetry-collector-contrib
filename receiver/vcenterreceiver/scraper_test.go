@@ -1,0 +1,174 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package vcenterreceiver // import github.com/open-telemetry/opentelemetry-collector-contrib/receiver/vcenterreceiver
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/receiver/receivertest"
+	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/golden"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatatest/pmetrictest"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/vcenterreceiver/internal/metadata"
+	mock "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/vcenterreceiver/internal/mockserver"
+)
+
+func TestScrape(t *testing.T) {
+	ctx := t.Context()
+	setResourcePoolMemoryUsageAttrFeatureGate(t, false)
+	mockServer := mock.MockServer(t, false)
+	defer mockServer.Close()
+
+	cfg := &Config{
+		MetricsBuilderConfig: metadata.NewDefaultMetricsBuilderConfig(),
+		Endpoint:             mockServer.URL,
+		Username:             mock.MockUsername,
+		Password:             mock.MockPassword,
+	}
+
+	testScrape(ctx, t, cfg, "expected.yaml")
+}
+
+func TestScrapeConfigsEnabled(t *testing.T) {
+	ctx := t.Context()
+	mockServer := mock.MockServer(t, false)
+	defer mockServer.Close()
+
+	optConfigs := metadata.NewDefaultMetricsBuilderConfig()
+	optConfigs.Metrics.VcenterHostMemoryCapacity.Enabled = true
+	optConfigs.Metrics.VcenterHostMemoryGranted.Enabled = true
+	optConfigs.Metrics.VcenterHostMemoryActive.Enabled = true
+	optConfigs.Metrics.VcenterHostMemoryBallooned.Enabled = true
+	optConfigs.Metrics.VcenterVMMemoryGranted.Enabled = true
+	optConfigs.Metrics.VcenterVMNetworkBroadcastPacketRate.Enabled = true
+	optConfigs.Metrics.VcenterVMNetworkMulticastPacketRate.Enabled = true
+	optConfigs.Metrics.VcenterVMCPUTime.Enabled = true
+	optConfigs.Metrics.VcenterHostPowerStatus.Enabled = true
+	optConfigs.Metrics.VcenterHostConnectionStatus.Enabled = true
+	optConfigs.Metrics.VcenterHostUptime.Enabled = true
+	optConfigs.Metrics.VcenterHostAlarmCount.Enabled = true
+	optConfigs.Metrics.VcenterDatastoreMaintenanceStatus.Enabled = true
+	optConfigs.Metrics.VcenterDatastoreAlarmCount.Enabled = true
+	optConfigs.Metrics.VcenterVMPowerStatus.Enabled = true
+
+	cfg := &Config{
+		MetricsBuilderConfig: optConfigs,
+		Endpoint:             mockServer.URL,
+		Username:             mock.MockUsername,
+		Password:             mock.MockPassword,
+	}
+
+	testScrape(ctx, t, cfg, "expected-all-enabled.yaml")
+}
+
+func TestScrape_TLS(t *testing.T) {
+	ctx := t.Context()
+	mockServer := mock.MockServer(t, true)
+	defer mockServer.Close()
+
+	setResourcePoolMemoryUsageAttrFeatureGate(t, false)
+
+	cfg := &Config{
+		MetricsBuilderConfig: metadata.NewDefaultMetricsBuilderConfig(),
+		Endpoint:             mockServer.URL,
+		Username:             mock.MockUsername,
+		Password:             mock.MockPassword,
+	}
+
+	cfg.ClientConfig.Insecure = true
+	cfg.ClientConfig.InsecureSkipVerify = true
+
+	testScrape(ctx, t, cfg, "expected.yaml")
+}
+
+func testScrape(ctx context.Context, t *testing.T, cfg *Config, fileName string) {
+	scraper := newVmwareVcenterScraper(zap.NewNop(), cfg, receivertest.NewNopSettings(metadata.Type))
+
+	metrics, err := scraper.scrape(ctx)
+	require.NoError(t, err)
+	require.NotEqual(t, 0, metrics.MetricCount())
+
+	goldenPath := filepath.Join("testdata", "metrics", fileName)
+	expectedMetrics, err := golden.ReadMetrics(goldenPath)
+	require.NoError(t, err)
+
+	err = pmetrictest.CompareMetrics(expectedMetrics, metrics,
+		pmetrictest.IgnoreStartTimestamp(), pmetrictest.IgnoreTimestamp(),
+		pmetrictest.IgnoreResourceMetricsOrder(),
+		pmetrictest.IgnoreMetricDataPointsOrder(),
+	)
+	require.NoError(t, err)
+	require.NoError(t, scraper.Shutdown(ctx))
+}
+
+func setResourcePoolMemoryUsageAttrFeatureGate(t *testing.T, val bool) {
+	wasEnabled := metadata.ReceiverVcenterResourcePoolMemoryUsageAttributeFeatureGate.IsEnabled()
+	err := featuregate.GlobalRegistry().Set(
+		metadata.ReceiverVcenterResourcePoolMemoryUsageAttributeFeatureGate.ID(),
+		val,
+	)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		err := featuregate.GlobalRegistry().Set(
+			metadata.ReceiverVcenterResourcePoolMemoryUsageAttributeFeatureGate.ID(),
+			wasEnabled,
+		)
+		require.NoError(t, err)
+	})
+}
+
+func TestScrape_NoClient(t *testing.T) {
+	ctx := t.Context()
+	scraper := &vcenterMetricScraper{
+		client: nil,
+		config: &Config{
+			Endpoint: "http://vcsa.localnet",
+		},
+		mb:     metadata.NewMetricsBuilder(metadata.NewDefaultMetricsBuilderConfig(), receivertest.NewNopSettings(metadata.Type)),
+		logger: zap.NewNop(),
+	}
+	metrics, err := scraper.scrape(ctx)
+	require.ErrorContains(t, err, "unable to connect to vSphere SDK")
+	require.Equal(t, 0, metrics.MetricCount())
+	require.NoError(t, scraper.Shutdown(ctx))
+}
+
+func TestStartFailures_Metrics(t *testing.T) {
+	cases := []struct {
+		desc string
+		cfg  *Config
+		err  error
+	}{
+		{
+			desc: "bad client connect",
+			cfg: &Config{
+				Endpoint: "http://no-host",
+			},
+		},
+		{
+			desc: "unparsable endpoint",
+			cfg: &Config{
+				Endpoint: "<protocol>://some-host",
+			},
+		},
+	}
+
+	ctx := t.Context()
+	for _, tc := range cases {
+		scraper := newVmwareVcenterScraper(zap.NewNop(), tc.cfg, receivertest.NewNopSettings(metadata.Type))
+		err := scraper.Start(ctx, componenttest.NewNopHost())
+		if tc.err != nil {
+			require.ErrorContains(t, err, tc.err.Error())
+		} else {
+			require.NoError(t, err)
+		}
+	}
+}

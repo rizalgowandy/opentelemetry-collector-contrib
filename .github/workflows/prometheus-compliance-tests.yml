@@ -1,0 +1,60 @@
+name: prometheus-compliance-tests
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+    paths-ignore:
+      - "**/README.md"
+  pull_request:
+    paths-ignore:
+      - "**/README.md"
+  merge_group:
+
+permissions:
+  contents: read
+
+# Do not cancel this workflow on main. See https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/16616
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # Make sure to exit early if cache segment download times out after 2 minutes.
+  # We limit cache download as a whole to 5 minutes.
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: 2
+  # Distinct spellings of the same proxy joined by `|` make Go retry any fetch error. Keep in sync with Makefile.Common.
+  GOPROXY: "https://proxy.golang.org|https://proxy.golang.org/|https://proxy.golang.org:443,direct"
+
+jobs:
+  prometheus-compliance-tests:
+    runs-on: ubuntu-24.04
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: opentelemetry-collector-contrib
+          persist-credentials: false
+      - run: opentelemetry-collector-contrib/.github/workflows/scripts/free-disk-space.sh
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: oldstable
+          cache: false
+      - name: Install dependencies
+        working-directory: opentelemetry-collector-contrib
+        run: make -j8 gomoddownload
+      - run: make genotelcontribcol
+        working-directory: opentelemetry-collector-contrib
+      - run: make otelcontribcol
+        working-directory: opentelemetry-collector-contrib
+      - name: Run remote write sender compliance tests
+        working-directory: opentelemetry-collector-contrib/exporter/prometheusremotewriteexporter/compliance
+        run: |
+          set -o pipefail
+          go test -v -count=1 ./ |& tee ./test-report.txt
+      - name: Run remote write receiver compliance tests
+        working-directory: opentelemetry-collector-contrib/receiver/prometheusremotewritereceiver/compliance
+        run: |
+          set -o pipefail
+          go test -v -count=1 ./ |& tee ./test-report.txt
+      - run: opentelemetry-collector-contrib/.github/workflows/scripts/check-disk-space.sh

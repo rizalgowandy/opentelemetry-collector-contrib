@@ -1,28 +1,21 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package translator
+package translator // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awsxrayreceiver/internal/translator"
 
 import (
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/conventions"
-	tracetranslator "go.opentelemetry.io/collector/translator/trace"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	conventionsv118 "go.opentelemetry.io/otel/semconv/v1.18.0"
+	conventionsv120 "go.opentelemetry.io/otel/semconv/v1.20.0"
+	conventionsv125 "go.opentelemetry.io/otel/semconv/v1.25.0"
+	conventions "go.opentelemetry.io/otel/semconv/v1.43.0"
 
 	awsxray "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/xray"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/tracetranslator"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awsxrayreceiver/internal/metadata"
 )
 
-func addHTTP(seg *awsxray.Segment, span *pdata.Span) {
+func addHTTP(seg *awsxray.Segment, span ptrace.Span) {
 	if seg.HTTP == nil {
 		return
 	}
@@ -30,39 +23,56 @@ func addHTTP(seg *awsxray.Segment, span *pdata.Span) {
 	attrs := span.Attributes()
 	if req := seg.HTTP.Request; req != nil {
 		// https://docs.aws.amazon.com/xray/latest/devguide/xray-api-segmentdocuments.html#api-segmentdocuments-http
-		addString(req.Method, conventions.AttributeHTTPMethod, &attrs)
+		if metadata.ReceiverAwsxrayEmitV1HTTPConventionsFeatureGate.IsEnabled() {
+			addString(req.Method, string(conventions.HTTPRequestMethodKey), attrs)
+		}
+		if !metadata.ReceiverAwsxrayDontEmitV0HTTPConventionsFeatureGate.IsEnabled() {
+			addString(req.Method, string(conventionsv125.HTTPMethodKey), attrs)
+		}
 
 		if req.ClientIP != nil {
 			// since the ClientIP is not nil, this means that this segment is generated
 			// by a server serving an incoming request
-			attrs.UpsertString(conventions.AttributeHTTPClientIP, *req.ClientIP)
+			if !metadata.ReceiverAwsxrayDontEmitV0HTTPConventionsFeatureGate.IsEnabled() {
+				attrs.PutStr(string(conventionsv120.HTTPClientIPKey), *req.ClientIP)
+			}
+			if metadata.ReceiverAwsxrayEmitV1HTTPConventionsFeatureGate.IsEnabled() {
+				attrs.PutStr(string(conventions.ClientAddressKey), *req.ClientIP)
+			}
 		}
 
-		addString(req.UserAgent, conventions.AttributeHTTPUserAgent, &attrs)
-		addString(req.URL, conventions.AttributeHTTPURL, &attrs)
-		addBool(req.XForwardedFor, awsxray.AWSXRayXForwardedForAttribute, &attrs)
+		addString(req.UserAgent, string(conventionsv118.HTTPUserAgentKey), attrs)
+		if metadata.ReceiverAwsxrayEmitV1HTTPConventionsFeatureGate.IsEnabled() {
+			addString(req.URL, string(conventions.URLFullKey), attrs)
+		}
+		if !metadata.ReceiverAwsxrayDontEmitV0HTTPConventionsFeatureGate.IsEnabled() {
+			addString(req.URL, string(conventionsv125.HTTPURLKey), attrs)
+		}
+		addBool(req.XForwardedFor, awsxray.AWSXRayXForwardedForAttribute, attrs)
 	}
 
 	if resp := seg.HTTP.Response; resp != nil {
 		if resp.Status != nil {
-			otStatus := tracetranslator.StatusCodeFromHTTP(int(*resp.Status))
+			otStatus := tracetranslator.StatusCodeFromHTTP(*resp.Status)
 			// in X-Ray exporter, the segment status is set:
-			// first via the span attribute, conventions.AttributeHTTPStatusCode
+			// first via the span attribute, string(conventions.HTTPStatusCodeKey)
 			// then the span status. Since we are also setting the span attribute
 			// below, the span status code here will not be actually used
 			span.Status().SetCode(otStatus)
-			attrs.UpsertInt(conventions.AttributeHTTPStatusCode, *resp.Status)
+			if metadata.ReceiverAwsxrayEmitV1HTTPConventionsFeatureGate.IsEnabled() {
+				attrs.PutInt(string(conventions.HTTPResponseStatusCodeKey), *resp.Status)
+			}
+			if !metadata.ReceiverAwsxrayDontEmitV0HTTPConventionsFeatureGate.IsEnabled() {
+				attrs.PutInt(string(conventionsv125.HTTPStatusCodeKey), *resp.Status)
+			}
 		}
 
-		switch resp.ContentLength.(type) {
+		switch val := resp.ContentLength.(type) {
 		case string:
-			lengthPointer := resp.ContentLength.(string)
-			addString(&lengthPointer, conventions.AttributeHTTPResponseContentLength, &attrs)
+			addString(&val, string(conventionsv125.HTTPResponseContentLengthKey), attrs)
 		case float64:
-			length := resp.ContentLength.(float64)
-			lengthPointer := int64(length)
-			addInt64(&lengthPointer, conventions.AttributeHTTPResponseContentLength, &attrs)
+			lengthPointer := int64(val)
+			addInt64(&lengthPointer, string(conventionsv125.HTTPResponseContentLengthKey), attrs)
 		}
 	}
-
 }

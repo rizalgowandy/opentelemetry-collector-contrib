@@ -1,0 +1,182 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package routingconnector // import "github.com/open-telemetry/opentelemetry-collector-contrib/connector/routingconnector"
+
+import (
+	"errors"
+	"fmt"
+
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/pipeline"
+	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottldatapoint"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottllog"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottlmetric"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottlotelcol"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottlresource"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottlspan"
+)
+
+type Action string
+
+const (
+	Copy Action = "copy"
+	Move Action = "move"
+)
+
+var (
+	errNoConditionOrStatement = errors.New("invalid route: no condition or statement provided")
+	errConditionAndStatement  = errors.New("invalid route: both condition and statement provided")
+	errNoPipelines            = errors.New("invalid route: no pipelines defined")
+	errUnexpectedConsumer     = errors.New("expected consumer to be a connector router")
+	errNoTableItems           = errors.New("invalid routing table: the routing table is empty")
+	errUnexpectedAction       = errors.New("invalid routing action: if provided should be one of move/copy")
+)
+
+// Config defines configuration for the Routing processor.
+type Config struct {
+	// ErrorMode determines how the processor reacts to errors that occur while processing an OTTL
+	// condition.
+	// Valid values are `ignore` and `propagate`.
+	// `ignore` means the processor ignores errors returned by conditions and continues on to the
+	// next condition. This is the recommended mode. If `ignore` is used and a statement's
+	// condition has an error then the payload will be routed to the default exporter. `propagate`
+	// means the processor returns the error up the pipeline.  This will result in the payload being
+	// dropped from the collector.
+	// The default value is `ignore`.
+	ErrorMode ottl.ErrorMode `mapstructure:"error_mode"`
+	// DefaultPipelines contains the list of pipelines to use when a more specific record can't be
+	// found in the routing table.
+	// Optional.
+	DefaultPipelines []pipeline.ID `mapstructure:"default_pipelines"`
+	// Table contains the routing table for this processor.
+	// Required.
+	Table []RoutingTableItem `mapstructure:"table"`
+
+	// OTTL functions set by the factory when creating the processor.
+	otelColFunctions   map[string]ottl.Factory[*ottlotelcol.TransformContext]
+	resourceFunctions  map[string]ottl.Factory[*ottlresource.TransformContext]
+	spanFunctions      map[string]ottl.Factory[*ottlspan.TransformContext]
+	metricFunctions    map[string]ottl.Factory[*ottlmetric.TransformContext]
+	dataPointFunctions map[string]ottl.Factory[*ottldatapoint.TransformContext]
+	logFunctions       map[string]ottl.Factory[*ottllog.TransformContext]
+}
+
+// UnmarshalText unmarshalls text to an Action.
+func (e *Action) UnmarshalText(text []byte) error {
+	if e == nil {
+		return errors.New("cannot unmarshal to a nil *Action")
+	}
+
+	str := string(text)
+	switch str {
+	case string(Copy):
+		*e = Copy
+	case string(Move):
+		*e = Move
+	default:
+		return fmt.Errorf("invalid Action string: %s", str)
+	}
+
+	return nil
+}
+
+// Validate checks if the processor configuration is valid.
+func (c *Config) Validate() error {
+	// validate that there's at least one item in the table
+	if len(c.Table) == 0 {
+		return errNoTableItems
+	}
+
+	// validate that every route has a value for the routing attribute and has
+	// at least one pipeline
+	for _, item := range c.Table {
+		if item.Statement == "" && item.Condition == "" {
+			return errNoConditionOrStatement
+		}
+		if item.Statement != "" && item.Condition != "" {
+			return errConditionAndStatement
+		}
+		if len(item.Pipelines) == 0 {
+			return errNoPipelines
+		}
+
+		switch item.Action {
+		case "":
+			item.Action = Move // use move if empty.
+		case Copy, Move: // ok
+		default:
+			return errUnexpectedAction
+		}
+
+		switch item.Context {
+		case "", "resource", "span", "metric", "datapoint", "log", "otelcol": // ok
+		case "request":
+			if item.Statement != "" || item.Condition == "" {
+				return fmt.Errorf("%q context requires a 'condition'", item.Context)
+			}
+			if _, err := parseRequestCondition(item.Condition); err != nil {
+				return err
+			}
+		default:
+			return errors.New("invalid context: " + item.Context)
+		}
+	}
+
+	settings := component.TelemetrySettings{Logger: zap.NewNop()}
+	parserCollection, err := newParserCollection(c, settings)
+	if err != nil {
+		return err
+	}
+	var parseErrors []error
+	for i, item := range c.Table {
+		if item.Context == "request" {
+			continue
+		}
+		if _, err := parseRoutingStatement(parserCollection, item.Context, item.ottlStatement(), settings.Logger); err != nil {
+			parseErrors = append(parseErrors, fmt.Errorf("table[%d]: %w", i, err))
+		}
+	}
+	return errors.Join(parseErrors...)
+}
+
+// RoutingTableItem specifies how data should be routed to the different pipelines
+type RoutingTableItem struct {
+	// One of "request" (deprecated), "resource", "log", "span", "metric", "datapoint", "otelcol".
+	// Optional. Default is inferred from the condition/statement paths.
+	Context string `mapstructure:"context"`
+
+	// Statement is an OTTL statement used for making a routing decision.
+	// 'Statement' is disallowed for the "request" context.
+	// For other contexts, 'Statement' or 'Condition' must be provided.
+	Statement string `mapstructure:"statement"`
+
+	// Condition is an OTTL condition used for making a routing decision.
+	// For the "request" context, 'Condition' is required
+	// and must be of the form 'request["<attribute>"] {== | !=} <value>'.
+	// For all other contexts, 'Statement' or 'Condition' must be provided, and must be a valid OTTL condition.
+	Condition string `mapstructure:"condition"`
+
+	// Action indicates the type of operation we intend to do when the condition
+	// Matches for the corresponding context and data.
+	Action Action `mapstructure:"action"`
+
+	// Pipelines contains the list of pipelines to use when the value from the FromAttribute field
+	// matches this table item. When no pipelines are specified, the ones specified under
+	// DefaultPipelines are used, if any.
+	// The routing processor will fail upon the first failure from these pipelines.
+	// Optional.
+	Pipelines []pipeline.ID `mapstructure:"pipelines"`
+	// prevent unkeyed literal initialization
+	_ struct{}
+}
+
+func (item RoutingTableItem) ottlStatement() string {
+	if item.Condition != "" {
+		return fmt.Sprintf("route() where %s", item.Condition)
+	}
+	return item.Statement
+}

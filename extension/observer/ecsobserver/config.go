@@ -1,25 +1,12 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package ecsobserver
+package ecsobserver // import "github.com/open-telemetry/opentelemetry-collector-contrib/extension/observer/ecsobserver"
 
 import (
-	"fmt"
+	"errors"
 	"os"
 	"time"
-
-	"go.opentelemetry.io/collector/config"
 )
 
 const (
@@ -30,8 +17,6 @@ const (
 )
 
 type Config struct {
-	config.ExtensionSettings `mapstructure:",squash"`
-
 	// ClusterName is the target ECS cluster name for service discovery.
 	ClusterName string `mapstructure:"cluster_name" yaml:"cluster_name"`
 	// ClusterRegion is the target ECS cluster's AWS region.
@@ -59,7 +44,7 @@ func (c *Config) Validate() error {
 	if c.ClusterName == "" {
 		// TODO: https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/3188
 		// would allow auto detect cluster name in extension
-		return fmt.Errorf("must specify ECS cluster name directly")
+		return errors.New("must specify ECS cluster name directly")
 	}
 	for _, s := range c.Services {
 		if err := s.validate(); err != nil {
@@ -79,15 +64,14 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// DefaultConfig only applies docker label
-func DefaultConfig() Config {
+// defaultConfig only applies docker label
+func defaultConfig() Config {
 	return Config{
-		ExtensionSettings: config.NewExtensionSettings(config.NewID(typeStr)),
-		ClusterName:       "default",
-		ClusterRegion:     os.Getenv(awsRegionEnvKey),
-		ResultFile:        "/etc/ecs_sd_targets.yaml",
-		RefreshInterval:   defaultRefreshInterval,
-		JobLabelName:      defaultJobLabelName,
+		ClusterName:     "default",
+		ClusterRegion:   os.Getenv(awsRegionEnvKey),
+		ResultFile:      "/etc/ecs_sd_targets.yaml",
+		RefreshInterval: defaultRefreshInterval,
+		JobLabelName:    defaultJobLabelName,
 		DockerLabels: []DockerLabelConfig{
 			{
 				PortLabel: defaultDockerLabelMatcherPortLabel,
@@ -96,10 +80,10 @@ func DefaultConfig() Config {
 	}
 }
 
-// ExampleConfig returns an example instance that matches testdata/config_example.yaml.
+// exampleConfig returns an example instance that matches testdata/config_example.yaml.
 // It can be used to validate if the struct tags like mapstructure, yaml are working properly.
-func ExampleConfig() Config {
-	return Config{
+func exampleConfig() *Config {
+	return &Config{
 		ClusterName:     "ecs-sd-test-1",
 		ClusterRegion:   "us-west-2",
 		ResultFile:      "/etc/ecs_sd_targets.yaml",

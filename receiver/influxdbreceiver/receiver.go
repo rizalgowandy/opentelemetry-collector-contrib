@@ -1,94 +1,100 @@
-// Copyright 2021, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package influxdbreceiver
+package influxdbreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/influxdbreceiver"
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/influxdata/influxdb-observability/common"
 	"github.com/influxdata/influxdb-observability/influx2otel"
-	lineprotocol "github.com/influxdata/line-protocol/v2/influxdata"
+	"github.com/influxdata/line-protocol/v2/lineprotocol"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componentstatus"
 	"go.opentelemetry.io/collector/config/confighttp"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumererror"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/receiver/receiverhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/common/sanitize"
 )
 
 type metricsReceiver struct {
 	nextConsumer       consumer.Metrics
-	httpServerSettings *confighttp.HTTPServerSettings
+	httpServerSettings *confighttp.ServerConfig
 	converter          *influx2otel.LineProtocolToOtelMetrics
 
 	server *http.Server
 	wg     sync.WaitGroup
 
 	logger common.Logger
+
+	obsrecv *receiverhelper.ObsReport
+
+	settings component.TelemetrySettings
 }
 
-var metricsSchemata = map[string]common.MetricsSchema{
-	"telegraf-prometheus-v1": common.MetricsSchemaTelegrafPrometheusV1,
-	"telegraf-prometheus-v2": common.MetricsSchemaTelegrafPrometheusV2,
-}
-
-func newMetricsReceiver(config *Config, influxLogger common.Logger, nextConsumer consumer.Metrics) (*metricsReceiver, error) {
-	schema, found := metricsSchemata[config.MetricsSchema]
-	if !found {
-		return nil, fmt.Errorf("schema '%s' not recognized", config.MetricsSchema)
-	}
-	converter, err := influx2otel.NewLineProtocolToOtelMetrics(influxLogger, schema)
+func newMetricsReceiver(config *Config, settings receiver.Settings, nextConsumer consumer.Metrics) (*metricsReceiver, error) {
+	influxLogger := newZapInfluxLogger(settings.Logger)
+	converter, err := influx2otel.NewLineProtocolToOtelMetrics(influxLogger)
 	if err != nil {
 		return nil, err
 	}
-	receiver := &metricsReceiver{
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{
+		ReceiverID:             settings.ID,
+		Transport:              "http",
+		ReceiverCreateSettings: settings,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &metricsReceiver{
 		nextConsumer:       nextConsumer,
-		httpServerSettings: &config.HTTPServerSettings,
+		httpServerSettings: &config.ServerConfig,
 		converter:          converter,
 		logger:             influxLogger,
-	}
-	return receiver, nil
+		obsrecv:            obsrecv,
+		settings:           settings.TelemetrySettings,
+	}, err
 }
 
-func (r *metricsReceiver) Start(_ context.Context, host component.Host) error {
-	ln, err := r.httpServerSettings.ToListener()
+func (r *metricsReceiver) Start(ctx context.Context, host component.Host) error {
+	ln, err := r.httpServerSettings.ToListener(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to bind to address %s: %w", r.httpServerSettings.Endpoint, err)
+		return fmt.Errorf("failed to bind to address %s: %w", r.httpServerSettings.NetAddr.Endpoint, err)
 	}
 
-	nr := mux.NewRouter()
-	nr.HandleFunc("/write", r.handleWrite)        // InfluxDB 1.x
-	nr.HandleFunc("/api/v2/write", r.handleWrite) // InfluxDB 2.x
+	router := http.NewServeMux()
+	router.HandleFunc("/write", r.handleWrite)        // InfluxDB 1.x
+	router.HandleFunc("/api/v2/write", r.handleWrite) // InfluxDB 2.x
+	router.HandleFunc("/ping", r.handlePing)
 
 	r.wg.Add(1)
-	r.server = r.httpServerSettings.ToServer(nr)
+	r.server, err = r.httpServerSettings.ToServer(ctx, host.GetExtensions(), r.settings, router)
+	if err != nil {
+		return err
+	}
 	go func() {
 		defer r.wg.Done()
-		if err := r.server.Serve(ln); err != nil && err != http.ErrServerClosed {
-			host.ReportFatalError(err)
+		if errHTTP := r.server.Serve(ln); !errors.Is(errHTTP, http.ErrServerClosed) && errHTTP != nil {
+			componentstatus.ReportStatus(host, componentstatus.NewFatalErrorEvent(errHTTP))
 		}
 	}()
 
 	return nil
 }
 
-func (r *metricsReceiver) Shutdown(ctx context.Context) error {
+func (r *metricsReceiver) Shutdown(_ context.Context) error {
+	if r.server == nil {
+		return nil
+	}
 	if err := r.server.Close(); err != nil {
 		return err
 	}
@@ -96,13 +102,20 @@ func (r *metricsReceiver) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-const defaultPrecision = lineprotocol.Nanosecond
+const (
+	defaultPrecision = lineprotocol.Nanosecond
+	dataFormat       = "influxdb"
+)
 
 var precisions = map[string]lineprotocol.Precision{
-	lineprotocol.Nanosecond.String():  lineprotocol.Nanosecond,
-	lineprotocol.Microsecond.String(): lineprotocol.Microsecond,
-	lineprotocol.Millisecond.String(): lineprotocol.Millisecond,
-	lineprotocol.Second.String():      lineprotocol.Second,
+	"ns": lineprotocol.Nanosecond,
+	"n":  lineprotocol.Nanosecond,
+	"µs": lineprotocol.Microsecond,
+	"µ":  lineprotocol.Microsecond,
+	"us": lineprotocol.Microsecond,
+	"u":  lineprotocol.Microsecond,
+	"ms": lineprotocol.Millisecond,
+	"s":  lineprotocol.Second,
 }
 
 func (r *metricsReceiver) handleWrite(w http.ResponseWriter, req *http.Request) {
@@ -115,13 +128,15 @@ func (r *metricsReceiver) handleWrite(w http.ResponseWriter, req *http.Request) 
 		var ok bool
 		if precision, ok = precisions[precisionStr]; !ok {
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = fmt.Fprintf(w, "unrecognized precision '%s'", precisionStr)
+			_, _ = fmt.Fprintf(w, "unrecognized precision '%s'", sanitize.String(precisionStr))
 			return
 		}
 	}
 
 	batch := r.converter.NewBatch()
 	lpDecoder := lineprotocol.NewDecoder(req.Body)
+
+	ctx := r.obsrecv.StartMetricsOp(req.Context())
 
 	var k, vTag []byte
 	var vField lineprotocol.Value
@@ -143,7 +158,7 @@ func (r *metricsReceiver) handleWrite(w http.ResponseWriter, req *http.Request) 
 			return
 		}
 
-		fields := make(map[string]interface{})
+		fields := make(map[string]any)
 		for k, vField, err = lpDecoder.NextField(); k != nil && err == nil; k, vField, err = lpDecoder.NextField() {
 			fields[string(k)] = vField.Interface()
 		}
@@ -169,32 +184,26 @@ func (r *metricsReceiver) handleWrite(w http.ResponseWriter, req *http.Request) 
 		err = batch.AddPoint(string(measurement), tags, fields, ts, common.InfluxMetricValueTypeUntyped)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = fmt.Fprintf(w, "failed to append to the batch")
+			_, _ = fmt.Fprintf(w, "failed to append to the batch: %v", err)
 			return
 		}
 	}
 
-	b, err := batch.ToProtoBytes()
+	err := r.nextConsumer.ConsumeMetrics(req.Context(), batch.GetMetrics())
+	r.obsrecv.EndMetricsOp(ctx, dataFormat, batch.GetMetrics().DataPointCount(), err)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = fmt.Fprintf(w, "failed to convert batch to protobuf bytes")
-		return
-	}
-	md, err := pdata.MetricsFromOtlpProtoBytes(b)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = fmt.Fprintf(w, "failed to convert protobuf bytes to OTLP object")
-		return
-	}
-	if err = r.nextConsumer.ConsumeMetrics(req.Context(), md); err != nil {
 		if consumererror.IsPermanent(err) {
 			w.WriteHeader(http.StatusBadRequest)
 		} else {
 			w.WriteHeader(http.StatusInternalServerError)
 		}
-		r.logger.Debug("failed to pass metrics to next consumer: %s", err.Error())
+		r.logger.Debug("failed to pass metrics to next consumer: %s", err)
 		return
 	}
 
-	w.WriteHeader(http.StatusAccepted)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (*metricsReceiver) handlePing(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
 }

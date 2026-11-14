@@ -1,0 +1,53 @@
+resourceMetrics:
+  - resource: {}
+    schemaUrl: https://opentelemetry.io/schemas/1.9.0
+    scopeMetrics:
+      - metrics:
+          - description: Total CPU seconds broken down by different states.
+            name: system.cpu.time
+            sum:
+              aggregationTemporality: 2
+              dataPoints:
+                - asDouble: 5.9
+                  attributes:
+                    - key: state
+                      value:
+                        stringValue: idle
+                  startTimeUnixNano: "1662132756000000000"
+                  timeUnixNano: "1136214250000000000"
+                - asDouble: 0
+                  attributes:
+                    - key: state
+                      value:
+                        stringValue: interrupt
+                  startTimeUnixNano: "1662132756000000000"
+                  timeUnixNano: "1136214250000000000"
+                - asDouble: 9.1
+                  attributes:
+                    - key: state
+                      value:
+                        stringValue: system
+                  startTimeUnixNano: "1662132756000000000"
+                  timeUnixNano: "1136214250000000000"
+                - asDouble: 6
+                  attributes:
+                    - key: state
+                      value:
+                        stringValue: user
+                  startTimeUnixNano: "1662132756000000000"
+                  timeUnixNano: "1136214250000000000"
+              isMonotonic: true
+            unit: s
+          - description: Number of available logical CPUs.
+            name: system.cpu.logical.count
+            sum:
+              aggregationTemporality: 2
+              dataPoints:
+                - asInt: "2"
+                  startTimeUnixNano: "1662132756000000000"
+                  timeUnixNano: "1136214250000000000"
+              isMonotonic: false
+            unit: "{cpu}"
+        scope:
+          name: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/cpuscraper
+          version: latest

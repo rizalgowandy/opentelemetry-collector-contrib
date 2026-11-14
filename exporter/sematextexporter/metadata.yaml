@@ -1,0 +1,16 @@
+type: sematext
+display_name: Sematext Exporter
+
+status:
+  class: exporter
+  stability:
+    development: [metrics,logs]
+  distributions: []
+  codeowners:
+    active: [AkhigbeEromo]
+
+sending_queue:
+  support: default
+
+tests:
+  expect_consumer_error: true

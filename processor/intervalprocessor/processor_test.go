@@ -1,0 +1,158 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package intervalprocessor // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/intervalprocessor"
+
+import (
+	"context"
+	"path/filepath"
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/consumer/consumertest"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/processor/processortest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/golden"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatatest/pmetrictest"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/intervalprocessor/internal/metadata"
+)
+
+func TestAggregation(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name        string
+		passThrough bool
+	}{
+		{name: "basic_aggregation"},
+		{name: "histograms_are_aggregated"},
+		{name: "exp_histograms_are_aggregated"},
+		{name: "gauges_are_aggregated"},
+		{name: "summaries_are_aggregated"},
+		{name: "all_delta_metrics_are_aggregated"}, // Deltas are aggregated
+		{name: "delta_metrics_aggregation_multiple_points"},
+		{name: "non_monotonic_sums_are_passed_through"}, // Non-monotonic sums are passed through even when aggregation is enabled
+		{name: "gauges_are_passed_through", passThrough: true},
+		{name: "summaries_are_passed_through", passThrough: true},
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	var config *Config
+	for _, tc := range testCases {
+		config = &Config{Interval: time.Second, PassThrough: PassThrough{Gauge: tc.passThrough, Summary: tc.passThrough}}
+
+		t.Run(tc.name, func(t *testing.T) {
+			// next stores the results of the filter metric processor
+			next := &consumertest.MetricsSink{}
+
+			factory := NewFactory()
+			mgp, err := factory.CreateMetrics(
+				t.Context(),
+				processortest.NewNopSettings(metadata.Type),
+				config,
+				next,
+			)
+			require.NoError(t, err)
+
+			dir := filepath.Join("testdata", tc.name)
+
+			inputFields, err := filepath.Glob(filepath.Join(dir, "input*.yaml"))
+			require.NoError(t, err)
+			require.NotEmpty(t, inputFields)
+
+			sort.Strings(inputFields)
+
+			for _, inputFile := range inputFields {
+				md, readErr := golden.ReadMetrics(inputFile)
+				require.NoError(t, readErr)
+
+				// Test that ConsumeMetrics works
+				consumeErr := mgp.ConsumeMetrics(ctx, md)
+				require.NoError(t, consumeErr)
+			}
+
+			require.IsType(t, &intervalProcessor{}, mgp)
+			processor := mgp.(*intervalProcessor)
+
+			// Pretend we hit the interval timer and call export
+			processor.exportMetrics(ctx)
+
+			// All the lookup tables should now be empty
+			require.Empty(t, processor.rmLookup)
+			require.Empty(t, processor.smLookup)
+			require.Empty(t, processor.mLookup)
+			require.Empty(t, processor.numberLookup)
+			require.Empty(t, processor.histogramLookup)
+			require.Empty(t, processor.expHistogramLookup)
+			require.Empty(t, processor.summaryLookup)
+
+			// Exporting again should return nothing
+			processor.exportMetrics(ctx)
+
+			// Next should have gotten N + 2 data sets:
+			// 1. Anything left over from each ConsumeMetrics() call (N calls)
+			// 2. Anything exported from exportMetrics()
+			// 3. An empty entry for the second call to exportMetrics()
+			allMetrics := next.AllMetrics()
+			numInputs := len(inputFields)
+			require.Len(t, allMetrics, numInputs+2)
+
+			nextData := allMetrics[0] // Only comparing the first pass-through
+			exportData := allMetrics[numInputs]
+			secondExportData := allMetrics[numInputs+1]
+
+			expectedNextData, err := golden.ReadMetrics(filepath.Join(dir, "next.yaml"))
+			require.NoError(t, err)
+			require.NoError(t, pmetrictest.CompareMetrics(expectedNextData, nextData))
+
+			expectedExportData, err := golden.ReadMetrics(filepath.Join(dir, "output.yaml"))
+			require.NoError(t, err)
+			require.NoError(t, pmetrictest.CompareMetrics(expectedExportData, exportData))
+
+			require.NoError(t, pmetrictest.CompareMetrics(pmetric.NewMetrics(), secondExportData), "the second export data should be empty")
+		})
+	}
+}
+
+func TestFlushOnShutdown(t *testing.T) {
+	t.Parallel()
+
+	// Use a very long interval so the ticker never fires during the test.
+	config := &Config{Interval: time.Hour}
+	next := &consumertest.MetricsSink{}
+
+	factory := NewFactory()
+	mgp, err := factory.CreateMetrics(
+		t.Context(),
+		processortest.NewNopSettings(metadata.Type),
+		config,
+		next,
+	)
+	require.NoError(t, err)
+
+	err = mgp.Start(t.Context(), componenttest.NewNopHost())
+	require.NoError(t, err)
+
+	dir := filepath.Join("testdata", "basic_aggregation")
+	md, err := golden.ReadMetrics(filepath.Join(dir, "input.yaml"))
+	require.NoError(t, err)
+
+	err = mgp.ConsumeMetrics(t.Context(), md)
+	require.NoError(t, err)
+
+	err = mgp.Shutdown(t.Context())
+	require.NoError(t, err)
+
+	allMetrics := next.AllMetrics()
+	require.Len(t, allMetrics, 2)
+
+	expectedExportData, err := golden.ReadMetrics(filepath.Join(dir, "output.yaml"))
+	require.NoError(t, err)
+	require.NoError(t, pmetrictest.CompareMetrics(expectedExportData, allMetrics[1]))
+}

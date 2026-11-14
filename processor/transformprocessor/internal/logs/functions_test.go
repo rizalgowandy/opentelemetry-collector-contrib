@@ -1,0 +1,30 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package logs
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/ottllog"
+	xprofilefuncs "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/contexts/xprofile/ottlfuncs"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/ottlfuncs"
+	xottlfuncs "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl/xottl/ottlfuncs"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor/internal/logparsingfuncs"
+)
+
+func Test_LogFunctions(t *testing.T) {
+	expected := xottlfuncs.WithExperimentalConverters(xprofilefuncs.WithProfileConverters(ottlfuncs.StandardFuncs[*ottllog.TransformContext]()))
+	expected["ParseCEF"] = logparsingfuncs.NewParseCEFFactory()
+	expected["ParseCLF"] = logparsingfuncs.NewParseCLFFactory()
+	expected["ParseELF"] = logparsingfuncs.NewParseELFFactory()
+	expected["ParseLEEF"] = logparsingfuncs.NewParseLEEFFactory()
+	actual := LogFunctions()
+	require.Len(t, actual, len(expected))
+	for k := range actual {
+		assert.Contains(t, expected, k)
+	}
+}

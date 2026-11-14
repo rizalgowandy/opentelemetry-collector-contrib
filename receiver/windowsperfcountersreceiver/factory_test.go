@@ -1,63 +1,106 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package windowsperfcountersreceiver
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/component/componenterror"
-	"go.opentelemetry.io/collector/config/configcheck"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/consumer/consumertest"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/pipeline"
+	"go.opentelemetry.io/collector/receiver/receivertest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/windowsperfcountersreceiver/internal/metadata"
 )
 
-var creationParams = component.ReceiverCreateSettings{Logger: zap.NewNop()}
+var creationParams = receivertest.NewNopSettings(metadata.Type)
 
 func TestCreateDefaultConfig(t *testing.T) {
 	factory := NewFactory()
 	cfg := factory.CreateDefaultConfig()
 
 	assert.NotNil(t, cfg, "failed to create default config")
-	assert.NoError(t, configcheck.ValidateConfig(cfg))
+	assert.NoError(t, componenttest.CheckConfigStruct(cfg))
 
-	cfg.(*Config).PerfCounters = []PerfCounterConfig{{Object: "object", Counters: []string{"counter"}}}
+	cfg.(*Config).PerfCounters = []ObjectConfig{
+		{
+			Object:   "object",
+			Counters: []CounterConfig{{Name: "counter", MetricRep: MetricRep{Name: "metric"}}},
+		},
+	}
 
-	assert.NoError(t, cfg.Validate())
+	cfg.(*Config).MetricMetaData = map[string]MetricConfig{
+		"metric": {
+			Description: "desc",
+			Unit:        "1",
+			Gauge:       GaugeMetric{},
+		},
+	}
+
+	assert.NoError(t, confmap.Validate(cfg))
 }
 
-func TestCreateTracesReceiver(t *testing.T) {
+func TestCreateTraces(t *testing.T) {
 	factory := NewFactory()
 	cfg := factory.CreateDefaultConfig()
-	cfg.(*Config).PerfCounters = []PerfCounterConfig{{Object: "object", Counters: []string{"counter"}}}
+	cfg.(*Config).PerfCounters = []ObjectConfig{
+		{
+			Object:   "object",
+			Counters: []CounterConfig{{Name: "counter", MetricRep: MetricRep{Name: "metric"}}},
+		},
+	}
 
-	tReceiver, err := factory.CreateTracesReceiver(context.Background(), creationParams, cfg, consumertest.NewNop())
+	cfg.(*Config).MetricMetaData = map[string]MetricConfig{
+		"metric": {
+			Description: "desc",
+			Unit:        "1",
+			Gauge:       GaugeMetric{},
+		},
+	}
+	tReceiver, err := factory.CreateTraces(t.Context(), creationParams, cfg, consumertest.NewNop())
 
-	assert.ErrorIs(t, err, componenterror.ErrDataTypeIsNotSupported)
+	assert.ErrorIs(t, err, pipeline.ErrSignalNotSupported)
 	assert.Nil(t, tReceiver)
 }
 
-func TestCreateLogsReceiver(t *testing.T) {
+func TestCreateTracesNoMetrics(t *testing.T) {
 	factory := NewFactory()
 	cfg := factory.CreateDefaultConfig()
-	cfg.(*Config).PerfCounters = []PerfCounterConfig{{Object: "object", Counters: []string{"counter"}}}
+	cfg.(*Config).PerfCounters = []ObjectConfig{
+		{
+			Object:   "object",
+			Counters: []CounterConfig{{Name: "counter"}},
+		},
+	}
+	tReceiver, err := factory.CreateTraces(t.Context(), creationParams, cfg, consumertest.NewNop())
 
-	tReceiver, err := factory.CreateLogsReceiver(context.Background(), creationParams, cfg, consumertest.NewNop())
+	assert.ErrorIs(t, err, pipeline.ErrSignalNotSupported)
+	assert.Nil(t, tReceiver)
+}
 
-	assert.ErrorIs(t, err, componenterror.ErrDataTypeIsNotSupported)
+func TestCreateLogs(t *testing.T) {
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig()
+	cfg.(*Config).PerfCounters = []ObjectConfig{
+		{
+			Object:   "object",
+			Counters: []CounterConfig{{Name: "counter", MetricRep: MetricRep{Name: "metric"}}},
+		},
+	}
+
+	cfg.(*Config).MetricMetaData = map[string]MetricConfig{
+		"metric": {
+			Description: "desc",
+			Unit:        "1",
+			Gauge:       GaugeMetric{},
+		},
+	}
+
+	tReceiver, err := factory.CreateLogs(t.Context(), creationParams, cfg, consumertest.NewNop())
+
+	assert.ErrorIs(t, err, pipeline.ErrSignalNotSupported)
 	assert.Nil(t, tReceiver)
 }

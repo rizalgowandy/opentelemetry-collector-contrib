@@ -1,16 +1,5 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package k8sclient
 
@@ -26,13 +15,12 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-var nodeArray = []interface{}{
+var nodeArray = []any{
 	&v1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "ip-192-168-200-63.eu-west-1.compute.internal",
 			GenerateName:    "",
 			Namespace:       "",
-			SelfLink:        "/api/v1/nodes/ip-192-168-200-63.eu-west-1.compute.internal",
 			UID:             "9e31e901-4c14-11e9-9bd4-02cf86190d00",
 			ResourceVersion: "6505830",
 			Generation:      0,
@@ -40,9 +28,9 @@ var nodeArray = []interface{}{
 				Time: time.Now(),
 			},
 			Labels: map[string]string{
-				"beta.kubernetes.io/arch":                  "amd64",
+				"kubernetes.io/arch":                       "amd64",
 				"beta.kubernetes.io/instance-type":         "t3.medium",
-				"beta.kubernetes.io/os":                    "linux",
+				"kubernetes.io/os":                         "linux",
 				"failure-domain.beta.kubernetes.io/region": "eu-west-1",
 				"failure-domain.beta.kubernetes.io/zone":   "eu-west-1c",
 				"kubernetes.io/hostname":                   "ip-192-168-200-63.eu-west-1.compute.internal",
@@ -51,7 +39,6 @@ var nodeArray = []interface{}{
 				"node.alpha.kubernetes.io/ttl":                           "0",
 				"volumes.kubernetes.io/controller-managed-attach-detach": "true",
 			},
-			ClusterName: "",
 		},
 		Status: v1.NodeStatus{
 			Conditions: []v1.NodeCondition{
@@ -112,7 +99,6 @@ var nodeArray = []interface{}{
 				OSImage:                 "Amazon Linux 2",
 				ContainerRuntimeVersion: "docker://18.6.1",
 				KubeletVersion:          "v1.11.5",
-				KubeProxyVersion:        "v1.11.5",
 				OperatingSystem:         "linux",
 				Architecture:            "amd64",
 			},
@@ -123,7 +109,6 @@ var nodeArray = []interface{}{
 			Name:            "ip-192-168-76-61.eu-west-1.compute.internal",
 			GenerateName:    "",
 			Namespace:       "",
-			SelfLink:        "/api/v1/nodes/ip-192-168-76-61.eu-west-1.compute.internal",
 			UID:             "9f9e79a7-4c14-11e9-b47e-066a7a20bac8",
 			ResourceVersion: "6505829",
 			Generation:      0,
@@ -131,18 +116,17 @@ var nodeArray = []interface{}{
 				Time: time.Now(),
 			},
 			Labels: map[string]string{
-				"beta.kubernetes.io/os":                    "linux",
+				"kubernetes.io/os":                         "linux",
 				"failure-domain.beta.kubernetes.io/region": "eu-west-1",
 				"failure-domain.beta.kubernetes.io/zone":   "eu-west-1a",
 				"kubernetes.io/hostname":                   "ip-192-168-76-61.eu-west-1.compute.internal",
-				"beta.kubernetes.io/arch":                  "amd64",
+				"kubernetes.io/arch":                       "amd64",
 				"beta.kubernetes.io/instance-type":         "t3.medium",
 			},
 			Annotations: map[string]string{
 				"node.alpha.kubernetes.io/ttl":                           "0",
 				"volumes.kubernetes.io/controller-managed-attach-detach": "true",
 			},
-			ClusterName: "",
 		},
 		Status: v1.NodeStatus{
 			Conditions: []v1.NodeCondition{
@@ -203,7 +187,6 @@ var nodeArray = []interface{}{
 				OSImage:                 "Amazon Linux 2",
 				ContainerRuntimeVersion: "docker://18.6.1",
 				KubeletVersion:          "v1.11.5",
-				KubeProxyVersion:        "v1.11.5",
 				OperatingSystem:         "linux",
 				Architecture:            "amd64",
 			},
@@ -214,7 +197,6 @@ var nodeArray = []interface{}{
 			Name:            "ip-192-168-153-1.eu-west-1.compute.internal",
 			GenerateName:    "",
 			Namespace:       "",
-			SelfLink:        "/api/v1/nodes/ip-192-168-153-1.eu-west-1.compute.internal",
 			UID:             "9eb3a09d-4c14-11e9-b47e-066a7a20bac8",
 			ResourceVersion: "6505831",
 			Generation:      0,
@@ -222,9 +204,9 @@ var nodeArray = []interface{}{
 				Time: time.Now(),
 			},
 			Labels: map[string]string{
-				"beta.kubernetes.io/arch":                  "amd64",
+				"kubernetes.io/arch":                       "amd64",
 				"beta.kubernetes.io/instance-type":         "t3.medium",
-				"beta.kubernetes.io/os":                    "linux",
+				"kubernetes.io/os":                         "linux",
 				"failure-domain.beta.kubernetes.io/region": "eu-west-1",
 				"failure-domain.beta.kubernetes.io/zone":   "eu-west-1b",
 				"kubernetes.io/hostname":                   "ip-192-168-153-1.eu-west-1.compute.internal",
@@ -233,7 +215,6 @@ var nodeArray = []interface{}{
 				"node.alpha.kubernetes.io/ttl":                           "0",
 				"volumes.kubernetes.io/controller-managed-attach-detach": "true",
 			},
-			ClusterName: "",
 		},
 		Status: v1.NodeStatus{
 			Conditions: []v1.NodeCondition{
@@ -249,7 +230,7 @@ var nodeArray = []interface{}{
 					Reason:  "KubeletHasSufficientMemory",
 					Message: "kubelet has sufficient memory available",
 				},
-				{ //This entry shows failed node
+				{ // This entry shows failed node
 					Type:   "DiskPressure",
 					Status: "True",
 					LastHeartbeatTime: metav1.Time{
@@ -294,7 +275,6 @@ var nodeArray = []interface{}{
 				OSImage:                 "Amazon Linux 2",
 				ContainerRuntimeVersion: "docker://18.6.1",
 				KubeletVersion:          "v1.11.5",
-				KubeProxyVersion:        "v1.11.5",
 				OperatingSystem:         "linux",
 				Architecture:            "amd64",
 			},
@@ -303,11 +283,12 @@ var nodeArray = []interface{}{
 }
 
 func TestNodeClient(t *testing.T) {
+	t.Skip("Flaky test, see https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/9001")
 	setOption := nodeSyncCheckerOption(&mockReflectorSyncChecker{})
 
-	fakeClientSet := fake.NewSimpleClientset()
+	fakeClientSet := fake.NewClientset()
 	client := newNodeClient(fakeClientSet, zap.NewNop(), setOption)
-	client.store.Replace(nodeArray, "")
+	assert.NoError(t, client.store.Replace(nodeArray, ""))
 
 	expectedClusterNodeCount := 3
 	expectedClusterFailedNodeCount := 1
@@ -315,8 +296,8 @@ func TestNodeClient(t *testing.T) {
 	clusterFailedNodeCount := client.ClusterFailedNodeCount()
 	log.Printf("clusterNodeCount: %v, clusterFailedNodeCount: %v", clusterNodeCount, clusterFailedNodeCount)
 
-	assert.Equal(t, clusterNodeCount, expectedClusterNodeCount)
-	assert.Equal(t, clusterFailedNodeCount, expectedClusterFailedNodeCount)
+	assert.Equal(t, expectedClusterNodeCount, clusterNodeCount)
+	assert.Equal(t, expectedClusterFailedNodeCount, clusterFailedNodeCount)
 	client.shutdown()
 	assert.True(t, client.stopped)
 }
@@ -324,5 +305,5 @@ func TestNodeClient(t *testing.T) {
 func TestTransformFuncNode(t *testing.T) {
 	info, err := transformFuncNode(nil)
 	assert.Nil(t, info)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 }

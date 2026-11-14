@@ -1,197 +1,223 @@
-// Copyright, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package awsutil
 
 import (
-	"errors"
-	"os"
-	"strings"
+	"context"
+	"net/http"
 	"testing"
+	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/aws-sdk-go-v2/service/sts/types"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
 
-var ec2Region = "us-west-2"
+type mockSTS struct{}
 
-type mockConn struct {
-	mock.Mock
-	sn *session.Session
-}
-
-func (c *mockConn) getEC2Region(s *session.Session) (string, error) {
-	args := c.Called(nil)
-	errorStr := args.String(0)
-	var err error
-	if errorStr != "" {
-		err = errors.New(errorStr)
-		return "", err
-	}
-	return ec2Region, nil
-}
-
-func (c *mockConn) newAWSSession(logger *zap.Logger, roleArn string, region string) (*session.Session, error) {
-	return c.sn, nil
-}
-
-// fetch region value from ec2 meta data service
-func TestEC2Session(t *testing.T) {
+func TestGetAWSConfig(t *testing.T) {
 	logger := zap.NewNop()
-	sessionCfg := CreateDefaultSessionConfig()
-	m := new(mockConn)
-	m.On("getEC2Region", nil).Return("").Once()
-	var expectedSession *session.Session
-	expectedSession, _ = session.NewSession()
-	m.sn = expectedSession
-	cfg, s, err := GetAWSConfigSession(logger, m, &sessionCfg)
-	assert.Equal(t, s, expectedSession, "Expect the session object is not overridden")
-	assert.Equal(t, *cfg.Region, ec2Region, "Region value fetched from ec2-metadata service")
-	assert.Nil(t, err)
+	settings := &AWSSessionSettings{
+		Region:   "us-mock-1",
+		RoleARN:  "arn:aws:iam::123456789012:role/TestRole",
+		Endpoint: "http://localhost:4566",
+	}
+
+	mockSTS := &mockSTS{}
+
+	cfg, err := getAWSConfig(t.Context(), logger, settings, func(_ aws.Config) stscreds.AssumeRoleAPIClient {
+		return mockSTS
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, "us-mock-1", cfg.Region)
+	assert.Equal(t, "http://localhost:4566", *cfg.BaseEndpoint)
+	assert.NotNil(t, cfg.Credentials)
 }
 
-// fetch region value from environment variable
+func (*mockSTS) AssumeRole(_ context.Context, _ *sts.AssumeRoleInput, _ ...func(*sts.Options)) (*sts.AssumeRoleOutput, error) {
+	return &sts.AssumeRoleOutput{
+		Credentials: &types.Credentials{
+			AccessKeyId:     aws.String("mockAccessKey"),
+			SecretAccessKey: aws.String("mockSecret"),
+			SessionToken:    aws.String("mockToken"),
+		},
+	}, nil
+}
+
+// Test fetching region value from environment variable
 func TestRegionEnv(t *testing.T) {
 	logger := zap.NewNop()
 	sessionCfg := CreateDefaultSessionConfig()
 	region := "us-east-1"
-	env := stashEnv()
-	defer popEnv(env)
-	os.Setenv("AWS_REGION", region)
+	t.Setenv("AWS_REGION", region)
 
-	var m = &mockConn{}
-	var expectedSession *session.Session
-	expectedSession, _ = session.NewSession()
-	m.sn = expectedSession
-	cfg, s, err := GetAWSConfigSession(logger, m, &sessionCfg)
-	assert.Equal(t, s, expectedSession, "Expect the session object is not overridden")
-	assert.Equal(t, *cfg.Region, region, "Region value fetched from environment")
-	assert.Nil(t, err)
+	ctx := t.Context()
+	cfg, err := GetAWSConfig(ctx, logger, &sessionCfg)
+	assert.NoError(t, err)
+	assert.Equal(t, region, cfg.Region, "Region value should be fetched from environment")
 }
 
-func TestGetAWSConfigSessionWithSessionErr(t *testing.T) {
+// Test GetAWSConfig with explicit region setting
+func TestGetAWSConfigWithExplicitRegion(t *testing.T) {
 	logger := zap.NewNop()
 	sessionCfg := CreateDefaultSessionConfig()
-	sessionCfg.Region = ""
-	sessionCfg.NoVerifySSL = false
-	env := stashEnv()
-	defer popEnv(env)
-	os.Setenv("AWS_STS_REGIONAL_ENDPOINTS", "fake")
-	m := new(mockConn)
-	m.On("getEC2Region", nil).Return("").Once()
-	var expectedSession *session.Session
-	expectedSession, _ = session.NewSession()
-	m.sn = expectedSession
-	cfg, s, err := GetAWSConfigSession(logger, m, &sessionCfg)
-	assert.Nil(t, cfg)
-	assert.Nil(t, s)
-	assert.NotNil(t, err)
+	sessionCfg.Region = "eu-west-1"
+
+	ctx := t.Context()
+	cfg, err := GetAWSConfig(ctx, logger, &sessionCfg)
+	assert.NoError(t, err)
+	assert.Equal(t, "eu-west-1", cfg.Region, "Region value should match the explicitly set region")
 }
 
-func TestGetAWSConfigSessionWithEC2RegionErr(t *testing.T) {
+// Test GetAWSConfig with custom endpoint
+func TestGetAWSConfigWithCustomEndpoint(t *testing.T) {
 	logger := zap.NewNop()
 	sessionCfg := CreateDefaultSessionConfig()
-	sessionCfg.Region = ""
-	sessionCfg.NoVerifySSL = false
-	m := new(mockConn)
-	m.On("getEC2Region", nil).Return("some error").Once()
-	var expectedSession *session.Session
-	expectedSession, _ = session.NewSession()
-	m.sn = expectedSession
-	cfg, s, err := GetAWSConfigSession(logger, m, &sessionCfg)
-	assert.Nil(t, cfg)
-	assert.Nil(t, s)
-	assert.NotNil(t, err)
+	sessionCfg.Region = "us-west-2"
+	sessionCfg.Endpoint = "https://custom.endpoint.com"
+
+	ctx := t.Context()
+	cfg, err := GetAWSConfig(ctx, logger, &sessionCfg)
+	assert.NoError(t, err)
+	assert.Equal(t, "us-west-2", cfg.Region)
+	assert.NotNil(t, cfg.BaseEndpoint)
+	assert.Equal(t, "https://custom.endpoint.com", *cfg.BaseEndpoint)
 }
 
-func TestNewAWSSessionWithErr(t *testing.T) {
+// Test GetAWSConfig with retry settings
+func TestGetAWSConfigWithRetries(t *testing.T) {
 	logger := zap.NewNop()
-	roleArn := "fake_arn"
-	region := "fake_region"
-	env := stashEnv()
-	defer popEnv(env)
-	os.Setenv("AWS_EC2_METADATA_DISABLED", "true")
-	os.Setenv("AWS_STS_REGIONAL_ENDPOINTS", "fake")
-	conn := &Conn{}
-	se, err := conn.newAWSSession(logger, roleArn, region)
-	assert.NotNil(t, err)
-	assert.Nil(t, se)
-	roleArn = ""
-	se, err = conn.newAWSSession(logger, roleArn, region)
-	assert.NotNil(t, err)
-	assert.Nil(t, se)
-	os.Setenv("AWS_SDK_LOAD_CONFIG", "true")
-	os.Setenv("AWS_STS_REGIONAL_ENDPOINTS", "regional")
-	se, _ = session.NewSession(&aws.Config{
-		Region: aws.String("us-east-1"),
-	})
-	assert.NotNil(t, se)
-	_, err = conn.getEC2Region(se)
-	assert.NotNil(t, err)
+	sessionCfg := CreateDefaultSessionConfig()
+	sessionCfg.Region = "us-west-2"
+	sessionCfg.MaxRetries = 5
+
+	ctx := t.Context()
+	cfg, err := GetAWSConfig(ctx, logger, &sessionCfg)
+	assert.NoError(t, err)
+	assert.Equal(t, 5, cfg.RetryMaxAttempts)
 }
 
-func TestGetSTSCredsFromPrimaryRegionEndpoint(t *testing.T) {
+// Test NewHTTPClient
+func TestNewHTTPClient(t *testing.T) {
 	logger := zap.NewNop()
-	session, _ := session.NewSession()
 
-	regions := []string{"us-east-1", "us-gov-west-1", "cn-north-1"}
-
-	for _, region := range regions {
-		creds := getSTSCredsFromPrimaryRegionEndpoint(logger, session, "", region)
-		assert.NotNil(t, creds)
+	testCases := []struct {
+		name         string
+		proxyAddress string
+		expectError  bool
+	}{
+		{
+			name:         "Valid configuration without proxy",
+			proxyAddress: "",
+			expectError:  false,
+		},
+		{
+			name:         "Valid configuration with proxy",
+			proxyAddress: "http://example.com",
+			expectError:  false,
+		},
+		{
+			name:         "Invalid proxy URL",
+			proxyAddress: "://invalid",
+			expectError:  true,
+		},
 	}
-	creds := getSTSCredsFromPrimaryRegionEndpoint(logger, session, "", "fake_region")
-	assert.Nil(t, creds)
-}
 
-func TestGetDefaultSession(t *testing.T) {
-	logger := zap.NewNop()
-	env := stashEnv()
-	defer popEnv(env)
-	os.Setenv("AWS_STS_REGIONAL_ENDPOINTS", "fake")
-	_, err := GetDefaultSession(logger)
-	assert.NotNil(t, err)
-}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := newHTTPClient(logger, 8, 30, false, tc.proxyAddress)
 
-func TestGetSTSCreds(t *testing.T) {
-	logger := zap.NewNop()
-	region := "fake_region"
-	roleArn := ""
-	_, err := getSTSCreds(logger, region, roleArn)
-	assert.Nil(t, err)
-	env := stashEnv()
-	defer popEnv(env)
-	os.Setenv("AWS_STS_REGIONAL_ENDPOINTS", "fake")
-	_, err = getSTSCreds(logger, region, roleArn)
-	assert.NotNil(t, err)
-}
-
-func stashEnv() []string {
-	env := os.Environ()
-	os.Clearenv()
-
-	return env
-}
-
-func popEnv(env []string) {
-	os.Clearenv()
-
-	for _, e := range env {
-		p := strings.SplitN(e, "=", 2)
-		os.Setenv(p[0], p[1])
+			if tc.expectError {
+				assert.Error(t, err, "Should return error with invalid proxy")
+				assert.Nil(t, client, "Client should be nil on error")
+			} else {
+				assert.NoError(t, err, "Should not return error with valid configuration")
+				assert.NotNil(t, client, "Client should not be nil")
+			}
+		})
 	}
+}
+
+// Test HTTP client with no SSL verification
+func TestNewHTTPClientNoVerifySSL(t *testing.T) {
+	logger := zap.NewNop()
+	client, err := newHTTPClient(logger, 8, 30, true, "")
+	assert.NoError(t, err, "Should not return error")
+	assert.NotNil(t, client, "Client should not be nil")
+
+	// Check that the transport has InsecureSkipVerify set
+	transport, ok := client.Transport.(*http.Transport)
+	assert.True(t, ok, "Transport should be of type *http.Transport")
+	assert.True(t, transport.TLSClientConfig.InsecureSkipVerify, "InsecureSkipVerify should be true")
+}
+
+// Test HTTP client with proxy from environment
+func TestNewHTTPClientWithProxyFromEnv(t *testing.T) {
+	logger := zap.NewNop()
+	proxyURL := "http://env.proxy.com:8080"
+	t.Setenv("HTTPS_PROXY", proxyURL)
+
+	client, err := newHTTPClient(logger, 8, 30, false, "")
+	assert.NoError(t, err)
+	assert.NotNil(t, client)
+}
+
+// Test HTTP client with custom timeout
+func TestNewHTTPClientWithCustomTimeout(t *testing.T) {
+	logger := zap.NewNop()
+	timeoutSeconds := 60
+
+	client, err := newHTTPClient(logger, 8, timeoutSeconds, false, "")
+	assert.NoError(t, err)
+	assert.NotNil(t, client)
+	assert.Equal(t, 60*time.Second, client.Timeout)
+}
+
+func TestNoProxyIsRespectedWhenUsingEnvProxy(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://mitmproxy:8080")
+	t.Setenv("NO_PROXY", ".amazonaws.com,localhost,127.0.0.1")
+
+	logger := zap.NewNop()
+
+	client, err := newHTTPClient(logger, 8, 30, false, "")
+	require.NoError(t, err)
+
+	transport, ok := client.Transport.(*http.Transport)
+	require.True(t, ok, "Transport should be *http.Transport")
+	require.NotNil(t, transport.Proxy, "Proxy function should not be nil")
+
+	req, err := http.NewRequest(http.MethodGet, "https://logs.eu-west-1.amazonaws.com/", http.NoBody)
+	require.NoError(t, err)
+
+	proxyURL, err := transport.Proxy(req)
+	assert.NoError(t, err)
+	assert.Nil(t, proxyURL,
+		"Proxy should be nil for hosts matching NO_PROXY, but got: %v — "+
+			"this proves NO_PROXY is not respected", proxyURL)
+}
+
+func TestProxyIsUsedForNonExcludedHosts(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://mitmproxy:8080")
+	t.Setenv("NO_PROXY", ".amazonaws.com,localhost,127.0.0.1")
+
+	logger := zap.NewNop()
+	client, err := newHTTPClient(logger, 8, 30, false, "")
+	require.NoError(t, err)
+
+	transport, ok := client.Transport.(*http.Transport)
+	require.True(t, ok)
+
+	req, err := http.NewRequest(http.MethodGet, "https://example.com/", http.NoBody)
+	require.NoError(t, err)
+
+	proxyURL, err := transport.Proxy(req)
+	assert.NoError(t, err)
+	assert.NotNil(t, proxyURL, "Proxy should be used for hosts NOT in NO_PROXY")
+	assert.Equal(t, "http://mitmproxy:8080", proxyURL.String())
 }

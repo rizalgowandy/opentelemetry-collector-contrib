@@ -1,62 +1,156 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package loadbalancingexporter
+//go:generate make mdatagen
+
+package loadbalancingexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/loadbalancingexporter"
 
 import (
 	"context"
+	"fmt"
 
-	"go.opencensus.io/stats/view"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/exporter/otlpexporter"
+	"go.opentelemetry.io/collector/exporter/xexporter"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
+	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/loadbalancingexporter/internal/metadata"
 )
 
 const (
-	// The value of "type" key in configuration.
-	typeStr = "loadbalancing"
+	zapEndpointKey = "endpoint"
 )
 
 // NewFactory creates a factory for the exporter.
-func NewFactory() component.ExporterFactory {
-	view.Register(MetricViews()...)
-
-	return exporterhelper.NewFactory(
-		typeStr,
+func NewFactory() exporter.Factory {
+	return xexporter.NewFactory(
+		metadata.Type,
 		createDefaultConfig,
-		exporterhelper.WithTraces(createTracesExporter),
-		exporterhelper.WithLogs(createLogExporter),
+		xexporter.WithTraces(createTracesExporter, metadata.TracesStability),
+		xexporter.WithLogs(createLogsExporter, metadata.LogsStability),
+		xexporter.WithMetrics(createMetricsExporter, metadata.MetricsStability),
+		xexporter.WithDeprecatedTypeAlias(metadata.DeprecatedType),
 	)
 }
 
-func createDefaultConfig() config.Exporter {
+func createDefaultConfig() component.Config {
 	otlpFactory := otlpexporter.NewFactory()
 	otlpDefaultCfg := otlpFactory.CreateDefaultConfig().(*otlpexporter.Config)
+	otlpDefaultCfg.ClientConfig.Endpoint = "placeholder:4317"
 
 	return &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
+		// By default we disable resilience options on loadbalancing exporter level
+		// to maintain compatibility with workflow in previous versions
 		Protocol: Protocol{
 			OTLP: *otlpDefaultCfg,
 		},
+		QueueSettings: configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
 	}
 }
 
-func createTracesExporter(_ context.Context, params component.ExporterCreateSettings, cfg config.Exporter) (component.TracesExporter, error) {
-	return newTracesExporter(params, cfg)
+func buildExporterConfig(cfg *Config, endpoint string) otlpexporter.Config {
+	oCfg := cfg.Protocol.OTLP
+	oCfg.ClientConfig.Endpoint = endpoint
+
+	return oCfg
 }
 
-func createLogExporter(_ context.Context, params component.ExporterCreateSettings, cfg config.Exporter) (component.LogsExporter, error) {
-	return newLogsExporter(params, cfg)
+func buildExporterSettings(typ component.Type, params exporter.Settings, endpoint string) exporter.Settings {
+	if name := params.ID.Name(); name != "" {
+		params.ID = component.NewIDWithName(typ, name)
+	} else {
+		params.ID = component.NewID(typ)
+	}
+	telemetry := params.TelemetrySettings
+	telemetry.MeterProvider = metricnoop.NewMeterProvider()
+	telemetry.TracerProvider = tracenoop.NewTracerProvider()
+	params.Logger = params.Logger.With(zap.String(zapEndpointKey, endpoint))
+	telemetry.Logger = params.Logger
+	params.TelemetrySettings = telemetry
+	return params
+}
+
+func buildExporterResilienceOptions(options []exporterhelper.Option, cfg *Config) []exporterhelper.Option {
+	if cfg.TimeoutSettings.Timeout > 0 {
+		options = append(options, exporterhelper.WithTimeout(cfg.TimeoutSettings))
+	}
+	if cfg.QueueSettings.HasValue() {
+		options = append(options, exporterhelper.WithQueue(cfg.QueueSettings))
+	}
+	if cfg.BackOffConfig.Enabled {
+		options = append(options, exporterhelper.WithRetry(cfg.BackOffConfig))
+	}
+
+	return options
+}
+
+func createTracesExporter(ctx context.Context, params exporter.Settings, cfg component.Config) (exporter.Traces, error) {
+	c := cfg.(*Config)
+	exp, err := newTracesExporter(params, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("cannot configure loadbalancing traces exporter: %w", err)
+	}
+
+	options := []exporterhelper.Option{
+		exporterhelper.WithStart(exp.Start),
+		exporterhelper.WithShutdown(exp.Shutdown),
+		exporterhelper.WithCapabilities(exp.Capabilities()),
+	}
+
+	return exporterhelper.NewTraces(
+		ctx,
+		params,
+		cfg,
+		exp.ConsumeTraces,
+		buildExporterResilienceOptions(options, c)...,
+	)
+}
+
+func createLogsExporter(ctx context.Context, params exporter.Settings, cfg component.Config) (exporter.Logs, error) {
+	c := cfg.(*Config)
+	exporter, err := newLogsExporter(params, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("cannot configure loadbalancing logs exporter: %w", err)
+	}
+
+	options := []exporterhelper.Option{
+		exporterhelper.WithStart(exporter.Start),
+		exporterhelper.WithShutdown(exporter.Shutdown),
+		exporterhelper.WithCapabilities(exporter.Capabilities()),
+	}
+
+	return exporterhelper.NewLogs(
+		ctx,
+		params,
+		cfg,
+		exporter.ConsumeLogs,
+		buildExporterResilienceOptions(options, c)...,
+	)
+}
+
+func createMetricsExporter(ctx context.Context, params exporter.Settings, cfg component.Config) (exporter.Metrics, error) {
+	c := cfg.(*Config)
+	exporter, err := newMetricsExporter(params, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("cannot configure loadbalancing metrics exporter: %w", err)
+	}
+
+	options := []exporterhelper.Option{
+		exporterhelper.WithStart(exporter.Start),
+		exporterhelper.WithShutdown(exporter.Shutdown),
+		exporterhelper.WithCapabilities(exporter.Capabilities()),
+	}
+
+	return exporterhelper.NewMetrics(
+		ctx,
+		params,
+		cfg,
+		exporter.ConsumeMetrics,
+		buildExporterResilienceOptions(options, c)...,
+	)
 }

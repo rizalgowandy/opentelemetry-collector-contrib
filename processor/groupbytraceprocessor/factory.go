@@ -1,35 +1,21 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package groupbytraceprocessor
+package groupbytraceprocessor // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/groupbytraceprocessor"
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"time"
 
-	"go.opencensus.io/stats/view"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
 	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/processor/processorhelper"
+	"go.opentelemetry.io/collector/processor"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/groupbytraceprocessor/internal/metadata"
 )
 
 const (
-	// typeStr is the value of "type" for this processor in the configuration.
-	typeStr config.Type = "groupbytrace"
-
 	defaultWaitDuration   = time.Second
 	defaultNumTraces      = 1_000_000
 	defaultNumWorkers     = 1
@@ -38,45 +24,44 @@ const (
 )
 
 var (
-	errDiskStorageNotSupported    = fmt.Errorf("option 'disk storage' not supported in this release")
-	errDiscardOrphansNotSupported = fmt.Errorf("option 'discard orphans' not supported in this release")
+	errDiskStorageNotSupported    = errors.New("option 'disk storage' not supported in this release")
+	errDiscardOrphansNotSupported = errors.New("option 'discard orphans' not supported in this release")
 )
 
 // NewFactory returns a new factory for the Filter processor.
-func NewFactory() component.ProcessorFactory {
-	// TODO: find a more appropriate way to get this done, as we are swallowing the error here
-	_ = view.Register(MetricViews()...)
-
-	return processorhelper.NewFactory(
-		typeStr,
+func NewFactory() processor.Factory {
+	return processor.NewFactory(
+		metadata.Type,
 		createDefaultConfig,
-		processorhelper.WithTraces(createTracesProcessor))
+		processor.WithTraces(createTracesProcessor, metadata.TracesStability),
+	)
 }
 
 // createDefaultConfig creates the default configuration for the processor.
-func createDefaultConfig() config.Processor {
+func createDefaultConfig() component.Config {
 	return &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewID(typeStr)),
-		NumTraces:         defaultNumTraces,
-		NumWorkers:        defaultNumWorkers,
-		WaitDuration:      defaultWaitDuration,
+		NumTraces:    defaultNumTraces,
+		NumWorkers:   defaultNumWorkers,
+		WaitDuration: defaultWaitDuration,
 
 		// not supported for now
 		DiscardOrphans: defaultDiscardOrphans,
 		StoreOnDisk:    defaultStoreOnDisk,
+
+		EmitStrategy: EmitStrategyTrace,
 	}
 }
 
 // createTracesProcessor creates a trace processor based on this config.
 func createTracesProcessor(
 	_ context.Context,
-	params component.ProcessorCreateSettings,
-	cfg config.Processor,
-	nextConsumer consumer.Traces) (component.TracesProcessor, error) {
-
+	params processor.Settings,
+	cfg component.Config,
+	nextConsumer consumer.Traces,
+) (processor.Traces, error) {
 	oCfg := cfg.(*Config)
 
-	var st storage
+	var st traceStorage
 	if oCfg.StoreOnDisk {
 		return nil, errDiskStorageNotSupported
 	}
@@ -84,8 +69,22 @@ func createTracesProcessor(
 		return nil, errDiscardOrphansNotSupported
 	}
 
+	processor := newGroupByTraceProcessor(params, nextConsumer, *oCfg)
 	// the only supported storage for now
-	st = newMemoryStorage()
+	st = newMemoryStorage(processor.telemetryBuilder)
+	processor.st = st
 
-	return newGroupByTraceProcessor(params.Logger, st, nextConsumer, *oCfg), nil
+	if oCfg.EmitStrategy == EmitStrategyService {
+		processor.eventMachine.onSubtraceTick = processor.onSubtraceTick
+
+		// Each worker gets its own ring buffer, deadlines and span storage. Traces
+		// are routed to a worker by trace ID, so nothing is shared between them.
+		for _, w := range processor.eventMachine.workers {
+			w.subtraceBuffer = newSubtraceRingBuffer(max(1, oCfg.NumTraces/oCfg.NumWorkers))
+			w.deadlines = newSubtraceDeadlines()
+			w.subSt = newSubtraceMemoryStorage(processor.telemetryBuilder)
+		}
+	}
+
+	return processor, nil
 }

@@ -1,41 +1,59 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package awscontainerinsightreceiver
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/testbed/testbed"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/consumer/consumertest"
+	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/receiver/receivertest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awscontainerinsightreceiver/internal/metadata"
 )
 
 func TestNewFactory(t *testing.T) {
+	// TestNewFactory checks the default behavior (feature gate disabled by default at StageAlpha)
+	// which should use the old type name for backward compatibility
+	originalValue := metadata.ReceiverAwscontainerinsightreceiverUseNewTypeNameFeatureGate.IsEnabled()
+	defer func() {
+		require.NoError(t, featuregate.GlobalRegistry().Set(metadata.ReceiverAwscontainerinsightreceiverUseNewTypeNameFeatureGate.ID(), originalValue))
+	}()
+
 	c := NewFactory()
 	assert.NotNil(t, c)
+	// By default (feature gate disabled), should use old type name for backward compatibility
+	assert.Equal(t, component.MustNewType("awscontainerinsightreceiver"), c.Type())
 }
 
-func TestCreateMetricsReceiver(t *testing.T) {
+func TestNewFactory_FeatureGateEnabled(t *testing.T) {
+	// Enable the feature gate
+	originalValue := metadata.ReceiverAwscontainerinsightreceiverUseNewTypeNameFeatureGate.IsEnabled()
+	defer func() {
+		if originalValue {
+			require.NoError(t, featuregate.GlobalRegistry().Set(metadata.ReceiverAwscontainerinsightreceiverUseNewTypeNameFeatureGate.ID(), true))
+		} else {
+			require.NoError(t, featuregate.GlobalRegistry().Set(metadata.ReceiverAwscontainerinsightreceiverUseNewTypeNameFeatureGate.ID(), false))
+		}
+	}()
+
+	require.NoError(t, featuregate.GlobalRegistry().Set(metadata.ReceiverAwscontainerinsightreceiverUseNewTypeNameFeatureGate.ID(), true))
+
+	c := NewFactory()
+	assert.NotNil(t, c)
+	assert.Equal(t, component.MustNewType("awscontainerinsight"), c.Type())
+}
+
+func TestCreateMetrics(t *testing.T) {
 	metricsReceiver, _ := createMetricsReceiver(
-		context.Background(),
-		component.ReceiverCreateSettings{Logger: zap.NewNop()},
+		t.Context(),
+		receivertest.NewNopSettings(metadata.Type),
 		createDefaultConfig(),
-		&testbed.MockMetricConsumer{},
+		consumertest.NewNop(),
 	)
 
 	require.NotNil(t, metricsReceiver)

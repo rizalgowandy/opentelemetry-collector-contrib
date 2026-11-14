@@ -1,102 +1,165 @@
-// Copyright OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package azuremonitorexporter
+//go:generate make mdatagen
+
+package azuremonitorexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/azuremonitorexporter"
 
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/microsoft/ApplicationInsights-Go/appinsights"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/exporter/xexporter"
+	conventions "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.uber.org/zap"
-)
 
-const (
-	// The value of "type" key in configuration.
-	typeStr         = "azuremonitor"
-	defaultEndpoint = "https://dc.services.visualstudio.com/v2/track"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/azuremonitorexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/sharedcomponent"
 )
 
 var (
 	errUnexpectedConfigurationType = errors.New("failed to cast configuration to Azure Monitor Config")
+	exporters                      = sharedcomponent.NewSharedComponents()
 )
 
 // NewFactory returns a factory for Azure Monitor exporter.
-func NewFactory() component.ExporterFactory {
-	f := &factory{}
-	return exporterhelper.NewFactory(
-		typeStr,
+func NewFactory() exporter.Factory {
+	f := &factory{
+		loggerInitOnce: sync.Once{},
+	}
+	return xexporter.NewFactory(
+		metadata.Type,
 		createDefaultConfig,
-		exporterhelper.WithTraces(f.createTracesExporter))
+		xexporter.WithTraces(f.createTracesExporter, metadata.TracesStability),
+		xexporter.WithLogs(f.createLogsExporter, metadata.LogsStability),
+		xexporter.WithMetrics(f.createMetricsExporter, metadata.MetricsStability),
+		xexporter.WithDeprecatedTypeAlias(metadata.DeprecatedType),
+	)
 }
 
 // Implements the interface from go.opentelemetry.io/collector/exporter/factory.go
 type factory struct {
-	tChannel transportChannel
+	loggerInitOnce sync.Once
 }
 
-func createDefaultConfig() config.Exporter {
+func createDefaultConfig() component.Config {
+	clientConfig := confighttp.NewDefaultClientConfig()
 	return &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewID(typeStr)),
-		Endpoint:         defaultEndpoint,
-		MaxBatchSize:     1024,
-		MaxBatchInterval: 10 * time.Second,
+		ClientConfig:        clientConfig,
+		MaxBatchSize:        1024,
+		MaxBatchInterval:    10 * time.Second,
+		SpanEventsEnabled:   false,
+		QueueSettings:       configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
+		ShutdownTimeout:     1 * time.Second,
+		CustomEventsEnabled: false,
+		TagMappings: TagMappingsConfig{
+			CloudRoleInstance:  []string{string(conventions.ServiceInstanceIDKey)},
+			ApplicationVersion: []string{string(conventions.ServiceVersionKey)},
+		},
 	}
 }
 
 func (f *factory) createTracesExporter(
 	ctx context.Context,
-	params component.ExporterCreateSettings,
-	cfg config.Exporter,
-) (component.TracesExporter, error) {
-	exporterConfig, ok := cfg.(*Config)
-
+	set exporter.Settings,
+	cfg component.Config,
+) (exporter.Traces, error) {
+	f.initLogger(set.Logger)
+	config, ok := cfg.(*Config)
 	if !ok {
 		return nil, errUnexpectedConfigurationType
 	}
+	ame := getOrCreateAzureMonitorExporter(cfg, set)
+	origComp := ame.Unwrap().(*azureMonitorExporter)
 
-	tc := f.getTransportChannel(exporterConfig, params.Logger)
-	return newTracesExporter(exporterConfig, tc, params.Logger)
+	return exporterhelper.NewTraces(
+		ctx,
+		set,
+		cfg,
+		origComp.consumeTraces,
+		exporterhelper.WithQueue(config.QueueSettings),
+		exporterhelper.WithStart(ame.Start),
+		exporterhelper.WithShutdown(ame.Shutdown),
+	)
 }
 
-// Configures the transport channel.
-// This method is not thread-safe
-func (f *factory) getTransportChannel(exporterConfig *Config, logger *zap.Logger) transportChannel {
+func (f *factory) createLogsExporter(
+	ctx context.Context,
+	set exporter.Settings,
+	cfg component.Config,
+) (exporter.Logs, error) {
+	f.initLogger(set.Logger)
+	config, ok := cfg.(*Config)
+	if !ok {
+		return nil, errUnexpectedConfigurationType
+	}
+	ame := getOrCreateAzureMonitorExporter(cfg, set)
+	origComp := ame.Unwrap().(*azureMonitorExporter)
 
-	// The default transport channel uses the default send mechanism from the AppInsights telemetry client.
-	// This default channel handles batching, appropriate retries, and is backed by memory.
-	if f.tChannel == nil {
-		telemetryConfiguration := appinsights.NewTelemetryConfiguration(exporterConfig.InstrumentationKey)
-		telemetryConfiguration.EndpointUrl = exporterConfig.Endpoint
-		telemetryConfiguration.MaxBatchSize = exporterConfig.MaxBatchSize
-		telemetryConfiguration.MaxBatchInterval = exporterConfig.MaxBatchInterval
-		telemetryClient := appinsights.NewTelemetryClientFromConfig(telemetryConfiguration)
+	return exporterhelper.NewLogs(
+		ctx,
+		set,
+		cfg,
+		origComp.consumeLogs,
+		exporterhelper.WithQueue(config.QueueSettings),
+		exporterhelper.WithStart(ame.Start),
+		exporterhelper.WithShutdown(ame.Shutdown),
+	)
+}
 
-		f.tChannel = telemetryClient.Channel()
+func (f *factory) createMetricsExporter(
+	ctx context.Context,
+	set exporter.Settings,
+	cfg component.Config,
+) (exporter.Metrics, error) {
+	f.initLogger(set.Logger)
+	config, ok := cfg.(*Config)
+	if !ok {
+		return nil, errUnexpectedConfigurationType
+	}
+	ame := getOrCreateAzureMonitorExporter(cfg, set)
+	origComp := ame.Unwrap().(*azureMonitorExporter)
 
-		// Don't even bother enabling the AppInsights diagnostics listener unless debug logging is enabled
+	return exporterhelper.NewMetrics(
+		ctx,
+		set,
+		cfg,
+		origComp.consumeMetrics,
+		exporterhelper.WithQueue(config.QueueSettings),
+		exporterhelper.WithStart(ame.Start),
+		exporterhelper.WithShutdown(ame.Shutdown),
+	)
+}
+
+func getOrCreateAzureMonitorExporter(cfg component.Config, set exporter.Settings) *sharedcomponent.SharedComponent {
+	conf := cfg.(*Config)
+	ame := exporters.GetOrAdd(set.ID, func() component.Component {
+		return &azureMonitorExporter{
+			config:   conf,
+			logger:   set.Logger,
+			packer:   newMetricPacker(set.Logger, conf),
+			settings: set.TelemetrySettings,
+		}
+	})
+
+	return ame
+}
+
+func (f *factory) initLogger(logger *zap.Logger) {
+	f.loggerInitOnce.Do(func() {
 		if checkedEntry := logger.Check(zap.DebugLevel, ""); checkedEntry != nil {
 			appinsights.NewDiagnosticsMessageListener(func(msg string) error {
 				logger.Debug(msg)
 				return nil
 			})
 		}
-	}
-
-	return f.tChannel
+	})
 }

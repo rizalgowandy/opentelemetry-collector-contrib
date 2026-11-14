@@ -1,0 +1,82 @@
+k8s_objects:
+  include_initial_state: false
+  objects:
+    - name: pods
+      mode: pull
+      interval: 1h
+      initial_delay: 10m
+      label_selector: environment in (production),tier in (frontend)
+      field_selector: status.phase=Running
+    - name: events
+      mode: watch
+      group: events.k8s.io
+      namespaces: [default]
+      exclude_watch_type: [DELETED]
+k8s_objects/pull_with_resource:
+  include_initial_state: false
+  objects:
+    - name: pods
+      mode: pull
+      interval: 1h
+      initial_delay: 5m
+      resource_version: "1"
+    - name: events
+      mode: pull
+      interval: 1h
+k8s_objects/watch_with_resource:
+  objects:
+    - name: events
+      mode: watch
+      group: events.k8s.io
+      namespaces: [default]
+    - name: events
+      mode: watch
+      group: events.k8s.io
+      namespaces: [default]
+      resource_version: "2"
+k8s_objects/watch_with_initial_state:
+  include_initial_state: true
+  objects:
+    - name: pods
+      mode: watch
+      namespaces: [default]
+    - name: events
+      mode: watch
+      group: events.k8s.io
+      namespaces: [default]
+k8s_objects/watch_without_initial_state:
+  include_initial_state: false
+  objects:
+    - name: events
+      mode: watch
+      group: events.k8s.io
+      namespaces: [default]
+k8s_objects/invalid_resource:
+  objects:
+    - name: fake_resource
+      mode: watch
+k8s_objects/exclude_deleted_with_pull:
+  include_initial_state: false
+  objects:
+    - name: events
+      mode: pull
+      exclude_watch_type: [DELETED]
+k8s_objects/invalid_mode:
+  objects:
+    - name: pods
+      mode: invalid_mode
+k8s_objects/exclude_namespaces:
+  objects:
+    - name: pods
+      mode: watch
+      exclude_namespaces:
+        - regexp: default_ignore
+k8s_objects/top_level_interval:
+  auth_type: serviceAccount
+  interval: 30m
+  objects:
+    - name: pods
+      mode: pull
+    - name: nodes
+      mode: pull
+      interval: 5m

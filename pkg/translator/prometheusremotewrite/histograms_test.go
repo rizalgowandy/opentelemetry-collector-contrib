@@ -1,0 +1,1077 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package prometheusremotewrite
+
+import (
+	"fmt"
+	"math"
+	"testing"
+	"time"
+
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/otlptranslator"
+	"github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/value"
+	"github.com/prometheus/prometheus/prompb"
+	prom "github.com/prometheus/prometheus/storage/remote/otlptranslator/prometheusremotewrite"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+)
+
+type expectedBucketLayout struct {
+	wantSpans  []prompb.BucketSpan
+	wantDeltas []int64
+}
+
+func TestConvertBucketsLayout(t *testing.T) {
+	tests := []struct {
+		name       string
+		buckets    func() pmetric.ExponentialHistogramDataPointBuckets
+		wantLayout map[int32]expectedBucketLayout
+	}{
+		{
+			name: "zero offset",
+			buckets: func() pmetric.ExponentialHistogramDataPointBuckets {
+				b := pmetric.NewExponentialHistogramDataPointBuckets()
+				b.SetOffset(0)
+				b.BucketCounts().FromRaw([]uint64{4, 3, 2, 1})
+				return b
+			},
+			wantLayout: map[int32]expectedBucketLayout{
+				0: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 1,
+							Length: 4,
+						},
+					},
+					wantDeltas: []int64{4, -1, -1, -1},
+				},
+				1: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 1,
+							Length: 2,
+						},
+					},
+					// 4+3, 2+1 = 7, 3 =delta= 7, -4
+					wantDeltas: []int64{7, -4},
+				},
+				2: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 1,
+							Length: 1,
+						},
+					},
+					// 4+3+2+1 = 10 =delta= 10
+					wantDeltas: []int64{10},
+				},
+			},
+		},
+		{
+			name: "offset 1",
+			buckets: func() pmetric.ExponentialHistogramDataPointBuckets {
+				b := pmetric.NewExponentialHistogramDataPointBuckets()
+				b.SetOffset(1)
+				b.BucketCounts().FromRaw([]uint64{4, 3, 2, 1})
+				return b
+			},
+			wantLayout: map[int32]expectedBucketLayout{
+				0: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 2,
+							Length: 4,
+						},
+					},
+					wantDeltas: []int64{4, -1, -1, -1},
+				},
+				1: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 1,
+							Length: 3,
+						},
+					},
+					wantDeltas: []int64{4, 1, -4}, // 0+4, 3+2, 1+0 = 4, 5, 1
+				},
+				2: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 1,
+							Length: 2,
+						},
+					},
+					wantDeltas: []int64{9, -8}, // 0+4+3+2, 1+0+0+0 = 9, 1
+				},
+			},
+		},
+		{
+			name: "positive offset",
+			buckets: func() pmetric.ExponentialHistogramDataPointBuckets {
+				b := pmetric.NewExponentialHistogramDataPointBuckets()
+				b.SetOffset(4)
+				b.BucketCounts().FromRaw([]uint64{4, 2, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})
+				return b
+			},
+			wantLayout: map[int32]expectedBucketLayout{
+				0: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 5,
+							Length: 4,
+						},
+						{
+							Offset: 12,
+							Length: 1,
+						},
+					},
+					wantDeltas: []int64{4, -2, -2, 2, -1},
+				},
+				1: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 3,
+							Length: 2,
+						},
+						{
+							Offset: 6,
+							Length: 1,
+						},
+					},
+					// Downscale:
+					// 4+2, 0+2, 0+0, 0+0, 0+0, 0+0, 0+0, 0+0, 1+0 = 6, 2, 0, 0, 0, 0, 0, 0, 1
+					wantDeltas: []int64{6, -4, -1},
+				},
+				2: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 2,
+							Length: 1,
+						},
+						{
+							Offset: 3,
+							Length: 1,
+						},
+					},
+					// Downscale:
+					// 4+2+0+2, 0+0+0+0, 0+0+0+0, 0+0+0+0, 1+0+0+0 = 8, 0, 0, 0, 1
+					// Check from sclaing from previous: 6+2, 0+0, 0+0, 0+0, 1+0 = 8, 0, 0, 0, 1
+					wantDeltas: []int64{8, -7},
+				},
+			},
+		},
+		{
+			name: "scaledown merges spans",
+			buckets: func() pmetric.ExponentialHistogramDataPointBuckets {
+				b := pmetric.NewExponentialHistogramDataPointBuckets()
+				b.SetOffset(4)
+				b.BucketCounts().FromRaw([]uint64{4, 2, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1})
+				return b
+			},
+			wantLayout: map[int32]expectedBucketLayout{
+				0: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 5,
+							Length: 4,
+						},
+						{
+							Offset: 8,
+							Length: 1,
+						},
+					},
+					wantDeltas: []int64{4, -2, -2, 2, -1},
+				},
+				1: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 3,
+							Length: 2,
+						},
+						{
+							Offset: 4,
+							Length: 1,
+						},
+					},
+					// Downscale:
+					// 4+2, 0+2, 0+0, 0+0, 0+0, 0+0, 1+0 = 6, 2, 0, 0, 0, 0, 1
+					wantDeltas: []int64{6, -4, -1},
+				},
+				2: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 2,
+							Length: 4,
+						},
+					},
+					// Downscale:
+					// 4+2+0+2, 0+0+0+0, 0+0+0+0, 1+0+0+0 = 8, 0, 0, 1
+					// Check from sclaing from previous: 6+2, 0+0, 0+0, 1+0 = 8, 0, 0, 1
+					wantDeltas: []int64{8, -8, 0, 1},
+				},
+			},
+		},
+		{
+			name: "negative offset",
+			buckets: func() pmetric.ExponentialHistogramDataPointBuckets {
+				b := pmetric.NewExponentialHistogramDataPointBuckets()
+				b.SetOffset(-2)
+				b.BucketCounts().FromRaw([]uint64{3, 1, 0, 0, 0, 1})
+				return b
+			},
+			wantLayout: map[int32]expectedBucketLayout{
+				0: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: -1,
+							Length: 2,
+						},
+						{
+							Offset: 3,
+							Length: 1,
+						},
+					},
+					wantDeltas: []int64{3, -2, 0},
+				},
+				1: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 0,
+							Length: 3,
+						},
+					},
+					// Downscale:
+					// 3+1, 0+0, 0+1 = 4, 0, 1
+					wantDeltas: []int64{4, -4, 1},
+				},
+				2: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 0,
+							Length: 2,
+						},
+					},
+					// Downscale:
+					// 0+0+3+1, 0+0+0+0 = 4, 1
+					wantDeltas: []int64{4, -3},
+				},
+			},
+		},
+		{
+			name: "buckets with gaps of size 1",
+			buckets: func() pmetric.ExponentialHistogramDataPointBuckets {
+				b := pmetric.NewExponentialHistogramDataPointBuckets()
+				b.SetOffset(-2)
+				b.BucketCounts().FromRaw([]uint64{3, 1, 0, 1, 0, 1})
+				return b
+			},
+			wantLayout: map[int32]expectedBucketLayout{
+				0: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: -1,
+							Length: 6,
+						},
+					},
+					wantDeltas: []int64{3, -2, -1, 1, -1, 1},
+				},
+				1: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 0,
+							Length: 3,
+						},
+					},
+					// Downscale:
+					// 3+1, 0+1, 0+1 = 4, 1, 1
+					wantDeltas: []int64{4, -3, 0},
+				},
+				2: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 0,
+							Length: 2,
+						},
+					},
+					// Downscale:
+					// 0+0+3+1, 0+1+0+1 = 4, 2
+					wantDeltas: []int64{4, -2},
+				},
+			},
+		},
+		{
+			name: "buckets with gaps of size 2",
+			buckets: func() pmetric.ExponentialHistogramDataPointBuckets {
+				b := pmetric.NewExponentialHistogramDataPointBuckets()
+				b.SetOffset(-2)
+				b.BucketCounts().FromRaw([]uint64{3, 0, 0, 1, 0, 0, 1})
+				return b
+			},
+			wantLayout: map[int32]expectedBucketLayout{
+				0: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: -1,
+							Length: 7,
+						},
+					},
+					wantDeltas: []int64{3, -3, 0, 1, -1, 0, 1},
+				},
+				1: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 0,
+							Length: 4,
+						},
+					},
+					// Downscale:
+					// 3+0, 0+1, 0+0, 0+1 = 3, 1, 0, 1
+					wantDeltas: []int64{3, -2, -1, 1},
+				},
+				2: {
+					wantSpans: []prompb.BucketSpan{
+						{
+							Offset: 0,
+							Length: 3,
+						},
+					},
+					// Downscale:
+					// 0+0+3+0, 0+1+0+0, 1+0+0+0 = 3, 1, 1
+					wantDeltas: []int64{3, -2, 0},
+				},
+			},
+		},
+		{
+			name:    "zero buckets",
+			buckets: pmetric.NewExponentialHistogramDataPointBuckets,
+			wantLayout: map[int32]expectedBucketLayout{
+				0: {
+					wantSpans:  nil,
+					wantDeltas: nil,
+				},
+				1: {
+					wantSpans:  nil,
+					wantDeltas: nil,
+				},
+				2: {
+					wantSpans:  nil,
+					wantDeltas: nil,
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		for scaleDown, wantLayout := range tt.wantLayout {
+			t.Run(fmt.Sprintf("%s-scaleby-%d", tt.name, scaleDown), func(t *testing.T) {
+				gotSpans, gotDeltas := convertBucketsLayout(tt.buckets(), scaleDown)
+				assert.Equal(t, wantLayout.wantSpans, gotSpans)
+				assert.Equal(t, wantLayout.wantDeltas, gotDeltas)
+			})
+		}
+	}
+}
+
+func BenchmarkConvertBucketLayout(b *testing.B) {
+	scenarios := []struct {
+		gap int
+	}{
+		{gap: 0},
+		{gap: 1},
+		{gap: 2},
+		{gap: 3},
+	}
+
+	for _, scenario := range scenarios {
+		buckets := pmetric.NewExponentialHistogramDataPointBuckets()
+		buckets.SetOffset(0)
+		for i := range 1000 {
+			if i%(scenario.gap+1) == 0 {
+				buckets.BucketCounts().Append(10)
+			} else {
+				buckets.BucketCounts().Append(0)
+			}
+		}
+		b.Run(fmt.Sprintf("gap %d", scenario.gap), func(b *testing.B) {
+			for b.Loop() {
+				convertBucketsLayout(buckets, 0)
+			}
+		})
+	}
+}
+
+func TestExplicitToNHCBHistogram(t *testing.T) {
+	tests := []struct {
+		name           string
+		hist           func() pmetric.HistogramDataPoint
+		wantValues     []float64
+		wantCount      uint64
+		wantSum        float64
+		wantBuckets    []nhcbBucket
+		stale          bool
+		wantErrMessage string
+	}{
+		{
+			name:        "consistent count and buckets",
+			hist:        func() pmetric.HistogramDataPoint { return newTestExplicitHistogram().Histogram().DataPoints().At(0) },
+			wantValues:  []float64{1, 2, 3},
+			wantCount:   10,
+			wantSum:     42.5,
+			wantBuckets: []nhcbBucket{{1, 1}, {2, 3}, {3, 6}, {math.Inf(1), 10}},
+		},
+		{
+			// Count below the bucket sum is clamped up so the +Inf bucket stays non-negative.
+			name: "count below bucket sum",
+			hist: func() pmetric.HistogramDataPoint {
+				pt := newTestExplicitHistogram().Histogram().DataPoints().At(0)
+				pt.SetCount(5) // below finite cumulative (6)
+				return pt
+			},
+			wantValues:  []float64{1, 2, 3},
+			wantCount:   10,
+			wantSum:     42.5,
+			wantBuckets: []nhcbBucket{{1, 1}, {2, 3}, {3, 6}, {math.Inf(1), 10}},
+		},
+		{
+			// Count above the bucket sum is preserved; the surplus lands in +Inf.
+			name: "count above bucket sum",
+			hist: func() pmetric.HistogramDataPoint {
+				pt := newTestExplicitHistogram().Histogram().DataPoints().At(0)
+				pt.SetCount(20) // above bucket sum (10)
+				return pt
+			},
+			wantValues:  []float64{1, 2, 3},
+			wantCount:   20,
+			wantSum:     42.5,
+			wantBuckets: []nhcbBucket{{1, 1}, {2, 3}, {3, 6}, {math.Inf(1), 20}},
+		},
+		{
+			name: "no sum",
+			hist: func() pmetric.HistogramDataPoint {
+				metric := pmetric.NewMetric()
+				metric.SetName("test_hist")
+				metric.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+				pt := metric.Histogram().DataPoints().AppendEmpty()
+				pt.SetTimestamp(testHistTimestamp)
+				pt.ExplicitBounds().FromRaw([]float64{1, 2, 3})
+				pt.BucketCounts().FromRaw([]uint64{1, 2, 3, 4})
+				pt.SetCount(10)
+				return pt
+			},
+			wantErrMessage: "sum is not set",
+		},
+		{
+			name: "no explicit bounds (single +Inf bucket)",
+			hist: func() pmetric.HistogramDataPoint {
+				metric := pmetric.NewMetric()
+				metric.SetName("test_hist")
+				metric.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+				pt := metric.Histogram().DataPoints().AppendEmpty()
+				pt.SetTimestamp(testHistTimestamp)
+				pt.BucketCounts().FromRaw([]uint64{5})
+				pt.SetCount(5)
+				pt.SetSum(12.5)
+				return pt
+			},
+			wantValues:  nil,
+			wantCount:   5,
+			wantSum:     12.5,
+			wantBuckets: []nhcbBucket{{math.Inf(1), 5}},
+		},
+		{
+			name: "stale marker",
+			hist: func() pmetric.HistogramDataPoint {
+				pt := newTestExplicitHistogram().Histogram().DataPoints().At(0)
+				pt.SetFlags(pt.Flags().WithNoRecordedValue(true))
+				return pt
+			},
+			stale: true,
+		},
+		{
+			name: "stale marker without sum",
+			hist: func() pmetric.HistogramDataPoint {
+				pt := newTestExplicitHistogram().Histogram().DataPoints().At(0)
+				pt.RemoveSum()
+				pt.SetFlags(pt.Flags().WithNoRecordedValue(true))
+				return pt
+			},
+			stale: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, err := explicitToNHCBHistogram(tt.hist())
+			if tt.wantErrMessage != "" {
+				require.ErrorContains(t, err, tt.wantErrMessage)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, histogram.CustomBucketsSchema, h.Schema, "must be NHCB schema -53")
+			assert.Equal(t, convertTimeStamp(testHistTimestamp), h.Timestamp)
+
+			if tt.stale {
+				assert.True(t, math.IsNaN(h.Sum), "stale marker signaled by stale-NaN sum")
+				assert.Zero(t, h.GetCountInt(), "stale marker leaves count unset")
+				return
+			}
+
+			if len(tt.wantValues) == 0 {
+				assert.Empty(t, h.CustomValues, "single +Inf bucket carries no finite bounds")
+			} else {
+				assert.Equal(t, tt.wantValues, h.CustomValues, "explicit bounds carried as custom values")
+			}
+			assert.Equal(t, tt.wantCount, h.GetCountInt(), "count")
+			assert.InDelta(t, tt.wantSum, h.Sum, 1e-9, "sum")
+
+			require.NoError(t, h.ToIntHistogram().Validate(), "converted histogram must be valid")
+			assert.Equal(t, tt.wantBuckets, nhcbCumulativeBuckets(h), "cumulative buckets round-trip")
+		})
+	}
+}
+
+func TestExponentialToNativeHistogram(t *testing.T) {
+	tests := []struct {
+		name            string
+		exponentialHist func() pmetric.ExponentialHistogramDataPoint
+		wantNativeHist  func() prompb.Histogram
+		wantErrMessage  string
+	}{
+		{
+			name: "preserve zero threshold with tiny positive and negative buckets",
+			exponentialHist: func() pmetric.ExponentialHistogramDataPoint {
+				pt := pmetric.NewExponentialHistogramDataPoint()
+				pt.SetScale(0)
+				pt.SetCount(2)
+				pt.SetSum(0)
+				pt.SetZeroCount(0)
+				pt.SetZeroThreshold(0)
+				// At scale 0, bucket -432 has upper bound 2^-431, below 1e-128.
+				pt.Positive().SetOffset(-432)
+				pt.Positive().BucketCounts().FromRaw([]uint64{1})
+				pt.Negative().SetOffset(-432)
+				pt.Negative().BucketCounts().FromRaw([]uint64{1})
+				return pt
+			},
+			wantNativeHist: func() prompb.Histogram {
+				return prompb.Histogram{
+					Count:          &prompb.Histogram_CountInt{CountInt: 2},
+					ZeroCount:      &prompb.Histogram_ZeroCountInt{ZeroCountInt: 0},
+					PositiveSpans:  []prompb.BucketSpan{{Offset: -431, Length: 1}},
+					PositiveDeltas: []int64{1},
+					NegativeSpans:  []prompb.BucketSpan{{Offset: -431, Length: 1}},
+					NegativeDeltas: []int64{1},
+				}
+			},
+		},
+		{
+			name: "convert exp. to native histogram",
+			exponentialHist: func() pmetric.ExponentialHistogramDataPoint {
+				pt := pmetric.NewExponentialHistogramDataPoint()
+				pt.SetStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(100)))
+				pt.SetTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(500)))
+				pt.SetCount(4)
+				pt.SetSum(10.1)
+				pt.SetScale(1)
+				pt.SetZeroCount(1)
+
+				pt.Positive().BucketCounts().FromRaw([]uint64{1, 1})
+				pt.Positive().SetOffset(1)
+
+				pt.Negative().BucketCounts().FromRaw([]uint64{1, 1})
+				pt.Negative().SetOffset(1)
+
+				return pt
+			},
+			wantNativeHist: func() prompb.Histogram {
+				return prompb.Histogram{
+					Count:          &prompb.Histogram_CountInt{CountInt: 4},
+					Sum:            10.1,
+					Schema:         1,
+					ZeroThreshold:  0,
+					ZeroCount:      &prompb.Histogram_ZeroCountInt{ZeroCountInt: 1},
+					NegativeSpans:  []prompb.BucketSpan{{Offset: 2, Length: 2}},
+					NegativeDeltas: []int64{1, 0},
+					PositiveSpans:  []prompb.BucketSpan{{Offset: 2, Length: 2}},
+					PositiveDeltas: []int64{1, 0},
+					Timestamp:      500,
+				}
+			},
+		},
+		{
+			name: "convert exp. to native histogram with specific zero_threshold",
+			exponentialHist: func() pmetric.ExponentialHistogramDataPoint {
+				pt := pmetric.NewExponentialHistogramDataPoint()
+				pt.SetStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(100)))
+				pt.SetTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(500)))
+				pt.SetCount(4)
+				pt.SetSum(10.1)
+				pt.SetScale(1)
+				pt.SetZeroCount(1)
+				pt.SetZeroThreshold(0.02)
+
+				pt.Positive().BucketCounts().FromRaw([]uint64{1, 1})
+				pt.Positive().SetOffset(1)
+
+				pt.Negative().BucketCounts().FromRaw([]uint64{1, 1})
+				pt.Negative().SetOffset(1)
+
+				return pt
+			},
+			wantNativeHist: func() prompb.Histogram {
+				return prompb.Histogram{
+					Count:          &prompb.Histogram_CountInt{CountInt: 4},
+					Sum:            10.1,
+					Schema:         1,
+					ZeroThreshold:  0.02,
+					ZeroCount:      &prompb.Histogram_ZeroCountInt{ZeroCountInt: 1},
+					NegativeSpans:  []prompb.BucketSpan{{Offset: 2, Length: 2}},
+					NegativeDeltas: []int64{1, 0},
+					PositiveSpans:  []prompb.BucketSpan{{Offset: 2, Length: 2}},
+					PositiveDeltas: []int64{1, 0},
+					Timestamp:      500,
+				}
+			},
+		},
+		{
+			name: "convert exp. to native histogram with no sum",
+			exponentialHist: func() pmetric.ExponentialHistogramDataPoint {
+				pt := pmetric.NewExponentialHistogramDataPoint()
+				pt.SetStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(100)))
+				pt.SetTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(500)))
+
+				pt.SetCount(4)
+				pt.SetScale(1)
+				pt.SetZeroCount(1)
+
+				pt.Positive().BucketCounts().FromRaw([]uint64{1, 1})
+				pt.Positive().SetOffset(1)
+
+				pt.Negative().BucketCounts().FromRaw([]uint64{1, 1})
+				pt.Negative().SetOffset(1)
+
+				return pt
+			},
+			wantErrMessage: "sum is not set",
+		},
+		{
+			name: "invalid negative scale",
+			exponentialHist: func() pmetric.ExponentialHistogramDataPoint {
+				pt := pmetric.NewExponentialHistogramDataPoint()
+				pt.SetScale(-10)
+				return pt
+			},
+			wantErrMessage: "cannot convert exponential to native histogram." +
+				" Scale must be >= -4, was -10",
+		},
+		{
+			name: "no downscaling at scale 8",
+			exponentialHist: func() pmetric.ExponentialHistogramDataPoint {
+				pt := pmetric.NewExponentialHistogramDataPoint()
+				pt.SetTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(500)))
+				pt.SetCount(6)
+				pt.SetSum(10.1)
+				pt.SetScale(8)
+				pt.SetZeroCount(1)
+
+				pt.Positive().BucketCounts().FromRaw([]uint64{1, 1, 1})
+				pt.Positive().SetOffset(1)
+
+				pt.Negative().BucketCounts().FromRaw([]uint64{1, 1, 1})
+				pt.Negative().SetOffset(2)
+				return pt
+			},
+			wantNativeHist: func() prompb.Histogram {
+				return prompb.Histogram{
+					Count:          &prompb.Histogram_CountInt{CountInt: 6},
+					Sum:            10.1,
+					Schema:         8,
+					ZeroThreshold:  0,
+					ZeroCount:      &prompb.Histogram_ZeroCountInt{ZeroCountInt: 1},
+					PositiveSpans:  []prompb.BucketSpan{{Offset: 2, Length: 3}},
+					PositiveDeltas: []int64{1, 0, 0}, // 1, 1, 1
+					NegativeSpans:  []prompb.BucketSpan{{Offset: 3, Length: 3}},
+					NegativeDeltas: []int64{1, 0, 0}, // 1, 1, 1
+					Timestamp:      500,
+				}
+			},
+		},
+		{
+			name: "downsample if scale is more than 8",
+			exponentialHist: func() pmetric.ExponentialHistogramDataPoint {
+				pt := pmetric.NewExponentialHistogramDataPoint()
+				pt.SetTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(500)))
+				pt.SetCount(6)
+				pt.SetSum(10.1)
+				pt.SetScale(9)
+				pt.SetZeroCount(1)
+
+				pt.Positive().BucketCounts().FromRaw([]uint64{1, 1, 1})
+				pt.Positive().SetOffset(1)
+
+				pt.Negative().BucketCounts().FromRaw([]uint64{1, 1, 1})
+				pt.Negative().SetOffset(2)
+				return pt
+			},
+			wantNativeHist: func() prompb.Histogram {
+				return prompb.Histogram{
+					Count:          &prompb.Histogram_CountInt{CountInt: 6},
+					Sum:            10.1,
+					Schema:         8,
+					ZeroThreshold:  0,
+					ZeroCount:      &prompb.Histogram_ZeroCountInt{ZeroCountInt: 1},
+					PositiveSpans:  []prompb.BucketSpan{{Offset: 1, Length: 2}},
+					PositiveDeltas: []int64{1, 1}, // 0+1, 1+1 = 1, 2
+					NegativeSpans:  []prompb.BucketSpan{{Offset: 2, Length: 2}},
+					NegativeDeltas: []int64{2, -1}, // 1+1, 1+0 = 2, 1
+					Timestamp:      500,
+				}
+			},
+		},
+		{
+			name: "stale marker omits count, zero count, and buckets",
+			exponentialHist: func() pmetric.ExponentialHistogramDataPoint {
+				pt := pmetric.NewExponentialHistogramDataPoint()
+				pt.SetStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(100)))
+				pt.SetTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(500)))
+				pt.SetCount(4)
+				pt.SetSum(10.1)
+				pt.SetScale(1)
+				pt.SetZeroCount(1)
+				pt.SetZeroThreshold(0.02)
+				pt.SetFlags(pmetric.DefaultDataPointFlags.WithNoRecordedValue(true))
+
+				pt.Positive().BucketCounts().FromRaw([]uint64{1, 1})
+				pt.Positive().SetOffset(1)
+
+				pt.Negative().BucketCounts().FromRaw([]uint64{1, 1})
+				pt.Negative().SetOffset(1)
+				return pt
+			},
+			wantNativeHist: func() prompb.Histogram {
+				return prompb.Histogram{
+					Schema:        1,
+					ZeroThreshold: 0.02,
+					Sum:           math.Float64frombits(value.StaleNaN),
+					Timestamp:     500,
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			validateExponentialHistogramCount(t, tt.exponentialHist()) // Sanity check.
+			got, err := exponentialToNativeHistogram(tt.exponentialHist())
+			if tt.wantErrMessage != "" {
+				assert.ErrorContains(t, err, tt.wantErrMessage)
+				return
+			}
+
+			require.NoError(t, err)
+			if tt.exponentialHist().Flags().NoRecordedValue() {
+				want := tt.wantNativeHist()
+				assert.Equal(t, math.Float64bits(want.Sum), math.Float64bits(got.Sum))
+				require.NoError(t, got.ToIntHistogram().Validate())
+				got.Sum = 0
+				want.Sum = 0
+				assert.Equal(t, want, got)
+				return
+			}
+			assert.Equal(t, tt.wantNativeHist(), got)
+			validateNativeHistogramCount(t, got)
+			validateNoZeroBucketOverlap(t, got.ToIntHistogram())
+		})
+	}
+}
+
+func validateExponentialHistogramCount(t *testing.T, h pmetric.ExponentialHistogramDataPoint) {
+	actualCount := uint64(0)
+	for _, bucket := range h.Positive().BucketCounts().AsRaw() {
+		actualCount += bucket
+	}
+	for _, bucket := range h.Negative().BucketCounts().AsRaw() {
+		actualCount += bucket
+	}
+	require.Equal(t, h.Count(), actualCount, "exponential histogram count mismatch")
+}
+
+func validateNativeHistogramCount(t *testing.T, h prompb.Histogram) {
+	require.NotNil(t, h.Count)
+	require.IsType(t, &prompb.Histogram_CountInt{}, h.Count)
+	want := h.Count.(*prompb.Histogram_CountInt).CountInt
+	var (
+		actualCount uint64
+		prevBucket  int64
+	)
+	for _, delta := range h.PositiveDeltas {
+		prevBucket += delta
+		actualCount += uint64(prevBucket)
+	}
+	prevBucket = 0
+	for _, delta := range h.NegativeDeltas {
+		prevBucket += delta
+		actualCount += uint64(prevBucket)
+	}
+	assert.Equal(t, want, actualCount, "native histogram count mismatch")
+}
+
+// validateNoZeroBucketOverlap checks that no populated bucket overlaps the zero bucket.
+func validateNoZeroBucketOverlap(t *testing.T, h *histogram.Histogram) {
+	for it := h.PositiveBucketIterator(); it.Next(); {
+		b := it.At()
+		assert.GreaterOrEqualf(t, b.Lower, h.ZeroThreshold, "positive bucket %s overlaps the zero bucket with threshold %g", b.String(), h.ZeroThreshold)
+	}
+	for it := h.NegativeBucketIterator(); it.Next(); {
+		b := it.At()
+		assert.LessOrEqualf(t, b.Upper, -h.ZeroThreshold, "negative bucket %s overlaps the zero bucket with threshold %g", b.String(), h.ZeroThreshold)
+	}
+}
+
+func TestPrometheusConverter_addExponentialHistogramDataPoints(t *testing.T) {
+	tests := []struct {
+		name       string
+		metric     func() pmetric.Metric
+		wantSeries func() map[uint64]*prompb.TimeSeries
+	}{
+		{
+			name: "histogram data points with same labels",
+			metric: func() pmetric.Metric {
+				metric := pmetric.NewMetric()
+				metric.SetName("test_hist")
+				metric.SetEmptyExponentialHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+
+				pt := metric.ExponentialHistogram().DataPoints().AppendEmpty()
+				pt.SetCount(7)
+				pt.SetSum(0)
+				pt.SetScale(1)
+				pt.Positive().SetOffset(-1)
+				pt.Positive().BucketCounts().FromRaw([]uint64{4, 2})
+				pt.Exemplars().AppendEmpty().SetDoubleValue(1)
+				pt.Attributes().PutStr("attr", "test_attr")
+
+				pt = metric.ExponentialHistogram().DataPoints().AppendEmpty()
+				pt.SetCount(4)
+				pt.SetSum(0)
+				pt.SetScale(1)
+				pt.Positive().SetOffset(-1)
+				pt.Positive().BucketCounts().FromRaw([]uint64{4, 2, 1})
+				pt.Exemplars().AppendEmpty().SetDoubleValue(2)
+				pt.Attributes().PutStr("attr", "test_attr")
+
+				return metric
+			},
+			wantSeries: func() map[uint64]*prompb.TimeSeries {
+				labels := []prompb.Label{
+					{Name: model.MetricNameLabel, Value: "test_hist"},
+					{Name: "attr", Value: "test_attr"},
+				}
+				return map[uint64]*prompb.TimeSeries{
+					timeSeriesSignature(labels): {
+						Labels: labels,
+						Histograms: []prompb.Histogram{
+							{
+								Count:          &prompb.Histogram_CountInt{CountInt: 7},
+								Schema:         1,
+								ZeroThreshold:  0,
+								ZeroCount:      &prompb.Histogram_ZeroCountInt{ZeroCountInt: 0},
+								PositiveSpans:  []prompb.BucketSpan{{Offset: 0, Length: 2}},
+								PositiveDeltas: []int64{4, -2},
+							},
+							{
+								Count:          &prompb.Histogram_CountInt{CountInt: 4},
+								Schema:         1,
+								ZeroThreshold:  0,
+								ZeroCount:      &prompb.Histogram_ZeroCountInt{ZeroCountInt: 0},
+								PositiveSpans:  []prompb.BucketSpan{{Offset: 0, Length: 3}},
+								PositiveDeltas: []int64{4, -2, -1},
+							},
+						},
+						Exemplars: []prompb.Exemplar{
+							{Value: 1},
+							{Value: 2},
+						},
+					},
+				}
+			},
+		},
+		{
+			name: "histogram data points with different labels",
+			metric: func() pmetric.Metric {
+				metric := pmetric.NewMetric()
+				metric.SetName("test_hist")
+				metric.SetEmptyExponentialHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+
+				pt := metric.ExponentialHistogram().DataPoints().AppendEmpty()
+				pt.SetCount(7)
+				pt.SetSum(0)
+				pt.SetScale(1)
+				pt.Positive().SetOffset(-1)
+				pt.Positive().BucketCounts().FromRaw([]uint64{4, 2})
+				pt.Exemplars().AppendEmpty().SetDoubleValue(1)
+				pt.Attributes().PutStr("attr", "test_attr")
+
+				pt = metric.ExponentialHistogram().DataPoints().AppendEmpty()
+				pt.SetCount(4)
+				pt.SetSum(0)
+				pt.SetScale(1)
+				pt.Negative().SetOffset(-1)
+				pt.Negative().BucketCounts().FromRaw([]uint64{4, 2, 1})
+				pt.Exemplars().AppendEmpty().SetDoubleValue(2)
+				pt.Attributes().PutStr("attr", "test_attr_two")
+
+				return metric
+			},
+			wantSeries: func() map[uint64]*prompb.TimeSeries {
+				labels := []prompb.Label{
+					{Name: model.MetricNameLabel, Value: "test_hist"},
+					{Name: "attr", Value: "test_attr"},
+				}
+				labelsAnother := []prompb.Label{
+					{Name: model.MetricNameLabel, Value: "test_hist"},
+					{Name: "attr", Value: "test_attr_two"},
+				}
+
+				return map[uint64]*prompb.TimeSeries{
+					timeSeriesSignature(labels): {
+						Labels: labels,
+						Histograms: []prompb.Histogram{
+							{
+								Count:          &prompb.Histogram_CountInt{CountInt: 7},
+								Schema:         1,
+								ZeroThreshold:  0,
+								ZeroCount:      &prompb.Histogram_ZeroCountInt{ZeroCountInt: 0},
+								PositiveSpans:  []prompb.BucketSpan{{Offset: 0, Length: 2}},
+								PositiveDeltas: []int64{4, -2},
+							},
+						},
+						Exemplars: []prompb.Exemplar{
+							{Value: 1},
+						},
+					},
+					timeSeriesSignature(labelsAnother): {
+						Labels: labelsAnother,
+						Histograms: []prompb.Histogram{
+							{
+								Count:          &prompb.Histogram_CountInt{CountInt: 4},
+								Schema:         1,
+								ZeroThreshold:  0,
+								ZeroCount:      &prompb.Histogram_ZeroCountInt{ZeroCountInt: 0},
+								NegativeSpans:  []prompb.BucketSpan{{Offset: 0, Length: 3}},
+								NegativeDeltas: []int64{4, -2, -1},
+							},
+						},
+						Exemplars: []prompb.Exemplar{
+							{Value: 2},
+						},
+					},
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metric := tt.metric()
+
+			converter := newPrometheusConverter(Settings{})
+			metricNamer := otlptranslator.MetricNamer{WithMetricSuffixes: true}
+			metricName, err := metricNamer.Build(prom.TranslatorMetricFromOtelMetric(metric))
+			require.NoError(t, err)
+			require.NoError(t, converter.addExponentialHistogramDataPoints(
+				metric.ExponentialHistogram().DataPoints(),
+				pcommon.NewResource(),
+				pcommon.NewInstrumentationScope(),
+				"",
+				Settings{},
+				metricName,
+			))
+
+			assert.Equal(t, tt.wantSeries(), converter.unique)
+			assert.Empty(t, converter.conflicts)
+		})
+	}
+}
+
+func TestFromMetricsExponentialHistogramSum(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		hasSum bool
+		sum    float64
+		stale  bool
+		mixed  bool
+	}{
+		{name: "absent sum"},
+		{name: "zero sum", hasSum: true},
+		{name: "nonzero sum", hasSum: true, sum: -0.5},
+		{name: "stale without sum", stale: true},
+		{name: "missing sum among valid points", mixed: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			md := pmetric.NewMetrics()
+			metric := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+			metric.SetName("test_hist")
+			h := metric.SetEmptyExponentialHistogram()
+			h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+			dp := h.DataPoints().AppendEmpty()
+			dp.SetTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(500)))
+			if tt.stale {
+				dp.SetFlags(pmetric.DefaultDataPointFlags.WithNoRecordedValue(true))
+			} else {
+				dp.SetCount(2)
+				dp.Positive().BucketCounts().FromRaw([]uint64{1})
+				dp.Negative().BucketCounts().FromRaw([]uint64{1})
+				dp.Exemplars().AppendEmpty().SetDoubleValue(1)
+			}
+			if tt.hasSum {
+				dp.SetSum(tt.sum)
+			}
+			if tt.mixed {
+				for _, separateSeries := range []bool{false, true} {
+					valid := h.DataPoints().AppendEmpty()
+					dp.CopyTo(valid)
+					valid.SetSum(0.5)
+					if separateSeries {
+						valid.Attributes().PutStr("series", "valid")
+					}
+				}
+			}
+			series, err := FromMetrics(md, Settings{DisableTargetInfo: true, DisableScopeInfo: true})
+			if !tt.hasSum && !tt.stale {
+				require.ErrorContains(t, err, "sum is not set")
+			} else {
+				require.NoError(t, err)
+			}
+			wantSeries := 1
+			if tt.mixed {
+				wantSeries = 2
+			} else if !tt.hasSum && !tt.stale {
+				wantSeries = 0
+			}
+			require.Len(t, series, wantSeries)
+			for _, ts := range series {
+				require.Len(t, ts.Histograms, 1)
+				if tt.stale {
+					require.True(t, value.IsStaleNaN(ts.Histograms[0].Sum))
+					require.Zero(t, ts.Histograms[0].GetCountInt())
+					require.Nil(t, ts.Histograms[0].Count)
+					require.Nil(t, ts.Histograms[0].ZeroCount)
+					require.Empty(t, ts.Histograms[0].PositiveSpans)
+					require.Empty(t, ts.Histograms[0].PositiveDeltas)
+					require.Empty(t, ts.Histograms[0].NegativeSpans)
+					require.Empty(t, ts.Histograms[0].NegativeDeltas)
+					require.Empty(t, ts.Exemplars)
+				} else {
+					expectedSum := tt.sum
+					if tt.mixed {
+						expectedSum = 0.5
+					}
+					require.Equal(t, expectedSum, ts.Histograms[0].Sum)
+					require.Equal(t, uint64(2), ts.Histograms[0].GetCountInt())
+					require.Len(t, ts.Exemplars, 1)
+				}
+			}
+		})
+	}
+}

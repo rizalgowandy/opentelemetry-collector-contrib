@@ -1,30 +1,17 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package awsemfexporter
 
 import (
 	"testing"
 
-	commonpb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/common/v1"
-	agentmetricspb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/metrics/v1"
-	resourcepb "github.com/census-instrumentation/opencensus-proto/gen-go/resource/v1"
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/translator/conventions"
-	"go.opentelemetry.io/collector/translator/internaldata"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/occonventions"
 )
 
 func TestReplacePatternValidTaskId(t *testing.T) {
@@ -32,13 +19,28 @@ func TestReplacePatternValidTaskId(t *testing.T) {
 
 	input := "{TaskId}"
 
-	attrMap := pdata.NewAttributeMap()
-	attrMap.UpsertString("aws.ecs.cluster.name", "test-cluster-name")
-	attrMap.UpsertString("aws.ecs.task.id", "test-task-id")
+	attrMap := pcommon.NewMap()
+	attrMap.PutStr("aws.ecs.cluster.name", "test-cluster-name")
+	attrMap.PutStr("aws.ecs.task.id", "test-task-id")
 
-	s := replacePatterns(input, attrMap, logger)
+	s, success := replacePatterns(input, attrMaptoStringMap(attrMap), logger)
 
 	assert.Equal(t, "test-task-id", s)
+	assert.True(t, success)
+}
+
+func TestReplacePatternValidServiceName(t *testing.T) {
+	logger := zap.NewNop()
+
+	input := "{ServiceName}"
+
+	attrMap := pcommon.NewMap()
+	attrMap.PutStr("service.name", "some-test-service")
+
+	s, success := replacePatterns(input, attrMaptoStringMap(attrMap), logger)
+
+	assert.Equal(t, "some-test-service", s)
+	assert.True(t, success)
 }
 
 func TestReplacePatternValidClusterName(t *testing.T) {
@@ -46,13 +48,14 @@ func TestReplacePatternValidClusterName(t *testing.T) {
 
 	input := "/aws/ecs/containerinsights/{ClusterName}/performance"
 
-	attrMap := pdata.NewAttributeMap()
-	attrMap.UpsertString("aws.ecs.cluster.name", "test-cluster-name")
-	attrMap.UpsertString("aws.ecs.task.id", "test-task-id")
+	attrMap := pcommon.NewMap()
+	attrMap.PutStr("aws.ecs.cluster.name", "test-cluster-name")
+	attrMap.PutStr("aws.ecs.task.id", "test-task-id")
 
-	s := replacePatterns(input, attrMap, logger)
+	s, success := replacePatterns(input, attrMaptoStringMap(attrMap), logger)
 
 	assert.Equal(t, "/aws/ecs/containerinsights/test-cluster-name/performance", s)
+	assert.True(t, success)
 }
 
 func TestReplacePatternMissingAttribute(t *testing.T) {
@@ -60,12 +63,57 @@ func TestReplacePatternMissingAttribute(t *testing.T) {
 
 	input := "/aws/ecs/containerinsights/{ClusterName}/performance"
 
-	attrMap := pdata.NewAttributeMap()
-	attrMap.UpsertString("aws.ecs.task.id", "test-task-id")
+	attrMap := pcommon.NewMap()
+	attrMap.PutStr("aws.ecs.task.id", "test-task-id")
 
-	s := replacePatterns(input, attrMap, logger)
+	s, success := replacePatterns(input, attrMaptoStringMap(attrMap), logger)
 
 	assert.Equal(t, "/aws/ecs/containerinsights/undefined/performance", s)
+	assert.False(t, success)
+}
+
+func TestReplacePatternValidPodName(t *testing.T) {
+	logger := zap.NewNop()
+
+	input := "/aws/eks/containerinsights/{PodName}/performance"
+
+	attrMap := pcommon.NewMap()
+	attrMap.PutStr("aws.eks.cluster.name", "test-cluster-name")
+	attrMap.PutStr("PodName", "test-pod-001")
+
+	s, success := replacePatterns(input, attrMaptoStringMap(attrMap), logger)
+
+	assert.Equal(t, "/aws/eks/containerinsights/test-pod-001/performance", s)
+	assert.True(t, success)
+}
+
+func TestReplacePatternValidPod(t *testing.T) {
+	logger := zap.NewNop()
+
+	input := "/aws/eks/containerinsights/{PodName}/performance"
+
+	attrMap := pcommon.NewMap()
+	attrMap.PutStr("aws.eks.cluster.name", "test-cluster-name")
+	attrMap.PutStr("pod", "test-pod-001")
+
+	s, success := replacePatterns(input, attrMaptoStringMap(attrMap), logger)
+
+	assert.Equal(t, "/aws/eks/containerinsights/test-pod-001/performance", s)
+	assert.True(t, success)
+}
+
+func TestReplacePatternMissingPodName(t *testing.T) {
+	logger := zap.NewNop()
+
+	input := "/aws/eks/containerinsights/{PodName}/performance"
+
+	attrMap := pcommon.NewMap()
+	attrMap.PutStr("aws.eks.cluster.name", "test-cluster-name")
+
+	s, success := replacePatterns(input, attrMaptoStringMap(attrMap), logger)
+
+	assert.Equal(t, "/aws/eks/containerinsights/undefined/performance", s)
+	assert.False(t, success)
 }
 
 func TestReplacePatternAttrPlaceholderClusterName(t *testing.T) {
@@ -73,12 +121,13 @@ func TestReplacePatternAttrPlaceholderClusterName(t *testing.T) {
 
 	input := "/aws/ecs/containerinsights/{ClusterName}/performance"
 
-	attrMap := pdata.NewAttributeMap()
-	attrMap.UpsertString("ClusterName", "test-cluster-name")
+	attrMap := pcommon.NewMap()
+	attrMap.PutStr("ClusterName", "test-cluster-name")
 
-	s := replacePatterns(input, attrMap, logger)
+	s, success := replacePatterns(input, attrMaptoStringMap(attrMap), logger)
 
 	assert.Equal(t, "/aws/ecs/containerinsights/test-cluster-name/performance", s)
+	assert.True(t, success)
 }
 
 func TestReplacePatternWrongKey(t *testing.T) {
@@ -86,12 +135,13 @@ func TestReplacePatternWrongKey(t *testing.T) {
 
 	input := "/aws/ecs/containerinsights/{WrongKey}/performance"
 
-	attrMap := pdata.NewAttributeMap()
-	attrMap.UpsertString("ClusterName", "test-task-id")
+	attrMap := pcommon.NewMap()
+	attrMap.PutStr("ClusterName", "test-task-id")
 
-	s := replacePatterns(input, attrMap, logger)
+	s, success := replacePatterns(input, attrMaptoStringMap(attrMap), logger)
 
 	assert.Equal(t, "/aws/ecs/containerinsights/{WrongKey}/performance", s)
+	assert.True(t, success)
 }
 
 func TestReplacePatternNilAttrValue(t *testing.T) {
@@ -99,55 +149,67 @@ func TestReplacePatternNilAttrValue(t *testing.T) {
 
 	input := "/aws/ecs/containerinsights/{ClusterName}/performance"
 
-	attrMap := pdata.NewAttributeMap()
-	attrMap.InsertNull("ClusterName")
+	attrMap := pcommon.NewMap()
+	attrMap.PutEmpty("ClusterName")
 
-	s := replacePatterns(input, attrMap, logger)
+	s, success := replacePatterns(input, attrMaptoStringMap(attrMap), logger)
 
 	assert.Equal(t, "/aws/ecs/containerinsights/undefined/performance", s)
+	assert.False(t, success)
+}
+
+func TestReplacePatternValidTaskDefinitionFamily(t *testing.T) {
+	logger := zap.NewNop()
+
+	input := "{TaskDefinitionFamily}"
+
+	attrMap := pcommon.NewMap()
+	attrMap.PutStr("aws.ecs.cluster.name", "test-cluster-name")
+	attrMap.PutStr("aws.ecs.task.family", "test-task-definition-family")
+
+	s, success := replacePatterns(input, attrMaptoStringMap(attrMap), logger)
+
+	assert.Equal(t, "test-task-definition-family", s)
+	assert.True(t, success)
 }
 
 func TestGetNamespace(t *testing.T) {
-	defaultMetric := createMetricTestData()
+	defaultRM := createTestResourceMetrics()
 	testCases := []struct {
 		testName        string
-		metric          *agentmetricspb.ExportMetricsServiceRequest
+		rm              pmetric.ResourceMetrics
 		configNamespace string
 		namespace       string
 	}{
 		{
 			"non-empty namespace",
-			defaultMetric,
+			defaultRM,
 			"namespace",
 			"namespace",
 		},
 		{
 			"empty namespace",
-			defaultMetric,
+			defaultRM,
 			"",
 			"myServiceNS/myServiceName",
 		},
 		{
 			"empty namespace, no service namespace",
-			&agentmetricspb.ExportMetricsServiceRequest{
-				Resource: &resourcepb.Resource{
-					Labels: map[string]string{
-						conventions.AttributeServiceName: "myServiceName",
-					},
-				},
-			},
+			func() pmetric.ResourceMetrics {
+				rm := pmetric.NewResourceMetrics()
+				rm.Resource().Attributes().PutStr("service.name", "myServiceName")
+				return rm
+			}(),
 			"",
 			"myServiceName",
 		},
 		{
 			"empty namespace, no service name",
-			&agentmetricspb.ExportMetricsServiceRequest{
-				Resource: &resourcepb.Resource{
-					Labels: map[string]string{
-						conventions.AttributeServiceNamespace: "myServiceNS",
-					},
-				},
-			},
+			func() pmetric.ResourceMetrics {
+				rm := pmetric.NewResourceMetrics()
+				rm.Resource().Attributes().PutStr("service.namespace", "myServiceNS")
+				return rm
+			}(),
 			"",
 			"myServiceNS",
 		},
@@ -155,50 +217,30 @@ func TestGetNamespace(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.testName, func(t *testing.T) {
-			rms := internaldata.OCToMetrics(tc.metric.Node, tc.metric.Resource, tc.metric.Metrics)
-			rm := rms.ResourceMetrics().At(0)
-			namespace := getNamespace(&rm, tc.configNamespace)
+			namespace := getNamespace(tc.rm, tc.configNamespace)
 			assert.Equal(t, tc.namespace, namespace)
 		})
 	}
 }
 
 func TestGetLogInfo(t *testing.T) {
-	metrics := []*agentmetricspb.ExportMetricsServiceRequest{
-		{
-			Node: &commonpb.Node{
-				ServiceInfo: &commonpb.ServiceInfo{Name: "test-emf"},
-				LibraryInfo: &commonpb.LibraryInfo{ExporterVersion: "SomeVersion"},
-			},
-			Resource: &resourcepb.Resource{
-				Labels: map[string]string{
-					"aws.ecs.cluster.name":          "test-cluster-name",
-					"aws.ecs.task.id":               "test-task-id",
-					"k8s.node.name":                 "ip-192-168-58-245.ec2.internal",
-					"aws.ecs.container.instance.id": "203e0410260d466bab7873bb4f317b4e",
-				},
-			},
-		},
-		{
-			Node: &commonpb.Node{
-				ServiceInfo: &commonpb.ServiceInfo{Name: "test-emf"},
-				LibraryInfo: &commonpb.LibraryInfo{ExporterVersion: "SomeVersion"},
-			},
-			Resource: &resourcepb.Resource{
-				Labels: map[string]string{
-					"ClusterName":         "test-cluster-name",
-					"TaskId":              "test-task-id",
-					"NodeName":            "ip-192-168-58-245.ec2.internal",
-					"ContainerInstanceId": "203e0410260d466bab7873bb4f317b4e",
-				},
-			},
-		},
-	}
-
-	var rms []pdata.ResourceMetrics
-	for _, md := range metrics {
-		rms = append(rms, internaldata.OCToMetrics(md.Node, md.Resource, md.Metrics).ResourceMetrics().At(0))
-	}
+	rm1 := pmetric.NewResourceMetrics()
+	rm1.Resource().Attributes().PutStr("service.name", "myServiceName")
+	rm1.Resource().Attributes().PutStr(occonventions.AttributeExporterVersion, "SomeVersion")
+	rm1.Resource().Attributes().PutStr("aws.ecs.cluster.name", "test-cluster-name")
+	rm1.Resource().Attributes().PutStr("aws.ecs.task.id", "test-task-id")
+	rm1.Resource().Attributes().PutStr("k8s.node.name", "ip-192-168-58-245.ec2.internal")
+	rm1.Resource().Attributes().PutStr("aws.ecs.container.instance.id", "203e0410260d466bab7873bb4f317b4e")
+	rm1.Resource().Attributes().PutStr("aws.ecs.task.family", "test-task-definition-family")
+	rm2 := pmetric.NewResourceMetrics()
+	rm2.Resource().Attributes().PutStr("service.name", "test-emf")
+	rm2.Resource().Attributes().PutStr(occonventions.AttributeExporterVersion, "SomeVersion")
+	rm2.Resource().Attributes().PutStr("ClusterName", "test-cluster-name")
+	rm2.Resource().Attributes().PutStr("TaskId", "test-task-id")
+	rm2.Resource().Attributes().PutStr("NodeName", "ip-192-168-58-245.ec2.internal")
+	rm2.Resource().Attributes().PutStr("ContainerInstanceId", "203e0410260d466bab7873bb4f317b4e")
+	rm2.Resource().Attributes().PutStr("TaskDefinitionFamily", "test-task-definition-family")
+	rms := []pmetric.ResourceMetrics{rm1, rm2}
 
 	testCases := []struct {
 		testName        string
@@ -256,7 +298,7 @@ func TestGetLogInfo(t *testing.T) {
 			"/aws/ecs/containerinsights/test-cluster-name/performance",
 			"test-task-id",
 		},
-		//test case for aws container insight usage
+		// test case for aws container insight usage
 		{
 			"empty namespace, config w/ pattern",
 			"",
@@ -274,6 +316,14 @@ func TestGetLogInfo(t *testing.T) {
 			"/aws/containerinsights/test-cluster-name/performance",
 			"instanceTelemetry/203e0410260d466bab7873bb4f317b4e",
 		},
+		{
+			"empty namespace, config w/ pattern",
+			"",
+			"/aws/containerinsights/{ClusterName}/performance",
+			"{TaskDefinitionFamily}-{TaskId}",
+			"/aws/containerinsights/test-cluster-name/performance",
+			"test-task-definition-family-test-task-id",
+		},
 	}
 
 	for i := range rms {
@@ -283,11 +333,11 @@ func TestGetLogInfo(t *testing.T) {
 					LogGroupName:  tc.configLogGroup,
 					LogStreamName: tc.configLogStream,
 				}
-				logGroup, logStream := getLogInfo(&rms[i], tc.namespace, config)
+				logGroup, logStream, success := getLogInfo(rms[i], tc.namespace, config)
 				assert.Equal(t, tc.logGroup, logGroup)
 				assert.Equal(t, tc.logStream, logStream)
+				assert.True(t, success)
 			})
 		}
 	}
-
 }

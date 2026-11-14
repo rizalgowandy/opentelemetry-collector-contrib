@@ -1,0 +1,309 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package redactionprocessor
+
+import (
+	"crypto/fips140"
+	"errors"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/redactionprocessor/internal/db"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/redactionprocessor/internal/metadata"
+)
+
+func TestLoadConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		id       component.ID
+		expected component.Config
+	}{
+		{
+			id: component.NewIDWithName(metadata.Type, ""),
+			expected: &Config{
+				AllowAllKeys:       false,
+				AllowedKeys:        []string{"description", "group", "id", "name"},
+				IgnoredKeys:        []string{"safe_attribute"},
+				BlockedValues:      []string{"4[0-9]{12}(?:[0-9]{3})?", "(5[1-5][0-9]{14})"},
+				BlockedKeyPatterns: []string{".*(token|api_key).*"},
+				HashFunction:       MD5,
+				AllowedValues:      []string{".+@mycompany.com"},
+				Summary:            debug,
+				DBSanitizer: db.DBSanitizerConfig{
+					SQLConfig: db.SQLConfig{
+						Enabled: false,
+					},
+					RedisConfig: db.RedisConfig{
+						Enabled: false,
+					},
+					MongoConfig: db.MongoConfig{
+						Enabled: false,
+					},
+				},
+			},
+		},
+		{
+			id:       component.NewIDWithName(metadata.Type, "empty"),
+			expected: createDefaultConfig(),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "masking_string"),
+			expected: &Config{
+				MaskingString: "[REDACTED]",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
+			require.NoError(t, err)
+
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
+
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			if fips140.Enabled() && tt.expected.(*Config).HashFunction == MD5 {
+				assert.ErrorContains(t, confmap.Validate(cfg), "not allowed when the collector runs in FIPS 140-3 mode")
+			} else {
+				assert.NoError(t, confmap.Validate(cfg))
+			}
+			assert.Equal(t, tt.expected, cfg)
+		})
+	}
+}
+
+func TestLoadInvalidConfig(t *testing.T) {
+	tests := []struct {
+		id            component.ID
+		errorContains string
+	}{
+		{
+			id:            component.NewIDWithName(metadata.Type, "hash_function_and_masking_string_set"),
+			errorContains: "masking_string must not be set when hash_function is defined",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config_invalid.yaml"))
+			require.NoError(t, err)
+
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
+
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			err = confmap.Validate(cfg)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.errorContains)
+		})
+	}
+}
+
+func TestValidateConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		hash     HashFunction
+		expected error
+	}{
+		{
+			name: "valid",
+			hash: MD5,
+		},
+		{
+			name: "empty",
+			hash: None,
+		},
+		{
+			name:     "invalid",
+			hash:     "hash",
+			expected: errors.New("unknown HashFunction hash, allowed functions are sha1, sha3 and md5"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var h HashFunction
+			err := h.UnmarshalText([]byte(tt.hash))
+			if tt.expected != nil {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.hash, h)
+			}
+		})
+	}
+}
+
+func TestValidateHMACKey(t *testing.T) {
+	tests := []struct {
+		name          string
+		config        *Config
+		expectError   bool
+		errorContains string
+	}{
+		{
+			name: "valid HMAC-SHA256 with sufficient key length",
+			config: &Config{
+				HashFunction: HMACSHA256,
+				HMACKey:      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 32 bytes
+			},
+			expectError: false,
+		},
+		{
+			name: "valid HMAC-SHA512 with sufficient key length",
+			config: &Config{
+				HashFunction: HMACSHA512,
+				HMACKey:      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", // 64 bytes
+			},
+			expectError: false,
+		},
+		{
+			name: "empty key with HMAC-SHA256",
+			config: &Config{
+				HashFunction: HMACSHA256,
+				HMACKey:      "",
+			},
+			expectError:   true,
+			errorContains: "hmac_key must not be empty",
+		},
+		{
+			name: "empty key with HMAC-SHA512",
+			config: &Config{
+				HashFunction: HMACSHA512,
+				HMACKey:      "",
+			},
+			expectError:   true,
+			errorContains: "hmac_key must not be empty",
+		},
+		{
+			name: "key too short for HMAC-SHA256",
+			config: &Config{
+				HashFunction: HMACSHA256,
+				HMACKey:      "short-key",
+			},
+			expectError:   true,
+			errorContains: "hmac_key must be at least 32 bytes long",
+		},
+		{
+			name: "key too short for HMAC-SHA512",
+			config: &Config{
+				HashFunction: HMACSHA512,
+				HMACKey:      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 32 bytes, too short for SHA512
+			},
+			expectError:   true,
+			errorContains: "hmac_key must be at least 64 bytes long",
+		},
+		{
+			name: "no validation for non-HMAC hash functions",
+			config: &Config{
+				HashFunction: SHA3,
+				HMACKey:      "",
+			},
+			expectError: false,
+		},
+		{
+			name: "no validation when hash function is None",
+			config: &Config{
+				HashFunction: None,
+				HMACKey:      "",
+			},
+			expectError: false,
+		},
+		{
+			name: "key with special characters is allowed",
+			config: &Config{
+				HashFunction: HMACSHA256,
+				HMACKey:      "!@#$%^&*()_+-=[]{}|;:,.<>?",
+			},
+			expectError:   true,
+			errorContains: "hmac_key must be at least 32 bytes long",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.errorContains != "" {
+					assert.Contains(t, err.Error(), tt.errorContains)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateHashFunctionFIPS(t *testing.T) {
+	tests := []struct {
+		name          string
+		fipsEnabled   bool
+		config        *Config
+		errorContains string
+	}{
+		{
+			name:          "md5 rejected in FIPS mode",
+			fipsEnabled:   true,
+			config:        &Config{HashFunction: MD5},
+			errorContains: `hash_function "md5" is not allowed when the collector runs in FIPS 140-3 mode`,
+		},
+		{
+			name:          "sha1 rejected in FIPS mode",
+			fipsEnabled:   true,
+			config:        &Config{HashFunction: SHA1},
+			errorContains: `hash_function "sha1" is not allowed when the collector runs in FIPS 140-3 mode`,
+		},
+		{
+			name:        "sha3 allowed in FIPS mode",
+			fipsEnabled: true,
+			config:      &Config{HashFunction: SHA3},
+		},
+		{
+			name:        "hmac-sha256 allowed in FIPS mode",
+			fipsEnabled: true,
+			config:      &Config{HashFunction: HMACSHA256, HMACKey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		},
+		{
+			name:        "no hash function allowed in FIPS mode",
+			fipsEnabled: true,
+			config:      &Config{HashFunction: None},
+		},
+		{
+			name:        "md5 allowed outside FIPS mode",
+			fipsEnabled: false,
+			config:      &Config{HashFunction: MD5},
+		},
+		{
+			name:        "sha1 allowed outside FIPS mode",
+			fipsEnabled: false,
+			config:      &Config{HashFunction: SHA1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.validateHashFunction(tt.fipsEnabled)
+			if tt.errorContains != "" {
+				assert.ErrorContains(t, err, tt.errorContains)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}

@@ -1,151 +1,114 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package splunkhecreceiver
 
 import (
-	"path"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/confighttp"
-	"go.opentelemetry.io/collector/config/configtest"
+	"go.opentelemetry.io/collector/config/confignet"
+	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/config/configtls"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/splunk"
+	translator "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/splunk"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/splunkhecreceiver/internal/metadata"
 )
 
-func TestDefaultPath(t *testing.T) {
-	c := createDefaultConfig()
-	err := c.(*Config).initialize()
-	assert.NoError(t, err)
-	assert.True(t, c.(*Config).pathGlob.Match("/foo"))
-	assert.True(t, c.(*Config).pathGlob.Match("/foo/bar"))
-	assert.True(t, c.(*Config).pathGlob.Match("/bar"))
-}
-
-func TestBadGlob(t *testing.T) {
-	c := createDefaultConfig().(*Config)
-	c.Path = "["
-	err := c.initialize()
-	assert.Error(t, err)
-}
-
-func TestFixedPath(t *testing.T) {
-	c := createDefaultConfig()
-	c.(*Config).Path = "/foo"
-	err := c.(*Config).initialize()
-	assert.NoError(t, err)
-	assert.True(t, c.(*Config).pathGlob.Match("/foo"))
-	assert.False(t, c.(*Config).pathGlob.Match("/foo/bar"))
-	assert.False(t, c.(*Config).pathGlob.Match("/bar"))
-}
-
-func TestPathWithGlob(t *testing.T) {
-	c := createDefaultConfig()
-	c.(*Config).Path = "/foo/*"
-	err := c.(*Config).initialize()
-	assert.NoError(t, err)
-	assert.False(t, c.(*Config).pathGlob.Match("/foo"))
-	assert.True(t, c.(*Config).pathGlob.Match("/foo/bar"))
-	assert.False(t, c.(*Config).pathGlob.Match("/bar"))
-}
-
-func TestInvalidPathGlobPattern(t *testing.T) {
-	c := Config{Path: "**/ "}
-	err := c.initialize()
-	assert.Error(t, err)
-}
-
-func TestInvalidPathSpaces(t *testing.T) {
-	c := Config{Path: "  foo  "}
-	err := c.initialize()
-	assert.Error(t, err)
-}
-
-func TestCreateValidEndpoint(t *testing.T) {
-	endpoint, err := extractPortFromEndpoint("localhost:123")
-	assert.NoError(t, err)
-	assert.Equal(t, 123, endpoint)
-}
-
-func TestCreateInvalidEndpoint(t *testing.T) {
-	endpoint, err := extractPortFromEndpoint("")
-	assert.EqualError(t, err, "endpoint is not formatted correctly: missing port in address")
-	assert.Equal(t, 0, endpoint)
-}
-
-func TestCreateNoPort(t *testing.T) {
-	endpoint, err := extractPortFromEndpoint("localhost:")
-	assert.EqualError(t, err, "endpoint port is not a number: strconv.ParseInt: parsing \"\": invalid syntax")
-	assert.Equal(t, 0, endpoint)
-}
-
-func TestCreateLargePort(t *testing.T) {
-	endpoint, err := extractPortFromEndpoint("localhost:65536")
-	assert.EqualError(t, err, "port number must be between 1 and 65535")
-	assert.Equal(t, 0, endpoint)
-}
-
 func TestLoadConfig(t *testing.T) {
-	factories, err := componenttest.NopFactories()
-	assert.Nil(t, err)
+	t.Parallel()
 
-	factory := NewFactory()
-	factories.Receivers[typeStr] = factory
-	cfg, err := configtest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
-
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
 	require.NoError(t, err)
-	require.NotNil(t, cfg)
 
-	assert.Equal(t, len(cfg.Receivers), 3)
+	allSettingsServerConfig := confighttp.NewDefaultServerConfig()
+	allSettingsServerConfig.WriteTimeout = defaultServerTimeout
+	allSettingsServerConfig.ReadHeaderTimeout = defaultServerTimeout
+	allSettingsServerConfig.NetAddr = confignet.AddrConfig{
+		Transport: "tcp",
+		Endpoint:  "localhost:8088",
+	}
 
-	r0 := cfg.Receivers[config.NewID(typeStr)]
-	assert.Equal(t, r0, createDefaultConfig())
+	tlsServerConfig := confighttp.NewDefaultServerConfig()
+	tlsServerConfig.WriteTimeout = defaultServerTimeout
+	tlsServerConfig.ReadHeaderTimeout = defaultServerTimeout
+	tlsServerConfig.NetAddr = confignet.AddrConfig{
+		Transport: "tcp",
+		Endpoint:  "localhost:8088",
+	}
+	tlsServerConfig.TLS = configoptional.Some(configtls.ServerConfig{
+		Config: configtls.Config{
+			CertFile: "/test.crt",
+			KeyFile:  "/test.key",
+		},
+	})
 
-	r1 := cfg.Receivers[config.NewIDWithName(typeStr, "allsettings")].(*Config)
-	assert.Equal(t, r1,
-		&Config{
-			ReceiverSettings: config.NewReceiverSettings(config.NewIDWithName(typeStr, "allsettings")),
-			HTTPServerSettings: confighttp.HTTPServerSettings{
-				Endpoint: "localhost:8088",
-			},
-			AccessTokenPassthroughConfig: splunk.AccessTokenPassthroughConfig{
-				AccessTokenPassthrough: true,
-			},
-			Path: "/foo",
-		})
-
-	r2 := cfg.Receivers[config.NewIDWithName(typeStr, "tls")].(*Config)
-	assert.Equal(t, r2,
-		&Config{
-			ReceiverSettings: config.NewReceiverSettings(config.NewIDWithName(typeStr, "tls")),
-			HTTPServerSettings: confighttp.HTTPServerSettings{
-				Endpoint: ":8088",
-				TLSSetting: &configtls.TLSServerSetting{
-					TLSSetting: configtls.TLSSetting{
-						CertFile: "/test.crt",
-						KeyFile:  "/test.key",
-					},
+	tests := []struct {
+		id       component.ID
+		expected component.Config
+	}{
+		{
+			id:       component.NewID(metadata.Type),
+			expected: createDefaultConfig(),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "allsettings"),
+			expected: &Config{
+				ServerConfig: allSettingsServerConfig,
+				AccessTokenPassthroughConfig: splunk.AccessTokenPassthroughConfig{
+					AccessTokenPassthrough: true,
+				},
+				RawPath:    "/foo",
+				Splitting:  SplittingStrategyLine,
+				HealthPath: "/bar",
+				Ack:        Ack{Path: "/services/collector/ack"},
+				HecToOtelAttrs: translator.HecToOtelAttrs{
+					Source:     "file.name",
+					SourceType: "foobar",
+					Index:      "myindex",
+					Host:       "myhostfield",
 				},
 			},
-			AccessTokenPassthroughConfig: splunk.AccessTokenPassthroughConfig{
-				AccessTokenPassthrough: false,
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "tls"),
+			expected: &Config{
+				ServerConfig: tlsServerConfig,
+				AccessTokenPassthroughConfig: splunk.AccessTokenPassthroughConfig{
+					AccessTokenPassthrough: false,
+				},
+				RawPath:    "/services/collector/raw",
+				Splitting:  SplittingStrategyLine,
+				HealthPath: "/services/collector/health",
+				Ack:        Ack{Path: "/services/collector/ack"},
+				HecToOtelAttrs: translator.HecToOtelAttrs{
+					Source:     "com.splunk.source",
+					SourceType: "com.splunk.sourcetype",
+					Index:      "com.splunk.index",
+					Host:       "host.name",
+				},
 			},
-			Path: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
+
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			assert.NoError(t, confmap.Validate(cfg))
+			assert.Equal(t, tt.expected, cfg)
 		})
+	}
 }

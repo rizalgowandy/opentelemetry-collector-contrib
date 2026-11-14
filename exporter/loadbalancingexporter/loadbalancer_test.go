@@ -1,45 +1,37 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package loadbalancingexporter
 
 import (
 	"context"
 	"errors"
+	"maps"
+	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/component/componenthelper"
 	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/consumer/pdata"
-	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.opentelemetry.io/collector/exporter/otlpexporter"
-	"go.uber.org/zap"
+	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/loadbalancingexporter/internal/metadata"
 )
 
 func TestNewLoadBalancerNoResolver(t *testing.T) {
 	// prepare
-	config := &Config{}
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
-	}
+	ts, tb := getTelemetryAssets(t)
+	cfg := &Config{}
 
 	// test
-	p, err := newLoadBalancer(params, config, nil)
+	p, err := newLoadBalancer(ts.Logger, cfg, nil, tb)
 
 	// verify
 	require.Nil(t, p)
@@ -48,17 +40,15 @@ func TestNewLoadBalancerNoResolver(t *testing.T) {
 
 func TestNewLoadBalancerInvalidStaticResolver(t *testing.T) {
 	// prepare
-	config := &Config{
+	ts, tb := getTelemetryAssets(t)
+	cfg := &Config{
 		Resolver: ResolverSettings{
-			Static: &StaticResolver{Hostnames: []string{}},
+			Static: configoptional.Some(StaticResolver{Hostnames: []string{}}),
 		},
-	}
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
 	}
 
 	// test
-	p, err := newLoadBalancer(params, config, nil)
+	p, err := newLoadBalancer(ts.Logger, cfg, nil, tb)
 
 	// verify
 	require.Nil(t, p)
@@ -67,56 +57,72 @@ func TestNewLoadBalancerInvalidStaticResolver(t *testing.T) {
 
 func TestNewLoadBalancerInvalidDNSResolver(t *testing.T) {
 	// prepare
-	config := &Config{
+	ts, tb := getTelemetryAssets(t)
+	cfg := &Config{
 		Resolver: ResolverSettings{
-			DNS: &DNSResolver{
+			DNS: configoptional.Some(DNSResolver{
 				Hostname: "",
-			},
+			}),
 		},
-	}
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
 	}
 
 	// test
-	p, err := newLoadBalancer(params, config, nil)
+	p, err := newLoadBalancer(ts.Logger, cfg, nil, tb)
 
 	// verify
 	require.Nil(t, p)
 	require.Equal(t, errNoHostname, err)
 }
 
+func TestNewLoadBalancerInvalidK8sResolver(t *testing.T) {
+	// prepare
+	ts, tb := getTelemetryAssets(t)
+	cfg := &Config{
+		Resolver: ResolverSettings{
+			K8sSvc: configoptional.Some(K8sSvcResolver{
+				Service: "",
+			}),
+		},
+	}
+
+	// test
+	p, err := newLoadBalancer(ts.Logger, cfg, nil, tb)
+
+	// verify
+	assert.Nil(t, p)
+	assert.True(t, clientcmd.IsConfigurationInvalid(err) || errors.Is(err, errNoSvc))
+}
+
 func TestLoadBalancerStart(t *testing.T) {
 	// prepare
-	config := simpleConfig()
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
-	}
-	p, err := newLoadBalancer(params, config, nil)
+	ts, tb := getTelemetryAssets(t)
+	cfg := simpleConfig()
+
+	p, err := newLoadBalancer(ts.Logger, cfg, nil, tb)
 	require.NotNil(t, p)
 	require.NoError(t, err)
 	p.res = &mockResolver{}
 
 	// test
-	res := p.Start(context.Background(), componenttest.NewNopHost())
-	defer p.Shutdown(context.Background())
-
+	res := p.Start(t.Context(), componenttest.NewNopHost())
+	defer func() {
+		require.NoError(t, p.Shutdown(t.Context()))
+	}()
 	// verify
-	assert.Nil(t, res)
+	assert.NoError(t, res)
 }
 
 func TestWithDNSResolver(t *testing.T) {
-	config := &Config{
+	ts, tb := getTelemetryAssets(t)
+	cfg := &Config{
 		Resolver: ResolverSettings{
-			DNS: &DNSResolver{
+			DNS: configoptional.Some(DNSResolver{
 				Hostname: "service-1",
-			},
+			}),
 		},
 	}
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
-	}
-	p, err := newLoadBalancer(params, config, nil)
+
+	p, err := newLoadBalancer(ts.Logger, cfg, nil, tb)
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
@@ -128,23 +134,55 @@ func TestWithDNSResolver(t *testing.T) {
 	assert.True(t, ok)
 }
 
-func TestMultipleResolvers(t *testing.T) {
-	config := &Config{
+func TestWithDNSResolverNoEndpoints(t *testing.T) {
+	// prepare
+	ts, tb := getTelemetryAssets(t)
+	cfg := &Config{
 		Resolver: ResolverSettings{
-			Static: &StaticResolver{
-				Hostnames: []string{"endpoint-1", "endpoint-2"},
-			},
-			DNS: &DNSResolver{
+			DNS: configoptional.Some(DNSResolver{
 				Hostname: "service-1",
-			},
+			}),
 		},
 	}
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
+
+	p, err := newLoadBalancer(ts.Logger, cfg, nil, tb)
+	require.NotNil(t, p)
+	require.NoError(t, err)
+
+	dnsRes, ok := p.res.(*dnsResolver)
+	require.True(t, ok)
+	dnsRes.resolver = &mockDNSResolver{
+		onLookupIPAddr: func(context.Context, string) ([]net.IPAddr, error) {
+			return nil, nil
+		},
+	}
+
+	err = p.Start(t.Context(), componenttest.NewNopHost())
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, p.Shutdown(t.Context())) }()
+
+	// test
+	_, e, _ := p.exporterAndEndpoint([]byte{128, 128, 0, 0})
+
+	// verify
+	assert.Empty(t, e)
+}
+
+func TestMultipleResolvers(t *testing.T) {
+	ts, tb := getTelemetryAssets(t)
+	cfg := &Config{
+		Resolver: ResolverSettings{
+			Static: configoptional.Some(StaticResolver{
+				Hostnames: []string{"endpoint-1", "endpoint-2"},
+			}),
+			DNS: configoptional.Some(DNSResolver{
+				Hostname: "service-1",
+			}),
+		},
 	}
 
 	// test
-	p, err := newLoadBalancer(params, config, nil)
+	p, err := newLoadBalancer(ts.Logger, cfg, nil, tb)
 
 	// verify
 	assert.Nil(t, p)
@@ -153,11 +191,10 @@ func TestMultipleResolvers(t *testing.T) {
 
 func TestStartFailureStaticResolver(t *testing.T) {
 	// prepare
-	config := simpleConfig()
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
-	}
-	p, err := newLoadBalancer(params, config, nil)
+	ts, tb := getTelemetryAssets(t)
+	cfg := simpleConfig()
+
+	p, err := newLoadBalancer(ts.Logger, cfg, nil, tb)
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
@@ -169,7 +206,7 @@ func TestStartFailureStaticResolver(t *testing.T) {
 	}
 
 	// test
-	res := p.Start(context.Background(), componenttest.NewNopHost())
+	res := p.Start(t.Context(), componenttest.NewNopHost())
 
 	// verify
 	assert.Equal(t, expectedErr, res)
@@ -177,31 +214,27 @@ func TestStartFailureStaticResolver(t *testing.T) {
 
 func TestLoadBalancerShutdown(t *testing.T) {
 	// prepare
-	config := simpleConfig()
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
-	}
-	p, err := newTracesExporter(params, config)
+	cfg := simpleConfig()
+	p, err := newTracesExporter(exportertest.NewNopSettings(metadata.Type), cfg)
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
 	// test
-	res := p.Shutdown(context.Background())
+	res := p.Shutdown(t.Context())
 
 	// verify
-	assert.Nil(t, res)
+	assert.NoError(t, res)
 }
 
 func TestOnBackendChanges(t *testing.T) {
 	// prepare
-	config := simpleConfig()
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
-	}
-	componentFactory := func(ctx context.Context, endpoint string) (component.Exporter, error) {
+	ts, tb := getTelemetryAssets(t)
+	cfg := simpleConfig()
+	componentFactory := func(_ context.Context, _ string) (component.Component, error) {
 		return newNopMockExporter(), nil
 	}
-	p, err := newLoadBalancer(params, config, componentFactory)
+
+	p, err := newLoadBalancer(ts.Logger, cfg, componentFactory, tb)
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
@@ -217,54 +250,176 @@ func TestOnBackendChanges(t *testing.T) {
 	assert.Len(t, p.ring.items, 2*defaultWeight)
 }
 
-func TestRemoveExtraExporters(t *testing.T) {
+func TestOnBackendChanges_SlowStartDoesNotBlockDataPath(t *testing.T) {
 	// prepare
-	config := simpleConfig()
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
+	ts, tb := getTelemetryAssets(t)
+	cfg := simpleConfig()
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	closeRelease := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(closeRelease) // Register in case of test failure to avoid a leak.
+
+	componentFactory := func(_ context.Context, endpoint string) (component.Component, error) {
+		if endpoint == endpointWithPort("endpoint-2") {
+			close(reached)
+			<-release
+		}
+
+		return newNopMockExporter(), nil
 	}
-	p, err := newLoadBalancer(params, config, nil)
+
+	p, err := newLoadBalancer(ts.Logger, cfg, componentFactory, tb)
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
-	p.exporters["endpoint-1"] = newNopMockExporter()
-	p.exporters["endpoint-2"] = newNopMockExporter()
-	resolved := []string{"endpoint-1"}
+	p.onBackendChanges([]string{"endpoint-1"})
+	require.Len(t, p.exporters, 1)
+
+	// find a key that moves to endpoint-2 once the new ring is installed
+	var key []byte
+	newRing := newHashRing([]string{"endpoint-1", "endpoint-2"})
+	for i := range 256 {
+		if candidate := []byte{byte(i), 0, 0, 0}; newRing.endpointFor(candidate) == "endpoint-2" {
+			key = candidate
+			break
+		}
+	}
+	require.NotNil(t, key)
+
+	// start a transition that blocks inside the component factory for endpoint-2
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.onBackendChanges([]string{"endpoint-1", "endpoint-2"})
+	}()
+	<-reached
 
 	// test
-	p.removeExtraExporters(context.Background(), resolved)
+	type lookup struct {
+		endpoint string
+		err      error
+	}
+	result := make(chan lookup, 1)
+	go func() {
+		_, endpoint, lookupErr := p.exporterAndEndpoint(key)
+		result <- lookup{endpoint: endpoint, err: lookupErr}
+	}()
+
+	// verify the data path is still served by the existing ring
+	select {
+	case res := <-result:
+		require.NoError(t, res.err)
+		assert.Equal(t, "endpoint-1", res.endpoint)
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "exporterAndEndpoint blocked while the new exporter was being started")
+	}
+
+	closeRelease()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "the backend transition didn't complete")
+	}
+
+	// verify
+	assert.Len(t, p.exporters, 2)
+	assert.Len(t, p.ring.items, 2*defaultWeight)
+	_, endpoint, err := p.exporterAndEndpoint(key)
+	require.NoError(t, err)
+	assert.Equal(t, "endpoint-2", endpoint)
+}
+
+func TestOnBackendChanges_FailedEndpointIsLeftOutOfRing(t *testing.T) {
+	// prepare
+	ts, tb := getTelemetryAssets(t)
+	cfg := simpleConfig()
+
+	failing := true
+	componentFactory := func(ctx context.Context, endpoint string) (component.Component, error) {
+		_, hasDeadline := ctx.Deadline()
+		assert.True(t, hasDeadline, "exporter creation should be bounded by a timeout")
+
+		if failing && endpoint == endpointWithPort("endpoint-2") {
+			return nil, errors.New("failed to create exporter")
+		}
+		return newNopMockExporter(), nil
+	}
+
+	p, err := newLoadBalancer(ts.Logger, cfg, componentFactory, tb)
+	require.NotNil(t, p)
+	require.NoError(t, err)
+
+	resolved := []string{"endpoint-1", "endpoint-2"}
+
+	// test
+	p.onBackendChanges(resolved)
 
 	// verify
 	assert.Len(t, p.exporters, 1)
-	assert.NotContains(t, p.exporters, "endpoint-2")
+	assert.Len(t, p.ring.items, defaultWeight)
+	for i := range 256 {
+		_, endpoint, lookupErr := p.exporterAndEndpoint([]byte{byte(i), 0, 0, 0})
+		require.NoError(t, lookupErr)
+		assert.Equal(t, "endpoint-1", endpoint)
+	}
+
+	// resolvers only report changes, so the failed endpoint is retried on the next topology change
+	failing = false
+	p.onBackendChanges([]string{"endpoint-1", "endpoint-2", "endpoint-3"})
+	assert.Len(t, p.exporters, 3)
+	assert.Len(t, p.ring.items, 3*defaultWeight)
+}
+
+// addMissingExporters synchronously creates and installs an exporter for every missing endpoint.
+func (lb *loadBalancer) addMissingExporters(_ context.Context, endpoints []string) {
+	maps.Copy(lb.exporters, lb.startMissingExporters(endpoints, lb.exporters))
+}
+
+func TestRemoveExtraExporters(t *testing.T) {
+	// prepare
+	ts, tb := getTelemetryAssets(t)
+	cfg := simpleConfig()
+	componentFactory := func(_ context.Context, _ string) (component.Component, error) {
+		return newNopMockExporter(), nil
+	}
+
+	p, err := newLoadBalancer(ts.Logger, cfg, componentFactory, tb)
+	require.NotNil(t, p)
+	require.NoError(t, err)
+
+	p.addMissingExporters(t.Context(), []string{"endpoint-1", "endpoint-2"})
+	resolved := []string{"endpoint-1"}
+
+	// test
+	p.removeExtraExporters(t.Context(), resolved)
+
+	// verify
+	assert.Len(t, p.exporters, 1)
+	assert.NotContains(t, p.exporters, endpointWithPort("endpoint-2"))
 }
 
 func TestAddMissingExporters(t *testing.T) {
 	// prepare
+	ts, tb := getTelemetryAssets(t)
 	cfg := simpleConfig()
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
-	}
-	exporterFactory := exporterhelper.NewFactory("otlp", func() config.Exporter {
+	exporterFactory := exporter.NewFactory(component.MustNewType("otlp"), func() component.Config {
 		return &otlpexporter.Config{}
-	}, exporterhelper.WithTraces(func(
+	}, exporter.WithTraces(func(
 		_ context.Context,
-		_ component.ExporterCreateSettings,
-		_ config.Exporter,
-	) (component.TracesExporter, error) {
+		_ exporter.Settings,
+		_ component.Config,
+	) (exporter.Traces, error) {
 		return newNopMockTracesExporter(), nil
-	}))
-	tmplParams := component.ExporterCreateSettings{
-		Logger:    params.Logger,
-		BuildInfo: params.BuildInfo,
-	}
-	fn := func(ctx context.Context, endpoint string) (component.Exporter, error) {
+	}, component.StabilityLevelDevelopment))
+	fn := func(ctx context.Context, endpoint string) (component.Component, error) {
 		oCfg := cfg.Protocol.OTLP
-		oCfg.Endpoint = endpoint
-		return exporterFactory.CreateTracesExporter(ctx, tmplParams, &oCfg)
+		oCfg.ClientConfig.Endpoint = endpoint
+		return exporterFactory.CreateTraces(ctx, exportertest.NewNopSettings(exporterFactory.Type()), &oCfg)
 	}
 
-	p, err := newLoadBalancer(params, cfg, fn)
+	p, err := newLoadBalancer(ts.Logger, cfg, fn, tb)
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
@@ -272,7 +427,7 @@ func TestAddMissingExporters(t *testing.T) {
 	resolved := []string{"endpoint-1", "endpoint-2"}
 
 	// test
-	p.addMissingExporters(context.Background(), resolved)
+	p.addMissingExporters(t.Context(), resolved)
 
 	// verify
 	assert.Len(t, p.exporters, 2)
@@ -281,64 +436,37 @@ func TestAddMissingExporters(t *testing.T) {
 
 func TestFailedToAddMissingExporters(t *testing.T) {
 	// prepare
+	ts, tb := getTelemetryAssets(t)
 	cfg := simpleConfig()
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
-	}
 	expectedErr := errors.New("some expected error")
-	exporterFactory := exporterhelper.NewFactory("otlp", func() config.Exporter {
+	exporterFactory := exporter.NewFactory(component.MustNewType("otlp"), func() component.Config {
 		return &otlpexporter.Config{}
-	}, exporterhelper.WithTraces(func(
+	}, exporter.WithTraces(func(
 		_ context.Context,
-		_ component.ExporterCreateSettings,
-		_ config.Exporter,
-	) (component.TracesExporter, error) {
+		_ exporter.Settings,
+		_ component.Config,
+	) (exporter.Traces, error) {
 		return nil, expectedErr
-	}))
-	tmplParams := component.ExporterCreateSettings{
-		Logger:    params.Logger,
-		BuildInfo: params.BuildInfo,
-	}
-	fn := func(ctx context.Context, endpoint string) (component.Exporter, error) {
+	}, component.StabilityLevelDevelopment))
+	fn := func(ctx context.Context, endpoint string) (component.Component, error) {
 		oCfg := cfg.Protocol.OTLP
-		oCfg.Endpoint = endpoint
-		return exporterFactory.CreateTracesExporter(ctx, tmplParams, &oCfg)
+		oCfg.ClientConfig.Endpoint = endpoint
+		return exporterFactory.CreateTraces(ctx, exportertest.NewNopSettings(metadata.Type), &oCfg)
 	}
 
-	p, err := newLoadBalancer(params, cfg, fn)
+	p, err := newLoadBalancer(ts.Logger, cfg, fn, tb)
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
-	p.exporters["endpoint-1"] = newNopMockExporter()
+	p.exporters["endpoint-1:4317"] = newNopMockExporter()
 	resolved := []string{"endpoint-1", "endpoint-2"}
 
 	// test
-	p.addMissingExporters(context.Background(), resolved)
+	p.addMissingExporters(t.Context(), resolved)
 
 	// verify
 	assert.Len(t, p.exporters, 1)
-	assert.NotContains(t, p.exporters, "endpoint-2")
-}
-
-func TestEndpointFound(t *testing.T) {
-	for _, tt := range []struct {
-		endpoint  string
-		endpoints []string
-		expected  bool
-	}{
-		{
-			"endpoint-1",
-			[]string{"endpoint-1", "endpoint-2"},
-			true,
-		},
-		{
-			"endpoint-3",
-			[]string{"endpoint-1", "endpoint-2"},
-			false,
-		},
-	} {
-		assert.Equal(t, tt.expected, endpointFound(tt.endpoint, tt.endpoints))
-	}
+	assert.Contains(t, p.exporters, "endpoint-1:4317")
 }
 
 func TestEndpointWithPort(t *testing.T) {
@@ -362,41 +490,86 @@ func TestFailedExporterInRing(t *testing.T) {
 	// this test is based on the discussion in the original PR for this exporter:
 	// https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/1542#discussion_r521268180
 	// prepare
-	config := &Config{
+	ts, tb := getTelemetryAssets(t)
+	cfg := &Config{
 		Resolver: ResolverSettings{
-			Static: &StaticResolver{Hostnames: []string{"endpoint-1", "endpoint-2"}},
+			Static: configoptional.Some(StaticResolver{Hostnames: []string{"endpoint-1", "endpoint-2"}}),
 		},
 	}
-	params := component.ExporterCreateSettings{
-		Logger: zap.NewNop(),
-	}
-	componentFactory := func(ctx context.Context, endpoint string) (component.Exporter, error) {
+	componentFactory := func(_ context.Context, _ string) (component.Component, error) {
 		return newNopMockExporter(), nil
 	}
-	p, err := newLoadBalancer(params, config, componentFactory)
+	p, err := newLoadBalancer(ts.Logger, cfg, componentFactory, tb)
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
-	err = p.Start(context.Background(), componenttest.NewNopHost())
+	err = p.Start(t.Context(), componenttest.NewNopHost())
 	require.NoError(t, err)
 
 	// simulate the case where one of the exporters failed to be created and do not exist in the internal map
 	// this is a case that we are not even sure that might happen, so, this test case is here to document
 	// this behavior. As the solution would require more locks/syncs/checks, we should probably wait to see
 	// if this is really a problem in the real world
-	delete(p.exporters, "endpoint-2")
+	resEndpoint := "endpoint-2"
+	delete(p.exporters, endpointWithPort(resEndpoint))
 
 	// sanity check
-	require.Contains(t, p.res.(*staticResolver).endpoints, "endpoint-2")
+	require.Contains(t, p.res.(*staticResolver).endpoints, resEndpoint)
 
 	// test
 	// this trace ID will reach the endpoint-2 -- see the consistent hashing tests for more info
-	_, err = p.Exporter(p.Endpoint(pdata.NewTraceID([16]byte{128, 128, 0, 0})))
+	_, _, err = p.exporterAndEndpoint([]byte{128, 128, 1, 0})
+
+	// verify
+	assert.Error(t, err)
+
+	// test
+	// this service name will reach the endpoint-2 -- see the consistent hashing tests for more info
+	_, _, err = p.exporterAndEndpoint([]byte("get-recommendations-2"))
 
 	// verify
 	assert.Error(t, err)
 }
 
-func newNopMockExporter() component.Exporter {
-	return componenthelper.New()
+func TestNewLoadBalancerInvalidNamespaceAwsResolver(t *testing.T) {
+	// prepare
+	ts, tb := getTelemetryAssets(t)
+	cfg := &Config{
+		Resolver: ResolverSettings{
+			AWSCloudMap: configoptional.Some(AWSCloudMapResolver{
+				NamespaceName: "",
+			}),
+		},
+	}
+
+	// test
+	p, err := newLoadBalancer(ts.Logger, cfg, nil, tb)
+
+	// verify
+	assert.Nil(t, p)
+	assert.True(t, clientcmd.IsConfigurationInvalid(err) || errors.Is(err, errNoNamespace))
+}
+
+func TestNewLoadBalancerInvalidServiceAwsResolver(t *testing.T) {
+	// prepare
+	ts, tb := getTelemetryAssets(t)
+	cfg := &Config{
+		Resolver: ResolverSettings{
+			AWSCloudMap: configoptional.Some(AWSCloudMapResolver{
+				NamespaceName: "cloudmap",
+				ServiceName:   "",
+			}),
+		},
+	}
+
+	// test
+	p, err := newLoadBalancer(ts.Logger, cfg, nil, tb)
+
+	// verify
+	assert.Nil(t, p)
+	assert.True(t, clientcmd.IsConfigurationInvalid(err) || errors.Is(err, errNoServiceName))
+}
+
+func newNopMockExporter() *wrappedExporter {
+	return newWrappedExporter(mockComponent{}, "mock")
 }

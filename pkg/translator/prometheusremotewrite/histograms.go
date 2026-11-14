@@ -1,0 +1,270 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package prometheusremotewrite // import "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/prometheusremotewrite"
+
+import (
+	"errors"
+	"fmt"
+	"math"
+
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/value"
+	"github.com/prometheus/prometheus/prompb"
+	"github.com/prometheus/prometheus/util/convertnhcb"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.uber.org/multierr"
+)
+
+// explicitToNHCB converts an OTLP explicit-bucket histogram data point to a
+// Prometheus histogram with custom buckets (schema -53) via Prometheus' own
+// convertnhcb helper. Exactly one of the returned histograms is non-nil.
+func explicitToNHCB(pt pmetric.HistogramDataPoint) (*histogram.Histogram, *histogram.FloatHistogram, error) {
+	if !pt.HasSum() {
+		return nil, nil, errors.New("cannot convert explicit histogram to native histogram with custom buckets: sum is not set")
+	}
+	th := convertnhcb.NewTempHistogram()
+	bounds := pt.ExplicitBounds()
+	counts := pt.BucketCounts()
+	// OTLP buckets are non-cumulative and omit the implicit +Inf bound;
+	// convertnhcb wants cumulative counts up to and including +Inf.
+	var cumulative uint64
+	for i := 0; i < bounds.Len()+1; i++ {
+		if i < counts.Len() { // Trailing empty buckets may be omitted.
+			cumulative += counts.At(i)
+		}
+		bound := math.Inf(1)
+		if i < bounds.Len() {
+			bound = bounds.At(i)
+		}
+		if bound == math.Inf(1) && pt.Count() > cumulative {
+			// Buckets under-report the total; the remainder lands in +Inf.
+			cumulative = pt.Count()
+		}
+		if err := th.SetBucketCount(bound, float64(cumulative)); err != nil {
+			return nil, nil, err
+		}
+		if bound == math.Inf(1) {
+			break // Reached +Inf, whether implicit or encoded in bounds.
+		}
+	}
+	if err := th.SetCount(float64(cumulative)); err != nil {
+		return nil, nil, err
+	}
+	if err := th.SetSum(pt.Sum()); err != nil {
+		return nil, nil, err
+	}
+	return th.Convert()
+}
+
+// explicitToNHCBHistogram is the RW1 wrapper around explicitToNHCB.
+func explicitToNHCBHistogram(pt pmetric.HistogramDataPoint) (prompb.Histogram, error) {
+	timestamp := convertTimeStamp(pt.Timestamp())
+
+	if pt.Flags().NoRecordedValue() {
+		// Staleness is signaled by a stale-NaN Sum; Count is ignored.
+		// https://prometheus.io/docs/specs/native_histograms/#staleness-markers
+		return prompb.Histogram{
+			Schema:    histogram.CustomBucketsSchema,
+			Sum:       math.Float64frombits(value.StaleNaN),
+			Timestamp: timestamp,
+		}, nil
+	}
+
+	h, fh, err := explicitToNHCB(pt)
+	if err != nil {
+		return prompb.Histogram{}, err
+	}
+	switch {
+	case h != nil:
+		return prompb.FromIntHistogram(timestamp, h), nil
+	case fh != nil:
+		return prompb.FromFloatHistogram(timestamp, fh), nil
+	default:
+		return prompb.Histogram{}, errors.New("convertnhcb produced neither an integer nor a float histogram")
+	}
+}
+
+func (c *prometheusConverter) addExponentialHistogramDataPoints(dataPoints pmetric.ExponentialHistogramDataPointSlice,
+	resource pcommon.Resource, scope pcommon.InstrumentationScope, schemaURL string, settings Settings, baseName string,
+) error {
+	var errs error
+	for x := 0; x < dataPoints.Len(); x++ {
+		pt := dataPoints.At(x)
+		lbls, err := createAttributes(resource, pt.Attributes(), scope, schemaURL, settings.ExternalLabels, nil, true, c.labelNamer, settings.DisableScopeInfo, model.MetricNameLabel, baseName)
+		if err != nil {
+			errs = multierr.Append(errs, err)
+			continue
+		}
+		histogram, err := exponentialToNativeHistogram(pt)
+		if err != nil {
+			errs = multierr.Append(errs, err)
+			continue
+		}
+		ts, _ := c.getOrCreateTimeSeries(lbls)
+		ts.Histograms = append(ts.Histograms, histogram)
+
+		exemplars := getPromExemplars[pmetric.ExponentialHistogramDataPoint](pt)
+		ts.Exemplars = append(ts.Exemplars, exemplars...)
+	}
+
+	return errs
+}
+
+// exponentialToNativeHistogram  translates OTel Exponential Histogram data point
+// to Prometheus Native Histogram.
+func exponentialToNativeHistogram(p pmetric.ExponentialHistogramDataPoint) (prompb.Histogram, error) {
+	scale := p.Scale()
+	if scale < -4 {
+		return prompb.Histogram{},
+			fmt.Errorf("cannot convert exponential to native histogram."+
+				" Scale must be >= -4, was %d", scale)
+	}
+	if !p.Flags().NoRecordedValue() && !p.HasSum() {
+		return prompb.Histogram{}, errors.New("cannot convert exponential to native histogram: sum is not set")
+	}
+
+	var scaleDown int32
+	if scale > 8 {
+		scaleDown = scale - 8
+		scale = 8
+	}
+
+	timestamp := convertTimeStamp(p.Timestamp())
+	if p.Flags().NoRecordedValue() {
+		// Staleness is signaled by a stale-NaN Sum; Count is 0 and ZeroCount/buckets are left empty.
+		// https://prometheus.io/docs/specs/native_histograms/#staleness-markers
+		return prompb.Histogram{
+			Schema:        scale,
+			ZeroThreshold: p.ZeroThreshold(),
+			Sum:           math.Float64frombits(value.StaleNaN),
+			Timestamp:     timestamp,
+		}, nil
+	}
+
+	pSpans, pDeltas := convertBucketsLayout(p.Positive(), scaleDown)
+	nSpans, nDeltas := convertBucketsLayout(p.Negative(), scaleDown)
+
+	h := prompb.Histogram{
+		// The counter reset detection must be compatible with Prometheus to
+		// safely set ResetHint to NO. This is not ensured currently.
+		// Sending a sample that triggers counter reset but with ResetHint==NO
+		// would lead to Prometheus panic as it does not double check the hint.
+		// Thus we're explicitly saying UNKNOWN here, which is always safe.
+		// TODO: using created time stamp should be accurate, but we
+		// need to know here if it was used for the detection.
+		// Ref: https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/28663#issuecomment-1810577303
+		// Counter reset detection in Prometheus: https://github.com/prometheus/prometheus/blob/f997c72f294c0f18ca13fa06d51889af04135195/tsdb/chunkenc/histogram.go#L232
+		ResetHint: prompb.Histogram_UNKNOWN,
+		Schema:    scale,
+
+		ZeroThreshold: p.ZeroThreshold(),
+		ZeroCount:     &prompb.Histogram_ZeroCountInt{ZeroCountInt: p.ZeroCount()},
+
+		PositiveSpans:  pSpans,
+		PositiveDeltas: pDeltas,
+		NegativeSpans:  nSpans,
+		NegativeDeltas: nDeltas,
+
+		Timestamp: timestamp,
+		Sum:       p.Sum(),
+		Count:     &prompb.Histogram_CountInt{CountInt: p.Count()},
+	}
+	return h, nil
+}
+
+// convertBucketsLayout translates OTel Exponential Histogram dense buckets
+// representation to Prometheus Native Histogram sparse bucket representation.
+//
+// The translation logic is taken from the client_golang `histogram.go#makeBuckets`
+// function, see `makeBuckets` https://github.com/prometheus/client_golang/blob/main/prometheus/histogram.go
+// The bucket indexes conversion was adjusted, since OTel exp. histogram bucket
+// index 0 corresponds to the range (1, base] while Prometheus bucket index 0
+// to the range (base 1].
+//
+// scaleDown is the factor by which the buckets are scaled down. In other words 2^scaleDown buckets will be merged into one.
+func convertBucketsLayout(buckets pmetric.ExponentialHistogramDataPointBuckets, scaleDown int32) ([]prompb.BucketSpan, []int64) {
+	bucketCounts := buckets.BucketCounts()
+	if bucketCounts.Len() == 0 {
+		return nil, nil
+	}
+
+	var (
+		spans     []prompb.BucketSpan
+		deltas    []int64
+		count     int64
+		prevCount int64
+	)
+
+	appendDelta := func(count int64) {
+		spans[len(spans)-1].Length++
+		deltas = append(deltas, count-prevCount)
+		prevCount = count
+	}
+
+	// Let the compiler figure out that this is const during this function by
+	// moving it into a local variable.
+	numBuckets := bucketCounts.Len()
+
+	// The offset is scaled and adjusted by 1 as described above.
+	bucketIdx := buckets.Offset()>>scaleDown + 1
+	spans = append(spans, prompb.BucketSpan{
+		Offset: bucketIdx,
+		Length: 0,
+	})
+
+	for i := range numBuckets {
+		// The offset is scaled and adjusted by 1 as described above.
+		nextBucketIdx := (int32(i)+buckets.Offset())>>scaleDown + 1
+		if bucketIdx == nextBucketIdx { // We have not collected enough buckets to merge yet.
+			count += int64(bucketCounts.At(i))
+			continue
+		}
+		if count == 0 {
+			count = int64(bucketCounts.At(i))
+			continue
+		}
+
+		gap := nextBucketIdx - bucketIdx - 1
+		if gap > 2 {
+			// We have to create a new span, because we have found a gap
+			// of more than two buckets. The constant 2 is copied from the logic in
+			// https://github.com/prometheus/client_golang/blob/27f0506d6ebbb117b6b697d0552ee5be2502c5f2/prometheus/histogram.go#L1296
+			spans = append(spans, prompb.BucketSpan{
+				Offset: gap,
+				Length: 0,
+			})
+		} else {
+			// We have found a small gap (or no gap at all).
+			// Insert empty buckets as needed.
+			for range gap {
+				appendDelta(0)
+			}
+		}
+		appendDelta(count)
+		count = int64(bucketCounts.At(i))
+		bucketIdx = nextBucketIdx
+	}
+	// Need to use the last item's index. The offset is scaled and adjusted by 1 as described above.
+	gap := (int32(numBuckets)+buckets.Offset()-1)>>scaleDown + 1 - bucketIdx
+	if gap > 2 {
+		// We have to create a new span, because we have found a gap
+		// of more than two buckets. The constant 2 is copied from the logic in
+		// https://github.com/prometheus/client_golang/blob/27f0506d6ebbb117b6b697d0552ee5be2502c5f2/prometheus/histogram.go#L1296
+		spans = append(spans, prompb.BucketSpan{
+			Offset: gap,
+			Length: 0,
+		})
+	} else {
+		// We have found a small gap (or no gap at all).
+		// Insert empty buckets as needed.
+		for range gap {
+			appendDelta(0)
+		}
+	}
+	appendDelta(count)
+
+	return spans, deltas
+}

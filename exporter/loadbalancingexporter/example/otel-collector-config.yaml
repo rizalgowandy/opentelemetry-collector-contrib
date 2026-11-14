@@ -3,12 +3,9 @@ receivers:
     protocols:
       grpc:
 
-processors:
-  batch:
-
 exporters:
-  logging:
-    loglevel: debug
+  debug:
+    verbosity: detailed
 
 extensions:
   health_check:
@@ -20,5 +17,4 @@ service:
   pipelines:
     logs:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [logging]
+      exporters: [debug]

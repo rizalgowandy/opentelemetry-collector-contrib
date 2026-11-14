@@ -1,30 +1,24 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package memcachedreceiver
+package memcachedreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/memcachedreceiver"
 
 import (
-	"time"
-
 	"go.opentelemetry.io/collector/config/confignet"
-	"go.opentelemetry.io/collector/receiver/scraperhelper"
+	"go.opentelemetry.io/collector/config/configtls"
+	"go.opentelemetry.io/collector/scraper/scraperhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/memcachedreceiver/internal/metadata"
 )
 
 type Config struct {
-	scraperhelper.ScraperControllerSettings `mapstructure:",squash"`
-	confignet.TCPAddr                       `mapstructure:",squash"`
+	ControllerConfig scraperhelper.ControllerConfig `mapstructure:",squash"`
+	AddrConfig       confignet.AddrConfig           `mapstructure:",squash"`
 
-	// Timeout for the memcache stats request
-	Timeout time.Duration `mapstructure:"timeout"`
+	// TLS controls the TLS settings used to connect to memcached. TLS is
+	// disabled by default (Insecure: true), preserving plaintext connections.
+	TLS configtls.ClientConfig `mapstructure:"tls,omitempty"`
+
+	// MetricsBuilderConfig allows customizing scraped metrics/attributes representation.
+	MetricsBuilderConfig metadata.MetricsBuilderConfig `mapstructure:",squash"`
 }

@@ -1,0 +1,88 @@
+default:
+all_set:
+  metrics:
+    couchdb.average_request_time:
+      enabled: true
+    couchdb.database.open:
+      enabled: true
+    couchdb.database.operations:
+      enabled: true
+      attributes: ["operation"]
+    couchdb.file_descriptor.open:
+      enabled: true
+    couchdb.httpd.bulk_requests:
+      enabled: true
+    couchdb.httpd.requests:
+      enabled: true
+      attributes: ["http.method"]
+    couchdb.httpd.responses:
+      enabled: true
+      attributes: ["http.status_code"]
+    couchdb.httpd.views:
+      enabled: true
+      attributes: ["view"]
+  resource_attributes:
+    couchdb.node.name:
+      enabled: true
+reaggregate_set:
+  metrics:
+    couchdb.average_request_time:
+      enabled: true
+    couchdb.database.open:
+      enabled: true
+    couchdb.database.operations:
+      enabled: true
+      attributes: []
+    couchdb.file_descriptor.open:
+      enabled: true
+    couchdb.httpd.bulk_requests:
+      enabled: true
+    couchdb.httpd.requests:
+      enabled: true
+      attributes: []
+    couchdb.httpd.responses:
+      enabled: true
+      attributes: []
+    couchdb.httpd.views:
+      enabled: true
+      attributes: []
+  resource_attributes:
+    couchdb.node.name:
+      enabled: true
+none_set:
+  metrics:
+    couchdb.average_request_time:
+      enabled: false
+    couchdb.database.open:
+      enabled: false
+    couchdb.database.operations:
+      enabled: false
+      attributes: ["operation"]
+    couchdb.file_descriptor.open:
+      enabled: false
+    couchdb.httpd.bulk_requests:
+      enabled: false
+    couchdb.httpd.requests:
+      enabled: false
+      attributes: ["http.method"]
+    couchdb.httpd.responses:
+      enabled: false
+      attributes: ["http.status_code"]
+    couchdb.httpd.views:
+      enabled: false
+      attributes: ["view"]
+  resource_attributes:
+    couchdb.node.name:
+      enabled: false
+filter_set_include:
+  resource_attributes:
+    couchdb.node.name:
+      enabled: true
+      metrics_include:
+        - regexp: ".*"
+filter_set_exclude:
+  resource_attributes:
+    couchdb.node.name:
+      enabled: true
+      metrics_exclude:
+        - strict: "couchdb.node.name-val"

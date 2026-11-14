@@ -1,63 +1,52 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-// Package awscloudwatchlogsexporter provides a logging exporter for the OpenTelemetry collector.
+//go:generate make mdatagen
+
+// Package awscloudwatchlogsexporter provides an AWS CloudWatch Logs exporter for the OpenTelemetry collector.
 // This package is subject to change and may break configuration settings and behavior.
-package awscloudwatchlogsexporter
+package awscloudwatchlogsexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awscloudwatchlogsexporter"
 
 import (
 	"context"
 	"errors"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config/configmodels"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/config/configretry"
+	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awscloudwatchlogsexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/awsutil"
 )
 
-const typeStr = "awscloudwatchlogs"
-
-func NewFactory() component.ExporterFactory {
-	return exporterhelper.NewFactory(
-		typeStr,
+func NewFactory() exporter.Factory {
+	return exporter.NewFactory(
+		metadata.Type,
 		createDefaultConfig,
-		exporterhelper.WithLogs(createLogsExporter))
+		exporter.WithLogs(createLogsExporter, metadata.LogsStability),
+	)
 }
 
-func createDefaultConfig() configmodels.Exporter {
+func createDefaultConfig() component.Config {
+	queueSettings := exporterhelper.NewDefaultQueueConfig()
+	// For backwards compatibilitiy, we default to 1 consumer
+	queueSettings.NumConsumers = 1
+	batchCfg := *queueSettings.Batch.GetOrInsertDefault()
+	queueSettings.Batch = configoptional.Some(batchCfg)
+
 	return &Config{
-		ExporterSettings: configmodels.ExporterSettings{
-			TypeVal: configmodels.Type(typeStr),
-			NameVal: typeStr,
-		},
+		BackOffConfig:      configretry.NewDefaultBackOffConfig(),
+		AWSSessionSettings: awsutil.CreateDefaultSessionConfig(),
+		QueueSettings:      configoptional.Some(queueSettings),
 	}
 }
 
-func createLogsExporter(ctx context.Context, params component.ExporterCreateParams, cfg configmodels.Exporter) (component.LogsExporter, error) {
-	config, ok := cfg.(*Config)
+func createLogsExporter(ctx context.Context, params exporter.Settings, config component.Config) (exporter.Logs, error) {
+	expConfig, ok := config.(*Config)
 	if !ok {
 		return nil, errors.New("invalid configuration type; can't cast to awscloudwatchlogsexporter.Config")
 	}
-
-	exporter := &exporter{config: config, logger: params.Logger}
-	return exporterhelper.NewLogsExporter(
-		config,
-		params.Logger,
-		exporter.PushLogs,
-		exporterhelper.WithQueue(exporterhelper.QueueSettings{
-			Enabled:      true,
-			NumConsumers: 1, // due to the sequence token, there can be only one request in flight
-		}),
-		exporterhelper.WithRetry(config.RetrySettings),
-	)
+	return newCwLogsExporter(ctx, expConfig, params)
 }

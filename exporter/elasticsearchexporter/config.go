@@ -1,33 +1,32 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package elasticsearchexporter
+package elasticsearchexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter"
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/config/configtls"
+	"go.opentelemetry.io/collector/config/configcompression"
+	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/configopaque"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.uber.org/zap"
 )
 
 // Config defines configuration for Elastic exporter.
 type Config struct {
-	config.ExporterSettings `mapstructure:",squash"`
+	// QueueBatchConfig configures the sending queue and the batching done
+	// by the exporter. The performed batching can further be customized by
+	// configuring `metadata_keys` which will be used to partition the batches.
+	QueueBatchConfig configoptional.Optional[exporterhelper.QueueBatchConfig] `mapstructure:"sending_queue"`
 
 	// Endpoints holds the Elasticsearch URLs the exporter should send events to.
 	//
@@ -41,16 +40,26 @@ type Config struct {
 	// This setting is required if no URL is configured.
 	CloudID string `mapstructure:"cloudid"`
 
-	// NumWorkers configures the number of workers publishing bulk requests.
-	NumWorkers int `mapstructure:"num_workers"`
+	// LogsIndex configures the static index used for document routing for logs.
+	// It should be empty if dynamic document routing is preferred.
+	LogsIndex string `mapstructure:"logs_index"`
 
-	// Index configures the index, index alias, or data stream name events should be indexed in.
-	//
-	// https://www.elastic.co/guide/en/elasticsearch/reference/current/indices.html
-	// https://www.elastic.co/guide/en/elasticsearch/reference/current/data-streams.html
-	//
-	// This setting is required.
-	Index string `mapstructure:"index"`
+	// MetricsIndex configures the static index used for document routing for metrics.
+	// It should be empty if dynamic document routing is preferred.
+	MetricsIndex string `mapstructure:"metrics_index"`
+
+	// TracesIndex configures the static index used for document routing for metrics.
+	// It should be empty if dynamic document routing is preferred.
+	TracesIndex string `mapstructure:"traces_index"`
+
+	// LogsDynamicID configures whether log record attribute `elasticsearch.document_id` is set as the document ID in ES.
+	LogsDynamicID DynamicIDSettings `mapstructure:"logs_dynamic_id"`
+
+	// TracesDynamicID configures whether span attribute `elasticsearch.document_id` is set as the document ID in ES.
+	TracesDynamicID DynamicIDSettings `mapstructure:"traces_dynamic_id"`
+
+	// LogsDynamicPipeline configures whether log record attribute `elasticsearch.document_pipeline` is set as the document ingest pipeline for ES.
+	LogsDynamicPipeline DynamicPipelineSettings `mapstructure:"logs_dynamic_pipeline"`
 
 	// Pipeline configures the ingest node pipeline name that should be used to process the
 	// events.
@@ -58,30 +67,121 @@ type Config struct {
 	// https://www.elastic.co/guide/en/elasticsearch/reference/current/ingest.html
 	Pipeline string `mapstructure:"pipeline"`
 
-	HTTPClientSettings `mapstructure:",squash"`
-	Discovery          DiscoverySettings `mapstructure:"discover"`
-	Retry              RetrySettings     `mapstructure:"retry"`
-	Flush              FlushSettings     `mapstructure:"flush"`
-	Mapping            MappingsSettings  `mapstructure:"mapping"`
+	ClientConfig   confighttp.ClientConfig `mapstructure:",squash"`
+	Authentication AuthenticationSettings  `mapstructure:",squash"`
+	Discovery      DiscoverySettings       `mapstructure:"discover"`
+	Retry          RetrySettings           `mapstructure:"retry"`
+
+	Mapping        MappingsSettings       `mapstructure:"mapping"`
+	LogstashFormat LogstashFormatSettings `mapstructure:"logstash_format"`
+
+	// SuppressConflictErrors configures whether 409 Conflict responses are logged as errors.
+	// If set to true, document level version conflict exceptions (409) will not be logged.
+	SuppressConflictErrors bool `mapstructure:"suppress_conflict_errors"`
+
+	// TelemetrySettings contains settings useful for testing/debugging purposes.
+	// This is experimental and may change at any time.
+	TelemetrySettings TelemetrySettings `mapstructure:"telemetry"`
+
+	// IncludeSourceOnError configures whether the bulk index responses include
+	// a part of the source document on error.
+	// Defaults to nil.
+	//
+	// This setting requires Elasticsearch 8.18+. Using it in prior versions
+	// have no effect.
+	//
+	// NOTE: The default behavior if this configuration is not set, is to
+	// discard the error reason entirely, i.e. only the error type is returned.
+	//
+	// WARNING: If set to true, the exporter may log error responses containing
+	// request payload, causing potential sensitive data to be exposed in logs.
+	// Users are expected to sanitize the responses themselves.
+	IncludeSourceOnError *bool `mapstructure:"include_source_on_error"`
+
+	// Experimental: MetadataKeys defines a list of client.Metadata keys that
+	// will be used as partition keys when `sending_queue::batch` is enabled and
+	// will be added to the exporter's telemetry if defined. The metadata keys
+	// are converted to lower case because client metadata key lookups are case
+	// insensitive. This means that the metric produced by internal telemetry
+	// will also have the attribute in lower case.
+	//
+	// Keys are case-insensitive and duplicates will trigger a validation error.
+	MetadataKeys []string `mapstructure:"metadata_keys"`
+
+	// BulkResponseFilterPath sets the filter_path parameter of bulk API requests,
+	// which controls what data is returned in the response from Elasticsearch.
+	//
+	// Note: If `items.*._index.items` is not in the BulkResponseFilterPath
+	// than for any failed documents, the exporter will not be able
+	// to log the index to which the document was being written
+	// to.
+	//
+	// Note: if `items.*._index.items` is not in the BulkResponseFilterPath
+	// than the export will log rejection of duplicates to
+	// ".profiling-stackframes" which were previously suppressed.
+	//
+	// BulkResponseFilterPath defaults to
+	// "items.*._index,items.*.status,items.*.failure_store,items.*.error.type,items.*.error.reason"
+	BulkResponseFilterPath string `mapstructure:"bulk_response_filter_path"`
+
+	// VersionDetection configures whether the exporter queries Elasticsearch
+	// at startup for its version and build flavor.
+	VersionDetection VersionDetectionSettings `mapstructure:"version_detection"`
 }
 
-type HTTPClientSettings struct {
-	Authentication AuthenticationSettings `mapstructure:",squash"`
+// VersionDetectionSettings defines settings controlling whether the exporter
+// queries Elasticsearch at startup for its version and build flavor. This
+// information is used to automatically enable features supported by the
+// connected Elasticsearch version, so no per-feature configuration is required.
+//
+// When disabled, the exporter does not query Elasticsearch and assumes only the
+// baseline capability set is available.
+type VersionDetectionSettings struct {
+	// Enabled controls whether version detection is performed at startup.
+	// It defaults to true.
+	Enabled bool `mapstructure:"enabled"`
 
-	// ReadBufferSize for HTTP client. See http.Transport.ReadBufferSize.
-	ReadBufferSize int `mapstructure:"read_buffer_size"`
+	// prevent unkeyed literal initialization
+	_ struct{}
+}
 
-	// WriteBufferSize for HTTP client. See http.Transport.WriteBufferSize.
-	WriteBufferSize int `mapstructure:"write_buffer_size"`
+type TelemetrySettings struct {
+	LogRequestBody  bool `mapstructure:"log_request_body"`
+	LogResponseBody bool `mapstructure:"log_response_body"`
 
-	// Timeout configures the HTTP request timeout.
-	Timeout time.Duration `mapstructure:"timeout"`
+	LogFailedDocsInput          bool          `mapstructure:"log_failed_docs_input"`
+	LogFailedDocsInputRateLimit time.Duration `mapstructure:"log_failed_docs_input_rate_limit"`
 
-	// Headers allows users to configure optional HTTP headers that
-	// will be send with each HTTP request.
-	Headers map[string]string `mapstructure:"headers,omitempty"`
+	// IncludeDestinationIndex adds the destination index, as reported by
+	// Elasticsearch, as an attribute to the `otelcol.elasticsearch.docs.processed`
+	// metric. It can have high cardinality, so it is disabled by default.
+	IncludeDestinationIndex bool `mapstructure:"include_destination_index"`
 
-	configtls.TLSClientSetting `mapstructure:",squash"`
+	// prevent unkeyed literal initialization
+	_ struct{}
+}
+
+type LogstashFormatSettings struct {
+	Enabled         bool   `mapstructure:"enabled"`
+	PrefixSeparator string `mapstructure:"prefix_separator"`
+	DateFormat      string `mapstructure:"date_format"`
+
+	// prevent unkeyed literal initialization
+	_ struct{}
+}
+
+type DynamicIDSettings struct {
+	Enabled bool `mapstructure:"enabled"`
+
+	// prevent unkeyed literal initialization
+	_ struct{}
+}
+
+type DynamicPipelineSettings struct {
+	Enabled bool `mapstructure:"enabled"`
+
+	// prevent unkeyed literal initialization
+	_ struct{}
 }
 
 // AuthenticationSettings defines user authentication related settings.
@@ -90,12 +190,15 @@ type AuthenticationSettings struct {
 	User string `mapstructure:"user"`
 
 	// Password is used to configure HTTP Basic Authentication.
-	Password string `mapstructure:"password"`
+	Password configopaque.String `mapstructure:"password"`
 
 	// APIKey is used to configure ApiKey based Authentication.
 	//
 	// https://www.elastic.co/guide/en/elasticsearch/reference/current/security-api-create-api-key.html
-	APIKey string `mapstructure:"api_key"`
+	APIKey configopaque.String `mapstructure:"api_key"`
+
+	// prevent unkeyed literal initialization
+	_ struct{}
 }
 
 // DiscoverySettings defines Elasticsearch node discovery related settings.
@@ -115,17 +218,9 @@ type DiscoverySettings struct {
 	// Interval instructs the exporter to renew the list of Elasticsearch URLs
 	// with the given interval. URLs will not be updated if Interval is <=0.
 	Interval time.Duration `mapstructure:"interval"`
-}
 
-// FlushSettings  defines settings for configuring the write buffer flushing
-// policy in the Elasticsearch exporter. The exporter sends a bulk request with
-// all events already serialized into the send-buffer.
-type FlushSettings struct {
-	// Bytes sets the send buffer flushing limit.
-	Bytes int `mapstructure:"bytes"`
-
-	// Interval configures the max age of a document in the send buffer.
-	Interval time.Duration `mapstructure:"interval"`
+	// prevent unkeyed literal initialization
+	_ struct{}
 }
 
 // RetrySettings defines settings for the HTTP request retries in the Elasticsearch exporter.
@@ -134,30 +229,35 @@ type RetrySettings struct {
 	// Enabled allows users to disable retry without having to comment out all settings.
 	Enabled bool `mapstructure:"enabled"`
 
-	// MaxRequests configures how often an HTTP request is retried before it is assumed to be failed.
-	MaxRequests int `mapstructure:"max_requests"`
+	// MaxRetries configures how many times an HTTP request is retried.
+	MaxRetries int `mapstructure:"max_retries"`
 
 	// InitialInterval configures the initial waiting time if a request failed.
 	InitialInterval time.Duration `mapstructure:"initial_interval"`
 
 	// MaxInterval configures the max waiting time if consecutive requests failed.
 	MaxInterval time.Duration `mapstructure:"max_interval"`
+
+	// RetryOnStatus configures the status codes that trigger request level retries.
+	RetryOnStatus []int `mapstructure:"retry_on_status"`
+
+	// RetryOnDocumentStatus configures the status codes that trigger document level retries
+	// for failed documents in a successful bulk HTTP response.
+	RetryOnDocumentStatus []int `mapstructure:"retry_on_document_status"`
+
+	// prevent unkeyed literal initialization
+	_ struct{}
 }
 
 type MappingsSettings struct {
-	// Mode configures the field mappings.
-	Mode string `mapstructure:"mode"`
+	// AllowedModes controls the allowed document mapping modes
+	// specified through X-Elastic-Mapping-Mode client metadata.
+	//
+	// If unspecified, all mapping modes are allowed.
+	AllowedModes []string `mapstructure:"allowed_modes"`
 
-	// Additional field mappings.
-	Fields map[string]string `mapstructure:"fields"`
-
-	// File to read additional fields mappings from.
-	File string `mapstructure:"file"`
-
-	// Try to find and remove duplicate fields
-	Dedup bool `mapstructure:"dedup"`
-
-	Dedot bool `mapstructure:"dedot"`
+	// prevent unkeyed literal initialization
+	_ struct{}
 }
 
 type MappingMode int
@@ -166,64 +266,208 @@ type MappingMode int
 const (
 	MappingNone MappingMode = iota
 	MappingECS
-)
+	MappingOTel
+	MappingRaw
+	MappingBodyMap
 
-var (
-	errConfigNoEndpoint    = errors.New("endpoints or cloudid must be specified")
-	errConfigEmptyEndpoint = errors.New("endpoints must not include empty entries")
-	errConfigNoIndex       = errors.New("index must be specified")
+	// NumMappingModes remain last, it is used for sizing arrays.
+	NumMappingModes
 )
 
 func (m MappingMode) String() string {
 	switch m {
 	case MappingNone:
-		return ""
+		return "none"
 	case MappingECS:
 		return "ecs"
-	default:
-		return ""
+	case MappingOTel:
+		return "otel"
+	case MappingRaw:
+		return "raw"
+	case MappingBodyMap:
+		return "bodymap"
 	}
+	return ""
 }
 
-var mappingModes = func() map[string]MappingMode {
-	table := map[string]MappingMode{}
-	for _, m := range []MappingMode{
-		MappingNone,
-		MappingECS,
-	} {
-		table[strings.ToLower(m.String())] = m
-	}
-
-	// config aliases
-	table["no"] = MappingNone
-	table["none"] = MappingNone
-
-	return table
-}()
+var (
+	errConfigEndpointRequired = errors.New("exactly one of [endpoint, endpoints, cloudid] must be specified")
+	errConfigEmptyEndpoint    = errors.New("endpoint must not be empty")
+)
 
 const defaultElasticsearchEnvName = "ELASTICSEARCH_URL"
 
-// Validate validates the elasticsearch server configuration.
-func (cfg *Config) Validate() error {
-	if len(cfg.Endpoints) == 0 && cfg.CloudID == "" {
-		if os.Getenv(defaultElasticsearchEnvName) == "" {
-			return errConfigNoEndpoint
+func (cfg *Config) Unmarshal(conf *confmap.Conf) error {
+	// ClientConfig is squashed and implements custom unmarshaling, so confmap
+	// does not report unused top-level keys here. Reject the removed settings explicitly.
+	var invalidKeys []string
+	for _, key := range []string{"flush", "num_workers"} {
+		if conf.IsSet(key) {
+			invalidKeys = append(invalidKeys, key)
 		}
 	}
-
-	for _, endpoint := range cfg.Endpoints {
-		if endpoint == "" {
-			return errConfigEmptyEndpoint
-		}
+	if len(invalidKeys) > 0 {
+		return fmt.Errorf("has invalid keys: %s, use sending_queue instead", strings.Join(invalidKeys, ", "))
 	}
 
-	if cfg.Index == "" {
-		return errConfigNoIndex
-	}
-
-	if _, ok := mappingModes[cfg.Mapping.Mode]; !ok {
-		return fmt.Errorf("unknown mapping mode %v", cfg.Mapping.Mode)
+	if err := conf.Unmarshal(cfg); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+// Validate validates the elasticsearch server configuration.
+func (cfg *Config) Validate() error {
+	endpoints, err := cfg.endpoints()
+	if err != nil {
+		return err
+	}
+	for _, endpoint := range endpoints {
+		if err := validateEndpoint(endpoint); err != nil {
+			return fmt.Errorf("invalid endpoint %q: %w", endpoint, err)
+		}
+	}
+
+	canonicalAllowedModes := make([]string, len(cfg.Mapping.AllowedModes))
+	for i, name := range cfg.Mapping.AllowedModes {
+		canonicalName := canonicalMappingModeName(name)
+		if _, ok := canonicalMappingModes[canonicalName]; !ok {
+			return fmt.Errorf("unknown allowed mapping mode name %q", name)
+		}
+		canonicalAllowedModes[i] = canonicalName
+	}
+
+	if cfg.ClientConfig.Compression != "none" && cfg.ClientConfig.Compression != configcompression.TypeGzip {
+		return errors.New("compression must be one of [none, gzip]")
+	}
+
+	if cfg.Retry.MaxRetries < 0 {
+		return errors.New("retry::max_retries should be non-negative")
+	}
+
+	uniq := map[string]struct{}{}
+	for i, k := range cfg.MetadataKeys {
+		kl := strings.ToLower(k)
+		if _, has := uniq[kl]; has {
+			return fmt.Errorf("metadata_keys must be case-insenstive and unique, found duplicate: %s", kl)
+		}
+		uniq[kl] = struct{}{}
+		// convert metadata keys to lower case as these are case insensitive
+		cfg.MetadataKeys[i] = kl
+	}
+
+	return nil
+}
+
+// allowedMappingModes returns a map from canonical mapping mode names to MappingModes.
+func (cfg *Config) allowedMappingModes() map[string]MappingMode {
+	modes := make(map[string]MappingMode)
+	for _, name := range cfg.Mapping.AllowedModes {
+		canonical := canonicalMappingModeName(name)
+		modes[canonical] = canonicalMappingModes[canonical]
+	}
+	return modes
+}
+
+var canonicalMappingModes = map[string]MappingMode{
+	MappingNone.String():    MappingNone,
+	MappingRaw.String():     MappingRaw,
+	MappingECS.String():     MappingECS,
+	MappingOTel.String():    MappingOTel,
+	MappingBodyMap.String(): MappingBodyMap,
+}
+
+func canonicalMappingModeName(name string) string {
+	lower := strings.ToLower(name)
+	switch lower {
+	case "", "no": // aliases for "none"
+		return "none"
+	default:
+		return lower
+	}
+}
+
+func (cfg *Config) endpoints() ([]string, error) {
+	// Exactly one of endpoint, endpoints, or cloudid must be configured.
+	// If none are set, then $ELASTICSEARCH_URL may be specified instead.
+	var endpoints []string
+	var numEndpointConfigs int
+	if cfg.ClientConfig.Endpoint != "" {
+		numEndpointConfigs++
+		endpoints = []string{cfg.ClientConfig.Endpoint}
+	}
+	if len(cfg.Endpoints) > 0 {
+		numEndpointConfigs++
+		endpoints = cfg.Endpoints
+	}
+	if cfg.CloudID != "" {
+		numEndpointConfigs++
+		u, err := parseCloudID(cfg.CloudID)
+		if err != nil {
+			return nil, err
+		}
+		endpoints = []string{u.String()}
+	}
+	if numEndpointConfigs == 0 {
+		if v := os.Getenv(defaultElasticsearchEnvName); v != "" {
+			numEndpointConfigs++
+			endpoints = strings.Split(v, ",")
+			for i, endpoint := range endpoints {
+				endpoints[i] = strings.TrimSpace(endpoint)
+			}
+		}
+	}
+	if numEndpointConfigs != 1 {
+		return nil, errConfigEndpointRequired
+	}
+	return endpoints, nil
+}
+
+func validateEndpoint(endpoint string) error {
+	if endpoint == "" {
+		return errConfigEmptyEndpoint
+	}
+
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return err
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return fmt.Errorf(`invalid scheme %q, expected "http" or "https"`, u.Scheme)
+	}
+	return nil
+}
+
+// Based on "addrFromCloudID" in go-elasticsearch.
+func parseCloudID(input string) (*url.URL, error) {
+	_, after, ok := strings.Cut(input, ":")
+	if !ok {
+		return nil, fmt.Errorf("invalid CloudID %q", input)
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(after)
+	if err != nil {
+		return nil, err
+	}
+
+	parts := strings.Split(string(decoded), "$")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("invalid decoded CloudID %q", string(decoded))
+	}
+	return url.Parse(fmt.Sprintf("https://%s.%s", parts[1], parts[0]))
+}
+
+func handleTelemetryConfig(cfg *Config, logger *zap.Logger) {
+	if cfg.TelemetrySettings.LogRequestBody {
+		logger.Warn("telemetry::log_request_body is enabled, and may expose sensitive data; It should only be used for testing or debugging.")
+	}
+	if cfg.TelemetrySettings.LogResponseBody {
+		logger.Warn("telemetry::log_response_body is enabled, and may expose sensitive data; It should only be used for testing or debugging.")
+	}
+	if cfg.TelemetrySettings.LogFailedDocsInput {
+		logger.Warn("telemetry::log_failed_docs_input is enabled, and may expose sensitive data; It should only be used for testing or debugging.")
+	}
 }

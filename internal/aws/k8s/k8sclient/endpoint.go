@@ -1,18 +1,7 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package k8sclient
+package k8sclient // import "github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/k8s/k8sclient"
 
 import (
 	"context"
@@ -20,7 +9,7 @@ import (
 	"sync"
 
 	"go.uber.org/zap"
-	v1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -48,9 +37,6 @@ type EpClient interface {
 	PodKeyToServiceNames() map[string][]string
 	// Get the mapping between the service and the number of belonging pods
 	ServiceToPodNum() map[Service]int
-
-	// shutdown is only used internally by clientset to stop the EpClient
-	shutdown()
 }
 
 type epClientOption func(*epClient)
@@ -71,7 +57,7 @@ type epClient struct {
 
 	mu                      sync.RWMutex
 	podKeyToServiceNamesMap map[string][]string
-	serviceToPodNumMap      map[Service]int //only running pods will show behind endpoints
+	serviceToPodNumMap      map[Service]int // only running pods will show behind endpoints
 }
 
 func (c *epClient) PodKeyToServiceNames() map[string][]string {
@@ -98,7 +84,7 @@ func (c *epClient) refresh() {
 
 	objsList := c.store.List()
 
-	tmpMap := make(map[string]map[string]struct{}) //pod key to service names
+	tmpMap := make(map[string]map[string]struct{}) // pod key to service names
 	serviceToPodNumMapNew := make(map[Service]int)
 
 	for _, obj := range objsList {
@@ -147,7 +133,7 @@ func newEpClient(clientSet kubernetes.Interface, logger *zap.Logger, options ...
 
 	c.store = NewObjStore(transformFuncEndpoint, logger)
 	lw := c.createEndpointListWatch(clientSet, metav1.NamespaceAll)
-	reflector := cache.NewReflector(lw, &v1.Endpoints{}, c.store, 0)
+	reflector := cache.NewReflector(lw, &discoveryv1.EndpointSlice{}, c.store, 0)
 
 	go reflector.Run(c.stopChan)
 
@@ -164,41 +150,47 @@ func (c *epClient) shutdown() {
 	c.stopped = true
 }
 
-func transformFuncEndpoint(obj interface{}) (interface{}, error) {
-	endpoint, ok := obj.(*v1.Endpoints)
+func transformFuncEndpoint(obj any) (any, error) {
+	endpointSlice, ok := obj.(*discoveryv1.EndpointSlice)
 	if !ok {
-		return nil, fmt.Errorf("input obj %v is not Endpoint type", obj)
+		return nil, fmt.Errorf("input obj %v is not EndpointSlice type", obj)
 	}
 	info := new(endpointInfo)
-	info.name = endpoint.Name
-	info.namespace = endpoint.Namespace
+	// EndpointSlice uses a label to reference the service
+	if serviceName, ok := endpointSlice.Labels[discoveryv1.LabelServiceName]; ok {
+		info.name = serviceName
+	} else {
+		// Fallback to the EndpointSlice name if label is not present
+		info.name = endpointSlice.Name
+	}
+	info.namespace = endpointSlice.Namespace
 	info.podKeyList = []string{}
-	if subsets := endpoint.Subsets; subsets != nil {
-		for _, subset := range subsets {
-			if addresses := subset.Addresses; addresses != nil {
-				for _, address := range addresses {
-					if targetRef := address.TargetRef; targetRef != nil && targetRef.Kind == typePod {
-						podKey := k8sutil.CreatePodKey(targetRef.Namespace, targetRef.Name)
-						if podKey == "" {
-							continue
-						}
-						info.podKeyList = append(info.podKeyList, podKey)
-					}
-				}
+
+	// EndpointSlice has Endpoints field (not Subsets like old Endpoints)
+	for _, endpoint := range endpointSlice.Endpoints {
+		// Check if endpoint is ready
+		if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+			continue
+		}
+
+		if endpoint.TargetRef != nil && endpoint.TargetRef.Kind == typePod {
+			podKey := k8sutil.CreatePodKey(endpoint.TargetRef.Namespace, endpoint.TargetRef.Name)
+			if podKey == "" {
+				continue
 			}
+			info.podKeyList = append(info.podKeyList, podKey)
 		}
 	}
 	return info, nil
 }
 
-func (c *epClient) createEndpointListWatch(client kubernetes.Interface, ns string) cache.ListerWatcher {
-	ctx := context.Background()
+func (*epClient) createEndpointListWatch(client kubernetes.Interface, ns string) cache.ListerWatcher {
 	return &cache.ListWatch{
-		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
-			return client.CoreV1().Endpoints(ns).List(ctx, opts)
+		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+			return client.DiscoveryV1().EndpointSlices(ns).List(ctx, opts)
 		},
-		WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
-			return client.CoreV1().Endpoints(ns).Watch(ctx, opts)
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return client.DiscoveryV1().EndpointSlices(ns).Watch(ctx, opts)
 		},
 	}
 }

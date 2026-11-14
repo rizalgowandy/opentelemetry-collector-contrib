@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package docker
 
@@ -18,14 +7,16 @@ import (
 	"context"
 	"testing"
 
+	"github.com/moby/moby/api/types/container"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/translator/conventions"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/processor/processortest"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor/internal"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/metadataproviders/docker"
 )
+
+var _ docker.Provider = (*mockMetadata)(nil)
 
 type mockMetadata struct {
 	mock.Mock
@@ -41,22 +32,76 @@ func (m *mockMetadata) OSType(context.Context) (string, error) {
 	return args.String(0), args.Error(1)
 }
 
+func (m *mockMetadata) ContainerInfo(context.Context) (container.InspectResponse, error) {
+	args := m.MethodCalled("ContainerInfo")
+	return args.Get(0).(container.InspectResponse), args.Error(1)
+}
+
 func TestDetect(t *testing.T) {
 	md := &mockMetadata{}
 	md.On("Hostname").Return("hostname", nil)
-	md.On("OSType").Return("DARWIN", nil)
+	md.On("OSType").Return("darwin", nil)
+	md.On("ContainerInfo").Return(container.InspectResponse{
+		Name:  "foo",
+		Image: "bar:1.0",
+	}, nil)
 
-	detector := &Detector{provider: md, logger: zap.NewNop()}
-	res, err := detector.Detect(context.Background())
+	cfg := CreateDefaultConfig()
+	cfg.ResourceAttributes.ContainerImageName.Enabled = true
+	cfg.ResourceAttributes.ContainerName.Enabled = true
+
+	detector, err := NewDetector(processortest.NewNopSettings(processortest.NopType), cfg, false)
 	require.NoError(t, err)
+	detector.(*Detector).provider = md
+	res, schemaURL, err := detector.Detect(t.Context())
+	require.NoError(t, err)
+	assert.Contains(t, schemaURL, "https://opentelemetry.io/schemas/")
 	md.AssertExpectations(t)
-	res.Attributes().Sort()
 
-	expected := internal.NewResource(map[string]interface{}{
-		conventions.AttributeHostName: "hostname",
-		conventions.AttributeOSType:   "DARWIN",
-	})
-	expected.Attributes().Sort()
+	expected := map[string]any{
+		"host.name":            "hostname",
+		"os.type":              "darwin",
+		"container.image.name": "bar:1.0",
+		"container.name":       "foo",
+	}
 
-	assert.Equal(t, expected, res)
+	assert.Equal(t, expected, res.Attributes().AsRaw())
+}
+
+func TestDetectSkipsContainerInfoByDefault(t *testing.T) {
+	md := &mockMetadata{}
+	md.On("Hostname").Return("hostname", nil)
+	md.On("OSType").Return("darwin", nil)
+
+	detector, err := NewDetector(processortest.NewNopSettings(processortest.NopType), CreateDefaultConfig(), false)
+	require.NoError(t, err)
+	detector.(*Detector).provider = md
+	res, _, err := detector.Detect(t.Context())
+	require.NoError(t, err)
+	md.AssertNotCalled(t, "ContainerInfo")
+
+	expected := map[string]any{
+		"host.name": "hostname",
+		"os.type":   "darwin",
+	}
+	assert.Equal(t, expected, res.Attributes().AsRaw())
+}
+
+func TestDetectSkipsDisabledResourceAttributes(t *testing.T) {
+	md := &mockMetadata{}
+
+	cfg := CreateDefaultConfig()
+	cfg.ResourceAttributes.HostName.Enabled = false
+	cfg.ResourceAttributes.OsType.Enabled = false
+
+	detector, err := NewDetector(processortest.NewNopSettings(processortest.NopType), cfg, false)
+	require.NoError(t, err)
+	detector.(*Detector).provider = md
+	res, _, err := detector.Detect(t.Context())
+	require.NoError(t, err)
+
+	md.AssertNotCalled(t, "Hostname")
+	md.AssertNotCalled(t, "OSType")
+	md.AssertNotCalled(t, "ContainerInfo")
+	assert.Empty(t, res.Attributes().AsRaw())
 }

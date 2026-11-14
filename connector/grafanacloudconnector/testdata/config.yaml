@@ -1,0 +1,10 @@
+# default configuration
+grafana_cloud:
+
+# custom configuration
+grafana_cloud/custom:
+  host_identifiers:
+    - k8s.node.name
+    - host.name
+    - host.id
+  metrics_flush_interval: 30s

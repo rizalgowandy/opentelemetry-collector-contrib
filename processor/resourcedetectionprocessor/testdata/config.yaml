@@ -1,50 +1,130 @@
-receivers:
-  nop:
+resource_detection:
+resource_detection/openshift:
+  detectors: [openshift]
+  timeout: 2s
+  override: false
+  openshift:
+    address: "127.0.0.1:4444"
+    token: "some_token"
+    tls:
+      insecure: true
 
-processors:
-  resourcedetection:
-  resourcedetection/gce:
-    detectors: [env, gce]
-    timeout: 2s
-    override: false
-  resourcedetection/ec2:
-    detectors: [env, ec2]
-    timeout: 2s
-    override: false
-    ec2:
-      tags:
-        - ^tag1$
-        - ^tag2$
-  resourcedetection/ecs:
-    detectors: [env, ecs]
-    timeout: 2s
-    override: false
-  resourcedetection/system:
-    detectors: [env, system]
-    timeout: 2s
-    override: false
-  resourcedetection/docker:
-    detectors: [env, docker]
-    timeout: 2s
-    override: false
-  resourcedetection/azure:
-    detectors: [env, azure]
-    timeout: 2s
-    override: false
+resource_detection/aks:
+  detectors: [env, aks]
+  timeout: 2s
+  override: false
 
-exporters:
-  nop:
+resource_detection/azureappservice:
+  detectors: [env, azureappservice]
+  timeout: 2s
+  override: false
+  azureappservice:
+    resource_attributes:
+      azure.app_service.instance.id:
+        enabled: false
 
-service:
-  pipelines:
-    metrics:
-      receivers: [nop]
-      processors:
-      # Choose one depending on your cloud provider and environment:
-      # - resourcedetection/system
-      # - resourcedetection/docker
-      # - resourcedetection/gce
-      # - resourcedetection/ec2
-      # - resourcedetection/ecs
-      # - resourcedetection/azure
-      exporters: [nop]
+resource_detection/azurecontainerapps:
+  detectors: [env, azurecontainerapps]
+
+resource_detection/azurefunctions:
+  detectors: [env, azurefunctions]
+  timeout: 2s
+  override: false
+  azurefunctions:
+    resource_attributes:
+      faas.instance:
+        enabled: false
+
+resource_detection/gcp:
+  detectors: [env, gcp]
+  timeout: 2s
+  override: false
+
+resource_detection/ec2:
+  detectors: [env, ec2]
+  timeout: 2s
+  override: false
+  ec2:
+    tags:
+      - ^tag1$
+      - ^tag2$
+
+resource_detection/ecs:
+  detectors: [env, ecs]
+  timeout: 2s
+  override: false
+
+resource_detection/lambda:
+  detectors: [env, lambda]
+  timeout: 2s
+  override: false
+
+resource_detection/system:
+  detectors: [env, system]
+  timeout: 2s
+  override: false
+  system:
+    hostname_sources: [os]
+
+resource_detection/docker:
+  detectors: [env, docker]
+  timeout: 2s
+  override: false
+
+resource_detection/azure:
+  detectors: [env, azure]
+  timeout: 2s
+  override: false
+
+resource_detection/heroku:
+  detectors: [env, heroku]
+  timeout: 2s
+  override: false
+
+resource_detection/env:
+  detectors: [env]
+  timeout: 2s
+  override: false
+  env:
+    attributes:
+      included:
+        - deployment.environment.name
+        - k8s.*
+      excluded:
+        - k8s.pod.name
+
+resource_detection/refresh:
+  detectors: [system]
+  timeout: 2s
+  override: false
+  refresh_interval: 5s
+
+resource_detection/invalid:
+  detectors: [env, system]
+  timeout: 2s
+  override: false
+  system:
+    hostname_sources: [invalid_source]
+
+resource_detection/fail_on_missing_metadata:
+  detectors: [gcp, azure, ec2]
+  fail_on_missing_metadata: true
+  timeout: 5s
+  override: false
+
+resource_detection/resourceattributes:
+  detectors: [system, ec2]
+  timeout: 2s
+  override: false
+  ec2:
+    resource_attributes:
+      host.name:
+        enabled: false
+      host.id:
+        enabled: false
+      host.type:
+        enabled: false
+  system:
+    resource_attributes:
+      os.type:
+        enabled: false

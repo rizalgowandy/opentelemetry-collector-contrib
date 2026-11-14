@@ -1,82 +1,61 @@
-// Copyright  The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-package kafkametricsreceiver
+package kafkametricsreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kafkametricsreceiver"
 
 import (
 	"context"
 	"fmt"
 
-	"github.com/Shopify/sarama"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/exporter/kafkaexporter"
-	"go.opentelemetry.io/collector/receiver/scraperhelper"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/scraper"
+	"go.opentelemetry.io/collector/scraper/scraperhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kafkametricsreceiver/internal/metadata"
 )
 
-const (
-	instrumentationLibName = "otelcol/kafkametrics"
-	brokersScraperName     = "brokers"
-	topicsScraperName      = "topics"
-	consumersScraperName   = "consumers"
-)
-
-type createKafkaScraper func(context.Context, Config, *sarama.Config, *zap.Logger) (scraperhelper.ResourceMetricsScraper, error)
+type createKafkaScraper func(context.Context, Config, receiver.Settings, *franzAdminProvider) (scraper.Metrics, error)
 
 var (
+	brokersScraperType   = component.MustNewType("brokers")
+	topicsScraperType    = component.MustNewType("topics")
+	consumersScraperType = component.MustNewType("consumers")
+
 	allScrapers = map[string]createKafkaScraper{
-		brokersScraperName:   createBrokerScraper,
-		topicsScraperName:    createTopicsScraper,
-		consumersScraperName: createConsumerScraper,
+		brokersScraperType.String():   createBrokerScraperFranz,
+		topicsScraperType.String():    createTopicsScraperFranz,
+		consumersScraperType.String(): createConsumerScraperFranz,
 	}
 )
 
 var newMetricsReceiver = func(
 	ctx context.Context,
 	config Config,
-	params component.ReceiverCreateSettings,
+	params receiver.Settings,
 	consumer consumer.Metrics,
-) (component.MetricsReceiver, error) {
-	sc := sarama.NewConfig()
-	sc.ClientID = config.ClientID
-	if config.ProtocolVersion != "" {
-		version, err := sarama.ParseKafkaVersion(config.ProtocolVersion)
+) (receiver.Metrics, error) {
+	// All scrapers share a single franz-go admin client to avoid duplicating
+	// connection pools and metadata caches per scraper.
+	clients := newFranzAdminProvider(config.ClientConfig, params.Logger)
+
+	scraperControllerOptions := make([]scraperhelper.ControllerOption, 0, len(config.Scrapers))
+	for _, key := range config.Scrapers {
+		factory, ok := allScrapers[key]
+		if !ok {
+			return nil, fmt.Errorf("no scraper found for key: %s", key)
+		}
+		s, err := factory(ctx, config, params, clients)
 		if err != nil {
 			return nil, err
 		}
-		sc.Version = version
-	}
-	if err := kafkaexporter.ConfigureAuthentication(config.Authentication, sc); err != nil {
-		return nil, err
-	}
-	scraperControllerOptions := make([]scraperhelper.ScraperControllerOption, 0, len(config.Scrapers))
-	for _, scraper := range config.Scrapers {
-		if s, ok := allScrapers[scraper]; ok {
-			s, err := s(ctx, config, sc, params.Logger)
-			if err != nil {
-				return nil, err
-			}
-			scraperControllerOptions = append(scraperControllerOptions, scraperhelper.AddResourceMetricsScraper(s))
-			continue
-		}
-		return nil, fmt.Errorf("no scraper found for key: %s", scraper)
+		scraperControllerOptions = append(scraperControllerOptions, scraperhelper.AddMetricsScraper(metadata.Type, s))
 	}
 
-	return scraperhelper.NewScraperControllerReceiver(
-		&config.ScraperControllerSettings,
-		params.Logger,
+	return scraperhelper.NewMetricsController(
+		&config.ControllerConfig,
+		params,
 		consumer,
 		scraperControllerOptions...,
 	)

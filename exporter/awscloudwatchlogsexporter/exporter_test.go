@@ -1,61 +1,242 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package awscloudwatchlogsexporter
 
 import (
-	"reflect"
+	"context"
+	"errors"
 	"testing"
+	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
-	"go.opentelemetry.io/collector/consumer/pdata"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awscloudwatchlogsexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/cwlogs"
 )
+
+type mockPusher struct {
+	mock.Mock
+}
+
+func (p *mockPusher) AddLogEntry(_ context.Context, _ *cwlogs.Event) error {
+	args := p.Called(nil)
+	errorStr := args.String(0)
+	if errorStr != "" {
+		return errors.New("Add log entry Error")
+	}
+	return nil
+}
+
+func (p *mockPusher) ForceFlush(_ context.Context) error {
+	args := p.Called(nil)
+	errorStr := args.String(0)
+	if errorStr != "" {
+		return errors.New("Push error")
+	}
+	return nil
+}
 
 func TestLogToCWLog(t *testing.T) {
 	tests := []struct {
 		name     string
-		resource pdata.Resource
-		log      pdata.LogRecord
-		want     *cloudwatchlogs.InputLogEvent
+		resource pcommon.Resource
+		scope    pcommon.InstrumentationScope
+		log      plog.LogRecord
+		config   *Config
+		want     cwlogs.Event
 		wantErr  bool
 	}{
 		{
 			name:     "basic",
 			resource: testResource(),
 			log:      testLogRecord(),
-			want: &cloudwatchlogs.InputLogEvent{
-				Timestamp: aws.Int64(1609719139),
-				Message:   aws.String(`{"name":"test","body":"hello world","severity_number":5,"severity_text":"debug","dropped_attributes_count":4,"flags":255,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","attributes":{"key1":1,"key2":"attr2"},"resource":{"host":"abc123","node":5}}`),
+			scope:    testScope(),
+			config:   &Config{},
+			want: cwlogs.Event{
+				GeneratedTime: time.Now(),
+				InputLogEvent: types.InputLogEvent{
+					Timestamp: aws.Int64(1609719139),
+					Message:   aws.String(`{"body":"hello world","severity_number":5,"severity_text":"debug","dropped_attributes_count":4,"flags":1,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","attributes":{"key1":1,"key2":"attr2"},"scope":{"name":"test-scope","version":"1.0.0","attributes":{"scope-attr":"value"}},"resource":{"host":"abc123","node":5}}`),
+				},
+				StreamKey: cwlogs.StreamKey{
+					LogGroupName:  "",
+					LogStreamName: "",
+				},
 			},
 		},
 		{
 			name:     "no resource",
-			resource: pdata.NewResource(),
+			resource: pcommon.NewResource(),
+			scope:    testScope(),
 			log:      testLogRecord(),
-			want: &cloudwatchlogs.InputLogEvent{
-				Timestamp: aws.Int64(1609719139),
-				Message:   aws.String(`{"name":"test","body":"hello world","severity_number":5,"severity_text":"debug","dropped_attributes_count":4,"flags":255,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","attributes":{"key1":1,"key2":"attr2"}}`),
+			config:   &Config{},
+			want: cwlogs.Event{
+				GeneratedTime: time.Now(),
+				InputLogEvent: types.InputLogEvent{
+					Timestamp: aws.Int64(1609719139),
+					Message:   aws.String(`{"body":"hello world","severity_number":5,"severity_text":"debug","dropped_attributes_count":4,"flags":1,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","attributes":{"key1":1,"key2":"attr2"},"scope":{"name":"test-scope","version":"1.0.0","attributes":{"scope-attr":"value"}}}`),
+				},
+				StreamKey: cwlogs.StreamKey{
+					LogGroupName:  "",
+					LogStreamName: "",
+				},
+			},
+		},
+		{
+			name:     "no scope",
+			resource: testResource(),
+			log:      testLogRecord(),
+			scope:    emptyScope(),
+			config:   &Config{},
+			want: cwlogs.Event{
+				GeneratedTime: time.Now(),
+				InputLogEvent: types.InputLogEvent{
+					Timestamp: aws.Int64(1609719139),
+					Message:   aws.String(`{"body":"hello world","severity_number":5,"severity_text":"debug","dropped_attributes_count":4,"flags":1,"trace_id":"0102030405060708090a0b0c0d0e0f10","span_id":"0102030405060708","attributes":{"key1":1,"key2":"attr2"},"resource":{"host":"abc123","node":5}}`),
+				},
+				StreamKey: cwlogs.StreamKey{
+					LogGroupName:  "",
+					LogStreamName: "",
+				},
 			},
 		},
 		{
 			name:     "no trace",
 			resource: testResource(),
+			scope:    testScope(),
 			log:      testLogRecordWithoutTrace(),
-			want: &cloudwatchlogs.InputLogEvent{
-				Timestamp: aws.Int64(1609719139),
-				Message:   aws.String(`{"name":"test","body":"hello world","severity_number":5,"severity_text":"debug","dropped_attributes_count":4,"attributes":{"key1":1,"key2":"attr2"},"resource":{"host":"abc123","node":5}}`),
+			config: &Config{
+				LogGroupName:  "tLogGroup",
+				LogStreamName: "tStreamName",
+			},
+			want: cwlogs.Event{
+				GeneratedTime: time.Now(),
+				InputLogEvent: types.InputLogEvent{
+					Timestamp: aws.Int64(1609719139),
+					Message:   aws.String(`{"body":"hello world","severity_number":5,"severity_text":"debug","dropped_attributes_count":4,"attributes":{"key1":1,"key2":"attr2"},"scope":{"name":"test-scope","version":"1.0.0","attributes":{"scope-attr":"value"}},"resource":{"host":"abc123","node":5}}`),
+				},
+				StreamKey: cwlogs.StreamKey{
+					LogGroupName:  "tLogGroup",
+					LogStreamName: "tStreamName",
+				},
+			},
+		},
+		{
+			name:     "raw",
+			resource: testResource(),
+			scope:    testScope(),
+			log:      testLogRecordWithoutTrace(),
+			config: &Config{
+				LogGroupName:  "tLogGroup",
+				LogStreamName: "tStreamName",
+				RawLog:        true,
+			},
+			want: cwlogs.Event{
+				GeneratedTime: time.Now(),
+				InputLogEvent: types.InputLogEvent{
+					Timestamp: aws.Int64(1609719139),
+					Message:   aws.String(`hello world`),
+				},
+				StreamKey: cwlogs.StreamKey{
+					LogGroupName:  "tLogGroup",
+					LogStreamName: "tStreamName",
+				},
+			},
+		},
+		{
+			name:     "raw emf v1",
+			resource: testResource(),
+			scope:    testScope(),
+			log:      createPLog(`{"_aws":{"Timestamp":1574109732004,"LogGroupName":"Foo","CloudWatchMetrics":[{"Namespace":"MyApp","Dimensions":[["Operation"]],"Metrics":[{"Name":"ProcessingLatency","Unit":"Milliseconds","StorageResolution":60}]}]},"Operation":"Aggregator","ProcessingLatency":100}`),
+			config: &Config{
+				LogGroupName:  "tLogGroup",
+				LogStreamName: "tStreamName",
+				RawLog:        true,
+			},
+			want: cwlogs.Event{
+				GeneratedTime: time.Now(),
+				InputLogEvent: types.InputLogEvent{
+					Timestamp: aws.Int64(1609719139),
+					Message:   aws.String(`{"_aws":{"Timestamp":1574109732004,"LogGroupName":"Foo","CloudWatchMetrics":[{"Namespace":"MyApp","Dimensions":[["Operation"]],"Metrics":[{"Name":"ProcessingLatency","Unit":"Milliseconds","StorageResolution":60}]}]},"Operation":"Aggregator","ProcessingLatency":100}`),
+				},
+				StreamKey: cwlogs.StreamKey{
+					LogGroupName:  "Foo",
+					LogStreamName: "tStreamName",
+				},
+			},
+		},
+		{
+			name:     "raw emf v1 with log stream",
+			resource: testResource(),
+			scope:    testScope(),
+			log:      createPLog(`{"_aws":{"Timestamp":1574109732004,"LogGroupName":"Foo","LogStreamName":"Foo","CloudWatchMetrics":[{"Namespace":"MyApp","Dimensions":[["Operation"]],"Metrics":[{"Name":"ProcessingLatency","Unit":"Milliseconds","StorageResolution":60}]}]},"Operation":"Aggregator","ProcessingLatency":100}`),
+			config: &Config{
+				LogGroupName:  "tLogGroup",
+				LogStreamName: "tStreamName",
+				RawLog:        true,
+			},
+			want: cwlogs.Event{
+				GeneratedTime: time.Now(),
+				InputLogEvent: types.InputLogEvent{
+					Timestamp: aws.Int64(1609719139),
+					Message:   aws.String(`{"_aws":{"Timestamp":1574109732004,"LogGroupName":"Foo","LogStreamName":"Foo","CloudWatchMetrics":[{"Namespace":"MyApp","Dimensions":[["Operation"]],"Metrics":[{"Name":"ProcessingLatency","Unit":"Milliseconds","StorageResolution":60}]}]},"Operation":"Aggregator","ProcessingLatency":100}`),
+				},
+				StreamKey: cwlogs.StreamKey{
+					LogGroupName:  "Foo",
+					LogStreamName: "Foo",
+				},
+			},
+		},
+		{
+			name:     "raw emf v0",
+			resource: testResource(),
+			scope:    testScope(),
+			log:      createPLog(`{"Timestamp":1574109732004,"log_group_name":"Foo","CloudWatchMetrics":[{"Namespace":"MyApp","Dimensions":[["Operation"]],"Metrics":[{"Name":"ProcessingLatency","Unit":"Milliseconds","StorageResolution":60}]}],"Operation":"Aggregator","ProcessingLatency":100}`),
+			config: &Config{
+				LogGroupName:  "tLogGroup",
+				LogStreamName: "tStreamName",
+				RawLog:        true,
+			},
+			want: cwlogs.Event{
+				GeneratedTime: time.Now(),
+				InputLogEvent: types.InputLogEvent{
+					Timestamp: aws.Int64(1609719139),
+					Message:   aws.String(`{"Timestamp":1574109732004,"log_group_name":"Foo","CloudWatchMetrics":[{"Namespace":"MyApp","Dimensions":[["Operation"]],"Metrics":[{"Name":"ProcessingLatency","Unit":"Milliseconds","StorageResolution":60}]}],"Operation":"Aggregator","ProcessingLatency":100}`),
+				},
+				StreamKey: cwlogs.StreamKey{
+					LogGroupName:  "Foo",
+					LogStreamName: "tStreamName",
+				},
+			},
+		},
+		{
+			name:     "raw emf v0 with log stream",
+			resource: testResource(),
+			scope:    testScope(),
+			log:      createPLog(`{"Timestamp":1574109732004,"log_group_name":"Foo","log_stream_name":"Foo","CloudWatchMetrics":[{"Namespace":"MyApp","Dimensions":[["Operation"]],"Metrics":[{"Name":"ProcessingLatency","Unit":"Milliseconds","StorageResolution":60}]}],"Operation":"Aggregator","ProcessingLatency":100}`),
+			config: &Config{
+				LogGroupName:  "tLogGroup",
+				LogStreamName: "tStreamName",
+				RawLog:        true,
+			},
+			want: cwlogs.Event{
+				GeneratedTime: time.Now(),
+				InputLogEvent: types.InputLogEvent{
+					Timestamp: aws.Int64(1609719139),
+					Message:   aws.String(`{"Timestamp":1574109732004,"log_group_name":"Foo","log_stream_name":"Foo","CloudWatchMetrics":[{"Namespace":"MyApp","Dimensions":[["Operation"]],"Metrics":[{"Name":"ProcessingLatency","Unit":"Milliseconds","StorageResolution":60}]}],"Operation":"Aggregator","ProcessingLatency":100}`),
+				},
+				StreamKey: cwlogs.StreamKey{
+					LogGroupName:  "Foo",
+					LogStreamName: "Foo",
+				},
 			},
 		},
 	}
@@ -63,14 +244,15 @@ func TestLogToCWLog(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			resourceAttrs := attrsValue(tt.resource.Attributes())
-			got, err := logToCWLog(resourceAttrs, tt.log)
+			got, err := logToCWLog(resourceAttrs, tt.scope, tt.log, tt.config)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("logToCWLog() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("logToCWLog() got = %v, want %v", got, tt.want)
-			}
+			// Do not test generated time since it is time.Now()
+			assert.Equal(t, tt.want.InputLogEvent, got.InputLogEvent)
+			assert.Equal(t, tt.want.LogStreamName, got.LogStreamName)
+			assert.Equal(t, tt.want.LogGroupName, got.LogGroupName)
 		})
 	}
 }
@@ -80,121 +262,165 @@ func BenchmarkLogToCWLog(b *testing.B) {
 
 	resource := testResource()
 	log := testLogRecord()
-	for i := 0; i < b.N; i++ {
-		logToCWLog(attrsValue(resource.Attributes()), log)
+	scope := testScope()
+	for b.Loop() {
+		_, err := logToCWLog(attrsValue(resource.Attributes()), scope, log, &Config{})
+		if err != nil {
+			b.Errorf("logToCWLog() failed %v", err)
+			return
+		}
 	}
 }
 
-func testResource() pdata.Resource {
-	resource := pdata.NewResource()
-	resource.Attributes().InsertString("host", "abc123")
-	resource.Attributes().InsertInt("node", 5)
+func testResource() pcommon.Resource {
+	resource := pcommon.NewResource()
+	resource.Attributes().PutStr("host", "abc123")
+	resource.Attributes().PutInt("node", 5)
 	return resource
 }
 
-func testLogRecord() pdata.LogRecord {
-	record := pdata.NewLogRecord()
-	record.SetName("test")
+func testScope() pcommon.InstrumentationScope {
+	scope := pcommon.NewInstrumentationScope()
+	scope.SetName("test-scope")
+	scope.SetVersion("1.0.0")
+	scope.Attributes().PutStr("scope-attr", "value")
+	return scope
+}
+
+func emptyScope() pcommon.InstrumentationScope {
+	scope := pcommon.NewInstrumentationScope()
+	return scope
+}
+
+func testLogRecord() plog.LogRecord {
+	record := plog.NewLogRecord()
 	record.SetSeverityNumber(5)
 	record.SetSeverityText("debug")
 	record.SetDroppedAttributesCount(4)
-	record.Body().SetStringVal("hello world")
-	record.Attributes().InsertInt("key1", 1)
-	record.Attributes().InsertString("key2", "attr2")
-	record.SetTraceID(pdata.NewTraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}))
-	record.SetSpanID(pdata.NewSpanID([8]byte{1, 2, 3, 4, 5, 6, 7, 8}))
-	record.SetFlags(255)
+	record.Body().SetStr("hello world")
+	record.Attributes().PutInt("key1", 1)
+	record.Attributes().PutStr("key2", "attr2")
+	record.SetTraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	record.SetSpanID([8]byte{1, 2, 3, 4, 5, 6, 7, 8})
+	record.SetFlags(plog.DefaultLogRecordFlags.WithIsSampled(true))
 	record.SetTimestamp(1609719139000000)
 	return record
 }
 
-func testLogRecordWithoutTrace() pdata.LogRecord {
-	record := pdata.NewLogRecord()
-	record.SetName("test")
+func testLogRecordWithoutTrace() plog.LogRecord {
+	record := plog.NewLogRecord()
 	record.SetSeverityNumber(5)
 	record.SetSeverityText("debug")
 	record.SetDroppedAttributesCount(4)
-	record.Body().SetStringVal("hello world")
-	record.Attributes().InsertInt("key1", 1)
-	record.Attributes().InsertString("key2", "attr2")
+	record.Body().SetStr("hello world")
+	record.Attributes().PutInt("key1", 1)
+	record.Attributes().PutStr("key2", "attr2")
 	record.SetTimestamp(1609719139000000)
 	return record
 }
 
-func TestAttrValue(t *testing.T) {
-	tests := []struct {
-		name    string
-		builder func() pdata.AttributeValue
-		want    interface{}
+func createPLog(log string) plog.LogRecord {
+	pLog := plog.NewLogRecord()
+	pLog.Body().SetStr(log)
+	pLog.SetTimestamp(1609719139000000)
+	return pLog
+}
+
+type mockFactory struct {
+	*mockPusher
+}
+
+func (mf *mockFactory) CreateMultiStreamPusher() cwlogs.Pusher {
+	return mf.mockPusher
+}
+
+func TestConsumeLogs(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	factory := NewFactory()
+	expCfg := factory.CreateDefaultConfig().(*Config)
+	expCfg.AWSSessionSettings.Region = "us-west-2"
+	expCfg.LogGroupName = "testGroup"
+	expCfg.LogStreamName = "testStream"
+	expCfg.AWSSessionSettings.MaxRetries = 0
+	exp, err := newCwLogsPusher(ctx, expCfg, exportertest.NewNopSettings(metadata.Type))
+
+	testcases := []struct {
+		id                 string
+		setupLogPusherFunc func(pusher *mockPusher)
+		shouldError        bool
 	}{
 		{
-			name: "null",
-			builder: func() pdata.AttributeValue {
-				return pdata.NewAttributeValueNull()
-			},
-			want: nil,
-		},
-		{
-			name: "bool",
-			builder: func() pdata.AttributeValue {
-				return pdata.NewAttributeValueBool(true)
-			},
-			want: true,
-		},
-		{
-			name: "int",
-			builder: func() pdata.AttributeValue {
-				return pdata.NewAttributeValueInt(5)
-			},
-			want: int64(5),
-		},
-		{
-			name: "double",
-			builder: func() pdata.AttributeValue {
-				return pdata.NewAttributeValueDouble(6.7)
-			},
-			want: float64(6.7),
-		},
-		{
-			name: "map",
-			builder: func() pdata.AttributeValue {
-				mAttr := pdata.NewAttributeValueMap()
-				m := mAttr.MapVal()
-				m.InsertString("key1", "value1")
-				m.InsertNull("key2")
-				m.InsertBool("key3", true)
-				m.InsertInt("key4", 4)
-				m.InsertDouble("key5", 5.6)
-				return mAttr
-			},
-			want: map[string]interface{}{
-				"key1": "value1",
-				"key2": nil,
-				"key3": true,
-				"key4": int64(4),
-				"key5": float64(5.6),
+			id: "push has no errors",
+			setupLogPusherFunc: func(pusher *mockPusher) {
+				pusher.On("AddLogEntry", nil).Return("").Times(3)
+				pusher.On("ForceFlush", nil).Return("").Once()
 			},
 		},
 		{
-			name: "array",
-			builder: func() pdata.AttributeValue {
-				arrAttr := pdata.NewAttributeValueArray()
-				arr := arrAttr.ArrayVal()
-				arr.Append(pdata.NewAttributeValueDouble(1.2))
-				arr.Append(pdata.NewAttributeValueDouble(1.6))
-				arr.Append(pdata.NewAttributeValueBool(true))
-				arr.Append(pdata.NewAttributeValueString("hello"))
-				arr.Append(pdata.NewAttributeValueNull())
-				return arrAttr
+			id: "AddLogEntry has error",
+			setupLogPusherFunc: func(pusher *mockPusher) {
+				pusher.On("AddLogEntry", nil).Return("").Once().
+					On("AddLogEntry", nil).Return("error").Once().
+					On("AddLogEntry", nil).Return("").Once()
+				pusher.On("ForceFlush", nil).Return("").Once()
 			},
-			want: []interface{}{1.2, 1.6, true, "hello", nil},
+			shouldError: true,
+		},
+		{
+			id: "ForceFlush has error",
+			setupLogPusherFunc: func(pusher *mockPusher) {
+				pusher.On("AddLogEntry", nil).Return("").Times(3)
+				pusher.On("ForceFlush", nil).Return("error").Once()
+			},
+			shouldError: true,
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := attrValue(tt.builder()); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("attrValue() = %v, want %v", got, tt.want)
+
+	for _, testcase := range testcases {
+		t.Run(testcase.id, func(t *testing.T) {
+			logPusher := new(mockPusher)
+			exp.pusherFactory = &mockFactory{logPusher}
+			assert.NoError(t, err)
+			assert.NotNil(t, exp)
+			ld := plog.NewLogs()
+			r := ld.ResourceLogs().AppendEmpty()
+			r.Resource().Attributes().PutStr("hello", "test")
+			logRecords := r.ScopeLogs().AppendEmpty().LogRecords()
+
+			record1 := logRecords.AppendEmpty()
+			record2 := logRecords.AppendEmpty()
+			record3 := logRecords.AppendEmpty()
+
+			record1.Body().SetStr("Hello world")
+			record2.Body().SetStr("Hello world")
+			record3.Body().SetStr("Hello world")
+
+			require.Equal(t, 3, ld.LogRecordCount())
+
+			testcase.setupLogPusherFunc(logPusher)
+
+			if !testcase.shouldError {
+				require.NoError(t, exp.consumeLogs(ctx, ld))
+			} else {
+				require.Error(t, exp.consumeLogs(ctx, ld))
 			}
+
+			require.NoError(t, exp.shutdown(ctx))
+
+			logPusher.AssertNumberOfCalls(t, "ForceFlush", 1)
+			logPusher.AssertNumberOfCalls(t, "AddLogEntry", 3)
 		})
 	}
+}
+
+func TestNewExporterWithoutRegionErr(t *testing.T) {
+	factory := NewFactory()
+	expCfg := factory.CreateDefaultConfig().(*Config)
+	expCfg.AWSSessionSettings.MaxRetries = 0
+
+	ctx := t.Context()
+	exp, err := newCwLogsExporter(ctx, expCfg, exportertest.NewNopSettings(metadata.Type))
+	assert.Nil(t, exp)
+	assert.Error(t, err)
 }
